@@ -31,14 +31,6 @@ export default defineConfig(({ mode }) => {
         'virtual:i18n': i18nImporter(),
         'virtual:plugins': pluginVirtualModuleGenerator('main'),
       }),
-      // Disable SSR mode set by electron-vite preset so rolldown uses its
-      // regular CJS-to-ESM bundler instead of the SSR one (which has a
-      // named-export chunk bug in rolldown RC.15).
-      {
-        name: 'disable-ssr-mode',
-        enforce: 'post' as const,
-        config: () => ({ build: { ssr: false } }),
-      },
     ],
     publicDir: 'assets',
     define: {
@@ -57,9 +49,9 @@ export default defineConfig(({ mode }) => {
         input: './src/index.ts',
         output: {
           entryFileNames: 'index.js',
-          // Inject createRequire shim so rolldown's CJS-to-ESM require helper
-          // can resolve Node builtins (e.g. require('os')) in ESM output.
-          banner: "import { createRequire as __cjsRequire } from 'module'; const require = __cjsRequire(import.meta.url);",
+          // Prevent code splitting so rolldown doesn't generate chunks with
+          // broken named-export interop (rolldown RC.15 bug).
+          inlineDynamicImports: true,
         },
       },
       minify: !isDev,
