@@ -1,9 +1,9 @@
 {
-  "name": "\u0079\u006f\u0075\u0074\u0075\u0062\u0065\u002d\u006d\u0075\u0073\u0069\u0063",
-  "desktopName": "com.github.th_ch.\u0079\u006f\u0075\u0074\u0075\u0062\u0065\u005f\u006d\u0075\u0073\u0069\u0063",
-  "productName": "\u0059\u006f\u0075\u0054\u0075\u0062\u0065\u0020\u004d\u0075\u0073\u0069\u0063",
+  "name": "youtube-music",
+  "desktopName": "com.github.th_ch.youtube_music",
+  "productName": "YouTube Music",
   "version": "3.11.0",
-  "description": "\u0059\u006f\u0075\u0054\u0075\u0062\u0065\u0020\u004d\u0075\u0073\u0069\u0063 Desktop App - including custom plugins",
+  "description": "YouTube Music Desktop App - including custom plugins",
   "main": "./dist/main/index.js",
   "type": "module",
   "license": "MIT",
@@ -42,24 +42,6 @@
   "engines": {
     "node": ">=22",
     "pnpm": ">=10"
-  },
-  "pnpm": {
-    "overrides": {
-      "vite": "8.0.8",
-      "node-gyp": "12.2.0",
-      "xml2js": "0.6.2",
-      "node-fetch": "3.3.2",
-      "@electron/universal": "3.0.3",
-      "@babel/runtime": "7.29.2",
-      "@xmldom/xmldom@<0.8.12": "0.8.12"
-    },
-    "patchedDependencies": {
-      "vudio@2.1.1": "patches/vudio@2.1.1.patch",
-      "@malept/flatpak-bundler@0.4.0": "patches/@malept__flatpak-bundler@0.4.0.patch",
-      "kuromoji@0.1.2": "patches/kuromoji@0.1.2.patch",
-      "electron-is@3.0.0": "patches/electron-is@3.0.0.patch",
-      "mdui@2.1.4": "patches/mdui@2.1.4.patch"
-    }
   },
   "dependencies": {
     "@dehoist/romanize-thai": "1.0.0",
