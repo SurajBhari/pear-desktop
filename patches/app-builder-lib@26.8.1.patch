@@ -1,0 +1,52 @@
+diff --git a/out/node-module-collector/pnpmNodeModulesCollector.js b/out/node-module-collector/pnpmNodeModulesCollector.js
+index 602599280ab621d078748187bb6b4ae9431c1739..7c0cd46cdc2a4a3989b9aaac12e769cce6338be4 100644
+--- a/out/node-module-collector/pnpmNodeModulesCollector.js
++++ b/out/node-module-collector/pnpmNodeModulesCollector.js
+@@ -25,6 +25,19 @@ class PnpmNodeModulesCollector extends nodeModulesCollector_1.NodeModulesCollect
+         const all = packageJson ? { ...packageJson.dependencies, ...packageJson.optionalDependencies } : { ...tree.dependencies, ...tree.optionalDependencies };
+         const optional = packageJson ? { ...packageJson.optionalDependencies } : {};
+         const deps = { ...(tree.dependencies || {}), ...(tree.optionalDependencies || {}) };
++        // pnpm marks repeated package occurrences as { deduped: true } with no dependencies
++        // field. If this node is deduped but packageJson declares real deps, resolve installed
++        // versions from the allDependencies map (populated before this function runs).
++        if (Object.keys(deps).length === 0 && Object.keys(all).length > 0) {
++            for (const depName of Object.keys(all)) {
++                for (const [key, val] of this.allDependencies.entries()) {
++                    if (key.startsWith(`${depName}@`)) {
++                        deps[depName] = val;
++                        break;
++                    }
++                }
++            }
++        }
+         this.productionGraph[dependencyId] = { dependencies: [] };
+         const depPromises = Object.entries(deps).map(async ([packageName, dependency]) => {
+             // First check if it's in production dependencies
+@@ -68,9 +81,25 @@ class PnpmNodeModulesCollector extends nodeModulesCollector_1.NodeModulesCollect
+         }
+     }
+     parseDependenciesTree(jsonBlob) {
+-        // pnpm returns an array of dependency trees
+         const dependencyTree = this.extractJsonFromPollutedOutput(jsonBlob);
+-        return dependencyTree[0];
++        const tree = dependencyTree[0];
++        // Normalize link: versions produced by pnpm v11 shamefully-hoist.
++        // e.g. "link:node_modules/.pnpm/es-define-property@1.0.1/node_modules/es-define-property" → "1.0.1"
++        this.normalizeLinkVersions(tree);
++        return tree;
++    }
++    normalizeLinkVersions(node) {
++        if (!node) return;
++        for (const deps of [node.dependencies, node.optionalDependencies]) {
++            if (!deps) continue;
++            for (const dep of Object.values(deps)) {
++                if (dep.version && dep.version.startsWith('link:')) {
++                    const m = dep.version.match(/@(\d[\w.-]*)\/node_modules/);
++                    if (m) dep.version = m[1];
++                }
++                this.normalizeLinkVersions(dep);
++            }
++        }
+     }
+ }
+ exports.PnpmNodeModulesCollector = PnpmNodeModulesCollector;
