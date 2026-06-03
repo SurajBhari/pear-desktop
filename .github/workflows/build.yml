@@ -17,7 +17,7 @@ jobs:
     name: Build Pear Desktop
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         os: [ macos-26, ubuntu-latest, windows-latest ]
 
@@ -80,6 +80,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           pnpm release:win
+
+      - name: Ensure Electron binary
+        run: node node_modules/electron/install.js
 
       - name: Test
         uses: coactions/setup-xvfb@b6b4fcfb9f5a895edadc3bc76318fae0ac17c8b3
