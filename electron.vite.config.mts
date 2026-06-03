@@ -43,7 +43,6 @@ export default defineConfig(({ mode }) => {
         formats: ['es'],
       },
       outDir: 'dist/main',
-      externalizeDeps: false,
       rolldownOptions: {
         external: ['electron', 'custom-electron-prompt', ...builtinModules],
         input: './src/index.ts',
@@ -71,7 +70,6 @@ export default defineConfig(({ mode }) => {
         formats: ['cjs'],
       },
       outDir: 'dist/preload',
-      externalizeDeps: false,
       commonjsOptions: {
         ignoreDynamicRequires: true,
       },
