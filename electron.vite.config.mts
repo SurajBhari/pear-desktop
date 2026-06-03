@@ -55,6 +55,10 @@ export default defineConfig(({ mode }) => {
       rolldownOptions: {
         external: ['electron', 'custom-electron-prompt', ...builtinModules, /\.node$/],
         input: './src/index.ts',
+        output: {
+          entryFileNames: 'index.js',
+          inlineDynamicImports: true,
+        },
       },
       minify: !isDev,
       cssMinify: !isDev,
