@@ -57,7 +57,6 @@ export default defineConfig(({ mode }) => {
         input: './src/index.ts',
         output: {
           entryFileNames: 'index.js',
-          inlineDynamicImports: true,
         },
       },
       minify: !isDev,
