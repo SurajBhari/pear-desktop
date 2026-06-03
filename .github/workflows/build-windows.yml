@@ -27,6 +27,7 @@ jobs:
         with:
           version: 11
           run_install: false
+          standalone: true
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
