@@ -57,6 +57,9 @@ export default defineConfig(({ mode }) => {
         input: './src/index.ts',
         output: {
           entryFileNames: 'index.js',
+          // Inject createRequire shim so rolldown's CJS-to-ESM require helper
+          // can resolve Node builtins (e.g. require('os')) in ESM output.
+          banner: "import { createRequire as __cjsRequire } from 'module'; const require = __cjsRequire(import.meta.url);",
         },
       },
       minify: !isDev,
