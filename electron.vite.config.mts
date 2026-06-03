@@ -31,12 +31,24 @@ export default defineConfig(({ mode }) => {
         'virtual:i18n': i18nImporter(),
         'virtual:plugins': pluginVirtualModuleGenerator('main'),
       }),
+      // Disable SSR mode set by electron-vite preset so rolldown uses its
+      // regular CJS-to-ESM bundler instead of the SSR one (which has a
+      // named-export chunk bug in rolldown RC.15).
+      {
+        name: 'disable-ssr-mode',
+        enforce: 'post' as const,
+        config: () => ({ build: { ssr: false } }),
+      },
     ],
     publicDir: 'assets',
+    define: {
+      __dirname: 'import.meta.dirname',
+      __filename: 'import.meta.filename',
+    },
     build: {
       lib: {
         entry: 'src/index.ts',
-        formats: ['cjs'],
+        formats: ['es'],
       },
       outDir: 'dist/main',
       externalizeDeps: false,
