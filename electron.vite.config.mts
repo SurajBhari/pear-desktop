@@ -33,18 +33,15 @@ export default defineConfig(({ mode }) => {
       }),
     ],
     publicDir: 'assets',
-    define: {
-      __dirname: 'import.meta.dirname',
-      __filename: 'import.meta.filename',
-    },
     build: {
       lib: {
         entry: 'src/index.ts',
-        formats: ['es'],
+        formats: ['cjs'],
       },
       outDir: 'dist/main',
+      externalizeDeps: false,
       rolldownOptions: {
-        external: ['electron', 'custom-electron-prompt', ...builtinModules],
+        external: ['electron', 'custom-electron-prompt', ...builtinModules, /\.node$/],
         input: './src/index.ts',
       },
       minify: !isDev,
@@ -70,11 +67,12 @@ export default defineConfig(({ mode }) => {
         formats: ['cjs'],
       },
       outDir: 'dist/preload',
+      externalizeDeps: false,
       commonjsOptions: {
         ignoreDynamicRequires: true,
       },
       rolldownOptions: {
-        external: ['electron', 'custom-electron-prompt', ...builtinModules],
+        external: ['electron', 'custom-electron-prompt', ...builtinModules, /\.node$/],
         input: './src/preload.ts',
       },
       minify: !isDev,

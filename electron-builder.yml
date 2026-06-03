@@ -5,9 +5,7 @@ files:
   - dist
   - assets
   - license
-  - 'node_modules/**'
-  - '!node_modules/**/*.map'
-  - '!node_modules/**/*.ts'
+  - 'node_modules/custom-electron-prompt/**'
 asarUnpack:
   - assets
 mac:
