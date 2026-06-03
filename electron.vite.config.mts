@@ -43,16 +43,9 @@ export default defineConfig(({ mode }) => {
         formats: ['es'],
       },
       outDir: 'dist/main',
-      externalizeDeps: false,
       rolldownOptions: {
         external: ['electron', 'custom-electron-prompt', ...builtinModules, /\.node$/],
         input: './src/index.ts',
-        output: {
-          entryFileNames: 'index.js',
-          // Prevent code splitting so rolldown doesn't generate chunks with
-          // broken named-export interop (rolldown RC.15 bug).
-          inlineDynamicImports: true,
-        },
       },
       minify: !isDev,
       cssMinify: !isDev,
@@ -77,10 +70,6 @@ export default defineConfig(({ mode }) => {
         formats: ['cjs'],
       },
       outDir: 'dist/preload',
-      externalizeDeps: false,
-      commonjsOptions: {
-        ignoreDynamicRequires: true,
-      },
       rolldownOptions: {
         external: ['electron', 'custom-electron-prompt', ...builtinModules, /\.node$/],
         input: './src/preload.ts',
