@@ -24,7 +24,12 @@ import {
 } from './legacy-clock';
 import { MusicGrantStore } from './music-grant-store';
 import { createMusicService } from './music-service';
-import { registerAuth, registerControl, registerWebsocket } from './routes';
+import {
+  registerAuth,
+  registerControl,
+  registerMusic,
+  registerWebsocket,
+} from './routes';
 import { registerMusicRoutes } from './routes/music';
 import { JWTPayloadSchema } from './scheme';
 
@@ -233,6 +238,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
         );
       },
     );
+    registerMusic(this.app, backendCtx, () => this.songInfo);
     registerAuth(this.app, backendCtx);
     registerWebsocket(this.app, backendCtx, upgradeWebSocket);
 
