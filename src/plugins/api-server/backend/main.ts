@@ -150,13 +150,14 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       },
     );
 
-    this.app.use('*', cors());
-
     // for web remote control
+    // registered before cors() so it also applies to preflight responses
     this.app.use('*', async (ctx, next) => {
-      ctx.header('Access-Control-Allow-Private-Network', 'true');
       await next();
+      ctx.res.headers.set('Access-Control-Allow-Private-Network', 'true');
     });
+
+    this.app.use('*', cors());
 
     // Capture scope before asynchronous authentication so stop/reconfigure cannot admit old work later.
     this.app.use(`/api/${API_VERSION}/queue/playlist`, async (ctx, next) => {
@@ -173,6 +174,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
         captureLegacyRequestScope(ctx.req.raw, backendCtx.window);
         await next();
       });
+
     // middlewares
     const jwtGuard: MiddlewareHandler = async (ctx, next) => {
       if (ctx.req.path.endsWith(`${API_VERSION}/ws`)) {
