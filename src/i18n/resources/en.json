@@ -356,7 +356,11 @@
     },
     "audio-compressor": {
       "description": "Apply compression to audio (lowers the volume of the loudest parts of the signal and raises the volume of the softest parts)",
-      "name": "Audio Compressor"
+      "name": "Audio Compressor",
+      "auto-track-gain": "Auto Track Gain",
+      "maximum-gain": "Maximum track gain",
+      "gain-headroom": "Boosts quiet tracks after compression. Leave equalizer headroom; high gain can clip.",
+      "gain-crossfade": "Track gain is suspended while auxiliary or crossfade audio is registered."
     },
     "auth-proxy-adapter": {
       "description": "Support for the use of authentication proxy services",

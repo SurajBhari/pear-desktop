@@ -9,6 +9,8 @@ export interface RendererAudioGraph {
   insertDry(input: AudioNode, output: AudioNode): () => void;
   insertMaster(input: AudioNode, output: AudioNode): () => void;
   registerMedia(element: HTMLMediaElement, gain?: GainNode): () => void;
+  readonly auxiliaryMediaCount: number;
+  observeAuxiliaryMedia(listener: (count: number) => void): () => void;
 }
 
 let current: RendererAudioGraph | null = null;
@@ -55,6 +57,19 @@ export function initializeAudioGraph(
     MediaElementAudioSourceNode
   >();
   const activeMedia = new WeakSet<HTMLMediaElement>();
+  let auxiliaryMediaCount = 0;
+  const auxiliaryObservers = new Set<(count: number) => void>();
+  const notifyObserver = (listener: (count: number) => void) => {
+    try {
+      listener(auxiliaryMediaCount);
+    } catch (error) {
+      console.error('[audio-graph] Auxiliary observer failed', error);
+    }
+  };
+  const notifyAuxiliaryMedia = () => {
+    for (const listener of [...auxiliaryObservers])
+      if (auxiliaryObservers.has(listener)) notifyObserver(listener);
+  };
   function insert(upstream: AudioNode, downstream: AudioNode) {
     let active: { input: AudioNode; output: AudioNode; token: object } | null =
       null;
@@ -97,6 +112,16 @@ export function initializeAudioGraph(
     insertMain: insert(audioSource, dryInput),
     insertDry: insert(dryInput, masterInput),
     insertMaster: insert(masterInput, musicGate),
+    get auxiliaryMediaCount() {
+      return auxiliaryMediaCount;
+    },
+    observeAuxiliaryMedia(listener) {
+      // Each subscription owns its callback even if callers reuse a function.
+      const owned = (count: number) => listener(count);
+      auxiliaryObservers.add(owned);
+      notifyObserver(owned);
+      return () => auxiliaryObservers.delete(owned);
+    },
     registerMedia(element, suppliedGain) {
       if (element === audioSource.mediaElement)
         throw new Error('Main media is already registered');
@@ -110,9 +135,29 @@ export function initializeAudioGraph(
         mediaNodes.set(element, source);
       }
       const gain = suppliedGain ?? audioContext.createGain();
-      source.connect(gain);
-      gain.connect(dryInput);
       activeMedia.add(element);
+      auxiliaryMediaCount++;
+      // Observers may remove makeup gain before any auxiliary audio enters dry.
+      notifyAuxiliaryMedia();
+      try {
+        source.connect(gain);
+        gain.connect(dryInput);
+      } catch (error) {
+        try {
+          source.disconnect(gain);
+        } catch {
+          /* own edge only */
+        }
+        try {
+          gain.disconnect(dryInput);
+        } catch {
+          /* own edge only */
+        }
+        activeMedia.delete(element);
+        auxiliaryMediaCount--;
+        notifyAuxiliaryMedia();
+        throw error;
+      }
       let disposed = false;
       return () => {
         if (disposed) return;
@@ -120,6 +165,9 @@ export function initializeAudioGraph(
         source.disconnect(gain);
         gain.disconnect(dryInput);
         activeMedia.delete(element);
+        auxiliaryMediaCount--;
+        // A zero count is observable only after the dry edge is retired.
+        notifyAuxiliaryMedia();
       };
     },
   };
