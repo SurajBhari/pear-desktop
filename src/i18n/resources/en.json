@@ -731,7 +731,43 @@
           }
         }
       },
-      "name": "Equalizer"
+      "name": "Equalizer",
+      "stock": {
+        "label": "Stock curves (10 bands)",
+        "user-presets": "Saved presets",
+        "names": {
+          "flat": "Flat",
+          "acoustic": "Acoustic",
+          "bass-booster": "Bass booster",
+          "bass-reducer": "Bass reducer",
+          "classical": "Classical",
+          "club": "Club",
+          "dance": "Dance",
+          "deep": "Deep",
+          "electronic": "Electronic",
+          "hip-hop": "Hip hop",
+          "jazz": "Jazz",
+          "latin": "Latin",
+          "live": "Live",
+          "loudness": "Loudness",
+          "lounge": "Lounge",
+          "metal": "Metal",
+          "piano": "Piano",
+          "pop": "Pop",
+          "reggae": "Reggae",
+          "rnb": "R&B",
+          "rock": "Rock",
+          "ska": "Ska",
+          "small-speakers": "Small speakers",
+          "soft": "Soft",
+          "soft-rock": "Soft rock",
+          "spoken-word": "Spoken word",
+          "techno": "Techno",
+          "treble-booster": "Treble booster",
+          "treble-reducer": "Treble reducer",
+          "vocal-booster": "Vocal booster"
+        }
+      }
     },
     "exponential-volume": {
       "description": "Makes the volume slider exponential so it's easier to select lower volumes.",

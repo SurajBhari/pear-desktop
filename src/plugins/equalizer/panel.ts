@@ -10,6 +10,7 @@ import {
   type EqualizerPluginConfig,
   type EqualizerProfile,
 } from './config';
+import { stockPresets, stockProfile } from './stock-presets';
 import style from './style.css?inline';
 
 export function openEqualizerPanel(
@@ -272,7 +273,6 @@ export function openEqualizerPanel(
         id: 'bass',
         name: t('plugins.equalizer.menu.presets.list.bass-booster'),
       },
-      ...state.userPresets,
     ];
     for (const preset of options) {
       const option = document.createElement('option');
@@ -280,6 +280,26 @@ export function openEqualizerPanel(
       option.textContent = preset.name;
       select.append(option);
     }
+    const stockGroup = document.createElement('optgroup');
+    stockGroup.label = t('plugins.equalizer.stock.label');
+    for (const preset of stockPresets) {
+      const option = document.createElement('option');
+      option.value = `stock:${preset.id}`;
+      option.textContent = t(`plugins.equalizer.stock.names.${preset.id}`);
+      stockGroup.append(option);
+    }
+    select.append(stockGroup);
+    const userGroup = document.createElement('optgroup');
+    userGroup.label = t('plugins.equalizer.stock.user-presets');
+    for (const preset of state.userPresets) {
+      const option = document.createElement('option');
+      option.value = `user:${preset.id}`;
+      option.textContent = preset.name;
+      userGroup.append(option);
+    }
+    if (state.userPresets.length) select.append(userGroup);
+    const selectedUserId = () =>
+      selectedPreset.startsWith('user:') ? selectedPreset.slice(5) : null;
     select.value = selectedPreset;
     select.onchange = () => {
       selectedPreset = select.value;
@@ -288,32 +308,45 @@ export function openEqualizerPanel(
           ? flatProfile(profile.mode)
           : selectedPreset === 'bass'
             ? bassProfile()
-            : state.userPresets.find((preset) => preset.id === selectedPreset)
-                ?.profile;
-      if (p) commit(p, {}, true);
+            : selectedPreset.startsWith('stock:')
+              ? stockProfile(selectedPreset.slice(6))
+              : state.userPresets.find(
+                  (preset) => preset.id === selectedUserId(),
+                )?.profile;
+      if (p)
+        commit(
+          p,
+          selectedPreset.startsWith('stock:')
+            ? {
+                rememberedProfiles: {
+                  ...state.rememberedProfiles,
+                  [profile.mode]: active(),
+                },
+              }
+            : {},
+          true,
+        );
     };
     const name = document.createElement('input');
     name.type = 'text';
     name.maxLength = 80;
     name.value =
-      state.userPresets.find((p) => p.id === selectedPreset)?.name ?? '';
+      state.userPresets.find((p) => p.id === selectedUserId())?.name ?? '';
     const save = button(t('plugins.equalizer.editor.save'), () => {
       const next = normalizeConfig(getConfig());
-      selectedPreset =
+      const id =
         next.userPresets.find((p) => p.name === name.value.trim())?.id ??
         crypto.randomUUID();
+      selectedPreset = `user:${id}`;
       const preset = {
-        id: selectedPreset,
+        id,
         name: name.value.trim(),
         profile: structuredClone(next.profile!),
       };
       commit(
         next.profile!,
         {
-          userPresets: [
-            ...next.userPresets.filter((p) => p.id !== selectedPreset),
-            preset,
-          ],
+          userPresets: [...next.userPresets.filter((p) => p.id !== id), preset],
         },
         true,
       );
@@ -329,7 +362,7 @@ export function openEqualizerPanel(
     name.oninput = updateSave;
     updateSave();
     const remove = button(t('plugins.equalizer.editor.delete'), () => {
-      const id = selectedPreset;
+      const id = selectedUserId();
       selectedPreset = '';
       commit(
         active(),
@@ -337,7 +370,7 @@ export function openEqualizerPanel(
         true,
       );
     });
-    remove.disabled = !state.userPresets.some((p) => p.id === selectedPreset);
+    remove.disabled = !state.userPresets.some((p) => p.id === selectedUserId());
     presets.append(
       label(t('plugins.equalizer.editor.preset'), select),
       label(t('plugins.equalizer.editor.preset-name'), name),
