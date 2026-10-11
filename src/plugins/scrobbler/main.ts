@@ -1,142 +1,434 @@
-import { type BrowserWindow } from 'electron';
+import { setTimeout, clearTimeout } from 'node:timers';
+
+import { deepmergeCustom } from 'deepmerge-ts';
+import {
+  ipcMain,
+  type BrowserWindow,
+  type IpcMainEvent,
+  type WebContents,
+  type WebFrameMain,
+} from 'electron';
 
 import {
   registerCallback,
   MediaType,
-  type SongInfo,
   SongInfoEvent,
+  getSongInfoProvenance,
+  getCurrentSongInfoProvenance,
+  type SongInfo,
+  type SongInfoProvenance,
 } from '@/providers/song-info';
 import { createBackend } from '@/utils';
 
-import { LastFmScrobbler } from './services/lastfm';
-import { ListenbrainzScrobbler } from './services/listenbrainz';
+import {
+  readWsAccount,
+  applyScrobblerPatch,
+  readListenbrainzAccount,
+  type ScrobblerPluginConfig,
+  type ScrobblerConfigPatch,
+  type WsServiceName,
+} from './config';
+import { createLastFmService } from './services/lastfm';
+import { createLibreFmService } from './services/librefm';
+import { createListenbrainzService } from './services/listenbrainz';
 
-import type { ScrobblerPluginConfig } from './index';
-import type { ScrobblerBase } from './services/base';
+import type { ScrobblerBase, ServiceRuntime } from './services/base';
+import type { BackendContext } from '@/types/contexts';
 
-export type SetConfType = (
-  conf: Partial<Omit<ScrobblerPluginConfig, 'enabled'>>,
-) => void | Promise<void>;
-
+export type SetConfType = (conf: ScrobblerConfigPatch) => void | Promise<void>;
+type ServiceName = WsServiceName | 'listenbrainz';
+type Track = {
+  info: SongInfo;
+  token: SongInfoProvenance;
+  scope: AbortController;
+  submitted: boolean;
+};
+const merge = deepmergeCustom({ mergeArrays: false });
+export class ScrobblerManager {
+  readonly services = new Map<ServiceName, ScrobblerBase>();
+  private active = true;
+  private config?: ScrobblerPluginConfig;
+  private configRevision = 0;
+  private viewEpoch = 0;
+  private contents: WebContents;
+  private frame?: WebFrameMain;
+  private track?: Track;
+  private latest?: SongInfo;
+  private timer?: NodeJS.Timeout;
+  private cleanup: (() => void)[] = [];
+  constructor(private readonly context: BackendContext<ScrobblerPluginConfig>) {
+    this.contents = context.window.webContents;
+    try {
+      this.frame = this.contents.mainFrame;
+    } catch {
+      this.frame = undefined;
+    }
+    const raw = (event: IpcMainEvent) => {
+      let frame: WebFrameMain;
+      try {
+        frame = this.contents.mainFrame;
+      } catch {
+        return;
+      }
+      if (
+        !this.active ||
+        event.sender !== this.contents ||
+        event.senderFrame !== frame
+      )
+        return;
+      this.retireTrack();
+      this.latest = undefined;
+      if (this.frame !== frame) {
+        this.retireServices();
+        this.frame = frame;
+        this.reconcileServices();
+      }
+    };
+    ipcMain.on('peard:video-src-changed', raw);
+    this.cleanup.push(() =>
+      ipcMain.removeListener('peard:video-src-changed', raw),
+    );
+    const closed = () => this.stop();
+    context.window.on('closed', closed);
+    this.contents.on('destroyed', closed);
+    this.cleanup.push(
+      () => context.window.removeListener('closed', closed),
+      () => this.contents.removeListener('destroyed', closed),
+    );
+    const unavailable = () => {
+      if (!this.active) return;
+      this.retireTrack();
+      this.retireServices();
+      this.frame = undefined;
+      this.latest = undefined;
+    };
+    const navigation = (...args: unknown[]) => {
+      const detail =
+        typeof args[0] === 'object' && args[0]
+          ? (args[0] as Record<string, unknown>)
+          : undefined;
+      const main =
+        typeof args[3] === 'boolean' ? args[3] : detail?.isMainFrame === true;
+      const inPlace =
+        typeof args[2] === 'boolean' ? args[2] : detail?.isInPlace === true;
+      if (main && !inPlace) unavailable();
+    };
+    this.contents.on('render-process-gone', unavailable);
+    this.contents.on('did-start-navigation', navigation);
+    const ready = () => {
+      try {
+        if (
+          !this.active ||
+          this.context.window.isDestroyed() ||
+          this.contents.isDestroyed() ||
+          this.context.window.webContents !== this.contents
+        )
+          return;
+        const frame = this.contents.mainFrame;
+        if (this.frame === frame) return;
+        this.retireTrack();
+        this.latest = undefined;
+        this.retireServices();
+        this.frame = frame;
+        this.reconcileServices();
+      } catch {
+        return;
+      }
+    };
+    this.contents.on('did-finish-load', ready);
+    this.cleanup.push(
+      () => this.contents.removeListener('render-process-gone', unavailable),
+      () => this.contents.removeListener('did-start-navigation', navigation),
+      () => this.contents.removeListener('did-finish-load', ready),
+    );
+    this.cleanup.push(
+      registerCallback((info, event) => this.onInfo(info, event), {
+        replayCurrent: true,
+      }),
+    );
+  }
+  private ownsWindow() {
+    try {
+      if (!this.active || !this.frame) return false;
+      const closed =
+        this.context.window.isDestroyed() || this.contents.isDestroyed();
+      const frame = this.contents.mainFrame;
+      return (
+        !closed &&
+        this.active &&
+        this.context.window.webContents === this.contents &&
+        frame === this.frame
+      );
+    } catch {
+      return false;
+    }
+  }
+  private current(info: SongInfo, token: SongInfoProvenance) {
+    if (!this.ownsWindow()) return false;
+    const owned = getSongInfoProvenance(info),
+      current = getCurrentSongInfoProvenance(this.context.window);
+    return (
+      !!owned &&
+      owned === token &&
+      current === token &&
+      this.active &&
+      this.ownsWindow()
+    );
+  }
+  async start() {
+    const revision = this.configRevision;
+    try {
+      const config = await this.context.getConfig();
+      if (!this.active) return;
+      if (this.configRevision === revision) this.configurationChanged(config);
+      else this.reconcileServices();
+    } catch {
+      if (this.active && revision === this.configRevision) this.stop();
+    }
+  }
+  configurationChanged(config: ScrobblerPluginConfig) {
+    if (!this.active) return;
+    this.configRevision++;
+    this.config = config;
+    this.retireTrack(false);
+    this.reconcileServices();
+    this.reconsider();
+  }
+  private retireServices() {
+    this.viewEpoch++;
+    for (const service of this.services.values()) service.stop();
+    this.services.clear();
+  }
+  private retireTrack(clear = true) {
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    this.track?.scope.abort();
+    if (clear) this.track = undefined;
+    else if (this.track) this.track.scope = new AbortController();
+  }
+  stop() {
+    if (!this.active) return;
+    this.active = false;
+    this.retireTrack();
+    this.retireServices();
+    this.latest = undefined;
+    for (const dispose of this.cleanup.splice(0)) dispose();
+  }
+  authenticate(
+    name: WsServiceName,
+    window: BrowserWindow = this.context.window,
+  ) {
+    const service = this.services.get(name);
+    return window === this.context.window && this.ownsWindow() && service
+      ? service.createSession(true)
+      : Promise.resolve(false);
+  }
+  private reconcileServices() {
+    if (!this.ownsWindow() || this.config?.enabled !== true) {
+      this.retireServices();
+      return;
+    }
+    for (const name of ['lastfm', 'librefm', 'listenbrainz'] as const) {
+      const fingerprint =
+        name === 'listenbrainz'
+          ? readListenbrainzAccount(this.config)?.fingerprint
+          : readWsAccount(this.config, name)?.fingerprint;
+      let service = this.services.get(name);
+      if (service && service.fingerprint !== fingerprint) {
+        service.stop();
+        this.services.delete(name);
+        service = undefined;
+      }
+      if (!fingerprint) continue;
+      if (service) {
+        service.configurationChanged();
+        continue;
+      }
+      const epoch = this.viewEpoch;
+      let created: ScrobblerBase;
+      const runtime: ServiceRuntime = {
+        window: this.context.window,
+        readConfig: () => this.config,
+        isCurrent: () =>
+          this.active &&
+          this.viewEpoch === epoch &&
+          this.services.get(name) === created &&
+          this.ownsWindow(),
+        writeConfig: (patch, guard) => this.writeConfig(patch, guard),
+      };
+      created =
+        name === 'lastfm'
+          ? createLastFmService(runtime)
+          : name === 'librefm'
+            ? createLibreFmService(runtime)
+            : createListenbrainzService(runtime);
+      this.services.set(name, created);
+      const revision = this.configRevision;
+      if (!created.isSessionCreated())
+        created.createSession().then(
+          (success) => {
+            if (
+              success &&
+              revision === this.configRevision &&
+              runtime.isCurrent()
+            )
+              this.reconsider();
+          },
+          () => {},
+        );
+    }
+  }
+  private async writeConfig(
+    patch: ScrobblerConfigPatch,
+    guard: () => boolean,
+  ): Promise<boolean> {
+    const epoch = this.viewEpoch,
+      revision = this.configRevision;
+    try {
+      if (
+        !this.ownsWindow() ||
+        !guard() ||
+        !this.active ||
+        epoch !== this.viewEpoch
+      )
+        return false;
+      await applyScrobblerPatch(this.context.setConfig, patch);
+      if (!this.active || epoch !== this.viewEpoch || !this.ownsWindow())
+        return false;
+      if (revision === this.configRevision && this.config)
+        this.configurationChanged(
+          merge(this.config, patch) as ScrobblerPluginConfig,
+        );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  private onInfo(info: SongInfo, event: SongInfoEvent) {
+    const token = getSongInfoProvenance(info);
+    if (!token || !this.current(info, token)) return;
+    this.latest = info;
+    if (event === SongInfoEvent.TimeChanged) return;
+    if (!this.track || this.track.token !== token) {
+      this.retireTrack();
+      this.track = {
+        info,
+        token,
+        scope: new AbortController(),
+        submitted: false,
+      };
+    } else this.track.info = info;
+    this.reconsider();
+  }
+  private reconsider() {
+    const config = this.config,
+      info = this.latest;
+    const token = info && getSongInfoProvenance(info);
+    if (
+      !config ||
+      config.enabled !== true ||
+      !info ||
+      !token ||
+      !this.current(info, token)
+    )
+      return;
+    if (!this.track || this.track.token !== token) {
+      this.retireTrack();
+      this.track = {
+        info,
+        token,
+        scope: new AbortController(),
+        submitted: false,
+      };
+    }
+    const track = this.track;
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    if (
+      info.isPaused ||
+      (!config.scrobbleOtherMedia &&
+        info.mediaType !== MediaType.Audio &&
+        info.mediaType !== MediaType.OriginalMusicVideo)
+    )
+      return;
+    const revision = this.configRevision,
+      epoch = this.viewEpoch;
+    const owner = {
+      signal: track.scope.signal,
+      isCurrent: () =>
+        this.active &&
+        revision === this.configRevision &&
+        epoch === this.viewEpoch &&
+        this.track === track &&
+        !track.scope.signal.aborted &&
+        this.current(track.info, track.token),
+    };
+    for (const service of this.services.values())
+      service.setNowPlaying(info, config, owner).catch(() => {});
+    const elapsed = info.elapsedSeconds ?? 0,
+      duration = info.songDuration;
+    if (
+      !Number.isFinite(elapsed) ||
+      elapsed < 0 ||
+      !Number.isFinite(duration) ||
+      duration < 0 ||
+      track.submitted
+    )
+      return;
+    const threshold = Math.min(Math.ceil(duration / 2), 4 * 60);
+    // Preserve the existing threshold/elapsed branch; TimeChanged mutates info.
+    if (threshold > elapsed)
+      this.timer = setTimeout(
+        () => {
+          this.timer = undefined;
+          if (!owner.isCurrent() || track.info.isPaused || track.submitted)
+            return;
+          track.submitted = true;
+          for (const service of this.services.values())
+            service
+              .addScrobble(track.info, this.config!, owner)
+              .catch(() => {});
+        },
+        (threshold - elapsed) * 1000,
+      );
+  }
+}
+export const createScrobblerManager = (
+  context: BackendContext<ScrobblerPluginConfig>,
+) => new ScrobblerManager(context);
 export const backend = createBackend<
   {
-    config?: ScrobblerPluginConfig;
-    window?: BrowserWindow;
-    enabledScrobblers: Map<string, ScrobblerBase>;
-    toggleScrobblers(
-      config: ScrobblerPluginConfig,
+    manager?: ScrobblerManager;
+    enabledScrobblers: Map<ServiceName, ScrobblerBase>;
+    lifecycleRevision: number;
+    authenticate: (
+      name: WsServiceName,
       window: BrowserWindow,
-    ): void;
-    createSessions(
-      config: ScrobblerPluginConfig,
-      setConfig: SetConfType,
-    ): Promise<void>;
-    setConfig?: SetConfType;
+    ) => Promise<boolean>;
   },
   ScrobblerPluginConfig
 >({
   enabledScrobblers: new Map(),
-
-  toggleScrobblers(config: ScrobblerPluginConfig, window: BrowserWindow) {
-    if (config.scrobblers.lastfm && config.scrobblers.lastfm.enabled) {
-      this.enabledScrobblers.set('lastfm', new LastFmScrobbler(window));
-    } else {
-      this.enabledScrobblers.delete('lastfm');
-    }
-
-    if (
-      config.scrobblers.listenbrainz &&
-      config.scrobblers.listenbrainz.enabled
-    ) {
-      this.enabledScrobblers.set('listenbrainz', new ListenbrainzScrobbler());
-    } else {
-      this.enabledScrobblers.delete('listenbrainz');
-    }
+  lifecycleRevision: 0,
+  async start(context) {
+    this.manager?.stop();
+    this.lifecycleRevision++;
+    this.manager = createScrobblerManager(context);
+    this.enabledScrobblers = this.manager.services;
+    await this.manager.start();
   },
-
-  async createSessions(config: ScrobblerPluginConfig, setConfig: SetConfType) {
-    for (const [, scrobbler] of this.enabledScrobblers) {
-      if (!scrobbler.isSessionCreated(config)) {
-        await scrobbler.createSession(config, setConfig);
-      }
-    }
+  stop() {
+    this.lifecycleRevision++;
+    this.manager?.stop();
+    this.manager = undefined;
+    this.enabledScrobblers = new Map();
   },
-
-  async start({ getConfig, setConfig, window }) {
-    const config = (this.config = await getConfig());
-    // This will store the timeout that will trigger addScrobble
-    let scrobbleTimer: NodeJS.Timeout | undefined;
-
-    this.window = window;
-    this.toggleScrobblers(config, window);
-    await this.createSessions(config, setConfig);
-    this.setConfig = setConfig;
-
-    registerCallback((songInfo: SongInfo, event) => {
-      if (event === SongInfoEvent.TimeChanged) return;
-      // Set remove the old scrobble timer
-      clearTimeout(scrobbleTimer);
-      if (!songInfo.isPaused) {
-        const configNonnull = this.config!;
-        // Scrobblers normally have no trouble working with official music videos
-        if (
-          !configNonnull.scrobbleOtherMedia &&
-          songInfo.mediaType !== MediaType.Audio &&
-          songInfo.mediaType !== MediaType.OriginalMusicVideo
-        ) {
-          return;
-        }
-
-        // Scrobble when the song is halfway through, or has passed the 4-minute mark
-        const scrobbleTime = Math.min(
-          Math.ceil(songInfo.songDuration / 2),
-          4 * 60,
-        );
-        if (scrobbleTime > (songInfo.elapsedSeconds ?? 0)) {
-          // Scrobble still needs to happen
-          const timeToWait =
-            (scrobbleTime - (songInfo.elapsedSeconds ?? 0)) * 1000;
-          scrobbleTimer = setTimeout(
-            (info, config) => {
-              this.enabledScrobblers.forEach((scrobbler) =>
-                scrobbler.addScrobble(info, config, setConfig),
-              );
-            },
-            timeToWait,
-            songInfo,
-            configNonnull,
-          );
-        }
-
-        this.enabledScrobblers.forEach((scrobbler) =>
-          scrobbler.setNowPlaying(songInfo, configNonnull, setConfig),
-        );
-      }
-    });
+  onConfigChange(config) {
+    this.manager?.configurationChanged(config);
   },
-
-  async onConfigChange(newConfig: ScrobblerPluginConfig) {
-    this.enabledScrobblers.clear();
-
-    this.toggleScrobblers(newConfig, this.window!);
-    for (const [scrobblerName, scrobblerConfig] of Object.entries(
-      newConfig.scrobblers,
-    )) {
-      if (scrobblerConfig.enabled) {
-        const scrobbler = this.enabledScrobblers.get(scrobblerName);
-        if (
-          this.config?.scrobblers?.[
-            scrobblerName as keyof typeof newConfig.scrobblers
-          ]?.enabled !== scrobblerConfig.enabled &&
-          scrobbler &&
-          !scrobbler.isSessionCreated(newConfig) &&
-          this.setConfig
-        ) {
-          await scrobbler.createSession(newConfig, this.setConfig);
-        }
-      }
-    }
-
-    this.config = newConfig;
+  authenticate(name, window) {
+    return this.manager
+      ? this.manager.authenticate(name, window)
+      : Promise.resolve(false);
   },
 });
