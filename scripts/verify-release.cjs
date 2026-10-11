@@ -1,4 +1,4 @@
-// Check the complete official desktop matrix before uploading a release.
+// Check the complete fork desktop matrix before uploading a release.
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -39,6 +39,8 @@ if (mode === 'stage') {
     `YouTube-Music-${version}.exe`, `youtube-music-${version}.freebsd`,
     `youtube-music-${version}.tar.gz`, `youtube-music-${version}.x86_64.rpm`,
     `YouTube-Music-Web-Setup-${version}.exe`, `youtube-music_${version}_amd64.deb`,
+    `YouTube-Music-Setup-${version}.exe`, `YouTube-Music-Setup-${version}.exe.blockmap`,
+    `YouTube-Music-${version}-aarch64.flatpak`,
     `youtube-music_${version}_amd64.snap`, `youtube-music_${version}_arm64.deb`,
     `youtube-music_${version}_armv7l.deb`,
     `YouTube-Music-${version}-mac.zip`, `YouTube-Music-${version}-arm64-mac.zip`,
@@ -48,6 +50,44 @@ if (mode === 'stage') {
     const full = path.join(directory, file);
     if (!fs.existsSync(full) || !fs.statSync(full).isFile() || fs.statSync(full).size === 0) fail(`Missing/empty asset: ${file}`);
   }
+  const webInstaller = `YouTube-Music-Web-Setup-${version}.exe`;
+  const macArchives = [`YouTube-Music-${version}-mac.zip`, `YouTube-Music-${version}-arm64-mac.zip`];
+  const linuxRole = (suffix, debArch, rpmArch) => {
+    const image = `YouTube-Music-${version}${suffix ? '-' + suffix : ''}.AppImage`;
+    return {
+      required: [image], primary: [image],
+      allowed: [image, `youtube-music_${version}_${debArch}.deb`, ...(rpmArch ? [`youtube-music-${version}.${rpmArch}.rpm`] : [])],
+    };
+  };
+  const roles = {
+    'latest.yml': { required: [webInstaller], primary: [webInstaller], allowed: [webInstaller] },
+    'latest-mac.yml': {
+      required: macArchives, primary: macArchives,
+      allowed: [...macArchives, `YouTube-Music-${version}.dmg`, `YouTube-Music-${version}-arm64.dmg`],
+    },
+    'latest-linux.yml': linuxRole('', 'amd64', 'x86_64'),
+    'latest-linux-arm64.yml': linuxRole('arm64', 'arm64', 'aarch64'),
+    'latest-linux-arm.yml': linuxRole('armv7l', 'armv7l'),
+  };
+  const checkRole = (name, metadata) => {
+    const role = roles[name];
+    if (!Array.isArray(metadata.files)) fail(`Invalid updater role: ${name}`);
+    const names = metadata.files.map(file => file?.url);
+    if (new Set(names).size !== names.length ||
+      names.some(file => !role.allowed.includes(file)) ||
+      role.required.some(file => !names.includes(file)) ||
+      !role.primary.includes(metadata.path)) fail(`Invalid updater role: ${name}`);
+    if (name === 'latest.yml') {
+      const packages = metadata.packages;
+      const arches = ['x64', 'ia32', 'arm64'];
+      if (!packages || typeof packages !== 'object' || Array.isArray(packages) ||
+        Object.keys(packages).length !== arches.length ||
+        arches.some(arch => !Object.hasOwn(packages, arch) ||
+          packages[arch]?.path !== `youtube-music-${version}-${arch}.nsis.7z`)) {
+        fail(`Invalid updater role: ${name}`);
+      }
+    } else if (metadata.packages !== undefined) fail(`Invalid updater role: ${name}`);
+  };
   const hash = (file, algorithm, encoding) => new Promise((resolve, reject) => {
     const digest = crypto.createHash(algorithm);
     fs.createReadStream(file).on('error', reject).on('data', chunk => digest.update(chunk))
@@ -64,6 +104,7 @@ if (mode === 'stage') {
     for (const name of expected.filter(file => file.endsWith('.yml'))) {
       const metadata = yaml.load(fs.readFileSync(path.join(directory, name), 'utf8'));
       if (metadata.version !== version || !metadata.files?.length) fail(`Invalid updater metadata: ${name}`);
+      checkRole(name, metadata);
       for (const file of metadata.files) await checkFile(file.url, file);
       if (metadata.path) await checkFile(metadata.path, metadata);
       for (const info of Object.values(metadata.packages || {})) await checkFile(info.path, info);
