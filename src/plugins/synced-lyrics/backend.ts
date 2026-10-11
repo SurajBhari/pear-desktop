@@ -6,6 +6,10 @@ import { t } from '@/i18n';
 import { registerCallback } from '@/providers/song-info';
 import { createBackend } from '@/utils';
 
+import {
+  startNetEaseProvider,
+  stopNetEaseProvider,
+} from './providers/netease-backend';
 import { serializeLyricsExport } from './tools';
 
 import type { SyncedLyricsPluginConfig } from './types';
@@ -48,6 +52,7 @@ const pendingDialogs = new WeakSet<
 
 export const backend = createBackend<unknown, SyncedLyricsPluginConfig>({
   start(ctx) {
+    startNetEaseProvider(ctx);
     const previous = currentSession;
     if (previous) {
       previous.active = false;
@@ -178,6 +183,7 @@ export const backend = createBackend<unknown, SyncedLyricsPluginConfig>({
     );
   },
   stop(ctx) {
+    stopNetEaseProvider(ctx);
     const session = sessions.get(ctx.window);
     if (!session || currentSession !== session) return;
     if (session) {

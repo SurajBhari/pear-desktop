@@ -1223,6 +1223,13 @@
       "placeholder": "Title or artist",
       "clear": "Clear",
       "results": "{{matches}} of {{total}} loaded items match"
+    },
+    "statusbar-lyrics": {
+      "name": "Menu bar lyrics",
+      "description": "Show the current synced lyric line in the macOS menu bar. Requires Synced Lyrics.",
+      "pronunciation": "Include pronunciation",
+      "max-length": "Maximum length",
+      "failed": "Could not update menu bar lyrics"
     }
   }
 }
