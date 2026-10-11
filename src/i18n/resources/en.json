@@ -1308,6 +1308,13 @@
     "skip-live-songs": {
       "name": "Skip live recordings",
       "description": "Skip explicitly marked live recordings. Ordinary city, radio and studio titles are retained."
+    },
+    "auto-acknowledge": {
+      "name": "Auto-acknowledge content warnings",
+      "description": "Automatically dismisses YouTube's suicide/self-harm player interstitial so playback is not blocked. Opt-in; does not dismiss age gates, sign-in, or other playability errors",
+      "menu": {
+        "debug": "Debug logging"
+      }
     }
   }
 }
