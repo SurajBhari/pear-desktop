@@ -1321,6 +1321,10 @@
       "menu": {
         "debug": "Debug logging"
       }
+    },
+    "resume-shuffle": {
+      "name": "Resume shuffle",
+      "description": "Remember shuffle and restore it when resuming the last queue."
     }
   }
 }
