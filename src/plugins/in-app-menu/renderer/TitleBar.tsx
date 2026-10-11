@@ -395,9 +395,10 @@ export const TitleBar = (props: TitleBarProps) => {
           const index = Number(element.getAttribute('data-index') ?? 0);
           const length = Number(element.getAttribute('data-length') ?? 1);
 
+          // oxfmt-ignore
           (element as HTMLElement).style.setProperty(
             'transition-delay',
-            `${length * 0.025 - index * 0.025}s`,
+            `${(length * 0.025) - (index * 0.025)}s`,
           );
         }}
       >
