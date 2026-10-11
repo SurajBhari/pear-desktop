@@ -26,7 +26,8 @@ async function statements(file: string, name: string) {
     const calls = syntax.getDescendantsOfKind(ts.SyntaxKind.CallExpression);
     const wanted = calls.filter((call) =>
       name === 'watch'
-        ? call.getExpression().getText() === 'config.watch'
+        ? call.getExpression().getText() === 'config.watch' &&
+          call.getArguments()[0]?.getText().includes('newPluginConfigList')
         : call.getExpression().getText() === 'ipcMain.handle' &&
           ['peard:get-config', 'peard:set-config'].includes(
             call.getArguments()[0]?.getText().slice(1, -1),

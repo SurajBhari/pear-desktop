@@ -184,7 +184,8 @@
                 }
               }
             }
-          }
+          },
+          "strip-music-from-shared-links": "Use youtube.com in shared links"
         }
       },
       "plugins": {

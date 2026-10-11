@@ -253,6 +253,28 @@ const initHook = async (win: BrowserWindow) => {
     configIpcRegistered = true;
   }
 
+  if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+    let shareLinksAlive = true;
+    let shareLinksEnabled =
+      config.get('options.stripMusicFromSharedLinks') === true;
+    const releaseShareLinksWatch = config.watch(() => {
+      if (
+        !shareLinksAlive ||
+        win.isDestroyed() ||
+        win.webContents.isDestroyed()
+      )
+        return;
+      const enabled = config.get('options.stripMusicFromSharedLinks') === true;
+      if (enabled === shareLinksEnabled) return;
+      shareLinksEnabled = enabled;
+      win.webContents.send('peard:strip-music-from-shared-links', enabled);
+    });
+    win.once('closed', () => {
+      shareLinksAlive = false;
+      releaseShareLinksWatch();
+    });
+  }
+
   if (!configWatcherRegistered) {
     config.watch((newValue, oldValue) => {
       const win = configWindow;

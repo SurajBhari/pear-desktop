@@ -181,7 +181,8 @@
                 }
               }
             }
-          }
+          },
+          "strip-music-from-shared-links": "Использовать youtube.com в ссылках для отправки"
         }
       },
       "plugins": {

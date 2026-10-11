@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -10,6 +11,11 @@ import {
   defaultAPIServerConfig,
   type APIServerConfig,
 } from '../src/plugins/api-server/config';
+
+const fixtureWindow = () => Object.assign(new EventEmitter(), {
+  isDestroyed: () => false,
+  webContents: { send: () => {}, isDestroyed: () => false },
+});
 
 const root = path.resolve('.');
 const requireRoot = createRequire(path.join(root, 'package.json'));
@@ -88,6 +94,7 @@ const getAllLoadedMainPlugins = () => ({});
 const showNeedToRestartDialog = () => {};
 ${initHookSource}
 export { fixtureEvents, handlers, defaultAPIServerConfig };
+export {store} from './store.ts';
 `,
   );
 
@@ -123,7 +130,7 @@ export { fixtureEvents, handlers, defaultAPIServerConfig };
   const originalWatch = store.onDidAnyChange.bind(store);
   Reflect.set(store, 'onDidAnyChange', (...args: unknown[]) => {
     fixtureEvents.push('watch');
-    Reflect.apply(originalWatch, store, args);
+    return Reflect.apply(originalWatch, store, args);
   });
   const globals = globalThis as typeof globalThis & {
     __pearApiServerConfigFixture?: { store: Conf; events: string[] };
@@ -136,6 +143,7 @@ export { fixtureEvents, handlers, defaultAPIServerConfig };
       fixtureEvents: string[];
       handlers: Record<string, (...args: unknown[]) => unknown>;
       defaultAPIServerConfig: APIServerConfig;
+      store: Conf;
     };
   } finally {
     if (previousFixture === undefined)
@@ -151,15 +159,11 @@ test('API server defaults bind locally and use a persistent strong secret', asyn
   const directory = await makeTestDirectory('.pear-api-config-');
   try {
     const source = await buildActualInitHook(directory);
-    await source.initHook({
-      isDestroyed: () => false,
-      once: () => {},
-      webContents: { isDestroyed: () => false, send: () => {} },
-    });
+    await source.initHook(fixtureWindow());
     const reopened = new Conf({ cwd: directory, configName: 'config' });
     const persisted = reopened.get('plugins.api-server') as APIServerConfig;
 
-    expect(source.fixtureEvents).toEqual(['set', 'watch']);
+    expect(source.fixtureEvents).toEqual(['set', 'watch', 'watch']);
     expect(persisted.hostname).toBe('127.0.0.1');
     expect(persisted.secret).toBe(source.defaultAPIServerConfig.secret);
     expect(reopened.get('plugins.api-server')).toEqual(persisted);
@@ -181,15 +185,11 @@ test('saved API server settings survive default materialization and reopen', asy
     const firstStore = new Conf(options);
     firstStore.set('plugins.api-server', saved);
     const source = await buildActualInitHook(directory);
-    await source.initHook({
-      isDestroyed: () => false,
-      once: () => {},
-      webContents: { isDestroyed: () => false, send: () => {} },
-    });
+    await source.initHook(fixtureWindow());
 
     const reopened = new Conf(options);
     const result = reopened.get('plugins.api-server') as APIServerConfig;
-    expect(source.fixtureEvents).toEqual(['watch']);
+    expect(source.fixtureEvents).toEqual(['watch', 'watch']);
     expect(result.hostname).toBe(saved.hostname);
     expect(result.secret).toBe(saved.secret);
     expect(result.authorizedClients).toEqual(saved.authorizedClients);
@@ -212,15 +212,11 @@ test('missing secret materialization preserves every saved API setting', async (
     const store = new Conf({ cwd: directory, configName: 'config' });
     store.set('plugins.api-server', saved);
     const source = await buildActualInitHook(directory);
-    await source.initHook({
-      isDestroyed: () => false,
-      once: () => {},
-      webContents: { isDestroyed: () => false, send: () => {} },
-    });
+    await source.initHook(fixtureWindow());
     const reopened = new Conf({ cwd: directory, configName: 'config' });
     const merged = reopened.get('plugins.api-server') as APIServerConfig;
 
-    expect(source.fixtureEvents).toEqual(['set', 'watch']);
+    expect(source.fixtureEvents).toEqual(['set', 'watch', 'watch']);
     expect(merged.secret).toBe(source.defaultAPIServerConfig.secret);
     expect(merged.enabled).toBe(saved.enabled);
     expect(merged.hostname).toBe(saved.hostname);
@@ -250,9 +246,11 @@ test('new profiles receive distinct API server secrets', async () => {
       Date.now = () => 0;
       const first = (await import(`${moduleUrl}?profile=one`)) as {
         defaultAPIServerConfig: APIServerConfig;
+      store: Conf;
       };
       const second = (await import(`${moduleUrl}?profile=two`)) as {
         defaultAPIServerConfig: APIServerConfig;
+      store: Conf;
       };
 
       expect(first.defaultAPIServerConfig.secret).not.toBe(
@@ -261,6 +259,52 @@ test('new profiles receive distinct API server secrets', async () => {
     } finally {
       Date.now = originalNow;
     }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('shared-link option updates the current window only and releases its config subscription on close', async () => {
+  const directory = await makeTestDirectory('.pear-share-option-');
+  try {
+    const source = await buildActualInitHook(directory);
+    const win = fixtureWindow();
+    const sent: unknown[][] = [];
+    win.webContents.send = (...args: unknown[]) => { sent.push(args); };
+    await source.initHook(win);
+    const store = source.store;
+    store.set('options.stripMusicFromSharedLinks', true);
+    await expect.poll(() => sent).toEqual([['peard:strip-music-from-shared-links', true]]);
+    store.set('options.unrelatedFixtureOption', true);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sent).toHaveLength(1);
+    store.set('options.stripMusicFromSharedLinks', false);
+    await expect.poll(() => sent).toEqual([
+      ['peard:strip-music-from-shared-links', true],
+      ['peard:strip-music-from-shared-links', false],
+    ]);
+    win.emit('closed');
+    store.set('options.stripMusicFromSharedLinks', true);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sent).toHaveLength(2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('window retirement during async plugin discovery never installs a shared-link watcher', async () => {
+  const directory = await makeTestDirectory('.pear-share-retired-');
+  try {
+    const source = await buildActualInitHook(directory);
+    const win = fixtureWindow();
+    const starting = source.initHook(win);
+    win.isDestroyed = () => true;
+    win.webContents.isDestroyed = () => true;
+    win.emit('closed');
+    await starting;
+    expect(win.listenerCount('closed')).toBe(0);
+    // The parent locale lifecycle retires before persisting config or installing watchers.
+    expect(source.fixtureEvents).toEqual([]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

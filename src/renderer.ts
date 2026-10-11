@@ -29,6 +29,7 @@ import {
 import { startingPages } from './providers/extracted-data';
 import { createPlaylistQueueController } from './providers/queue-playlist-renderer';
 import { createRepeatPreference } from './providers/repeat-preference';
+import { setupShareLinks } from './providers/share-links';
 import { setupSongInfo } from './providers/song-info-front';
 
 import type { MusicPlayer } from '@/types/music-player';
@@ -541,6 +542,30 @@ const preload = async () => {
 };
 
 const main = async () => {
+  const setSharedLinks = setupShareLinks();
+  let shareActive = true;
+  const updateSharedLinks = (_event: unknown, value: unknown) => {
+    if (shareActive) setSharedLinks(value === true);
+  };
+  window.ipcRenderer.on(
+    'peard:strip-music-from-shared-links',
+    updateSharedLinks,
+  );
+  setSharedLinks(
+    window.mainConfig.get('options.stripMusicFromSharedLinks') === true,
+  );
+  window.addEventListener(
+    'pagehide',
+    () => {
+      shareActive = false;
+      window.ipcRenderer.removeListener(
+        'peard:strip-music-from-shared-links',
+        updateSharedLinks,
+      );
+      setSharedLinks(false);
+    },
+    { once: true },
+  );
   await loadAllRendererPlugins();
   isPluginLoaded = true;
 

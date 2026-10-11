@@ -42,6 +42,9 @@ async function fixture(plugins: Record<string, any>) {
           };
         },
         on: (id: string, fn: (...args: any[]) => any) => handlers.set(id, fn),
+        removeListener: (id: string, fn: (...args: any[]) => any) => {
+          if (handlers.get(id) === fn) handlers.delete(id);
+        },
         send() {},
       },
     },
@@ -75,6 +78,8 @@ async function fixture(plugins: Record<string, any>) {
   )
     .replace(/^import[\s\S]*?;\n/gm, '')
     .replace(/^export /gm, '');
+  const shareProvider = (await readFile(new URL('../src/utils/share-url.ts', import.meta.url), 'utf8')) + '\n' + (await readFile(new URL('../src/providers/share-links.ts', import.meta.url), 'utf8')).replace(/^import[^;]+;\n/gm, '');
+  const shareSource = stripTypeScriptTypes(shareProvider).replace(/^export /gm, '');
   const boundaries = `
 const fixture=globalThis[${JSON.stringify(key)}];
 const {window}=fixture; const document=fixture.dom.document;
@@ -92,7 +97,7 @@ const forceUnloadRendererPlugin=async()=>{};
 class AudioContext {destination={};addEventListener(){}removeEventListener(){}createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(){return {connect(){},disconnect(){}}}}
 `;
   const source = await import(
-    `data:text/javascript;base64,${Buffer.from(boundaries + repeatProvider + (await playlistProviderSource()) + actual).toString('base64')}`
+    `data:text/javascript;base64,${Buffer.from(boundaries + shareSource + repeatProvider + (await playlistProviderSource()) + actual).toString('base64')}`
   );
   return {
     ...state,
@@ -179,3 +184,26 @@ for (const asynchronous of [false, true]) {
     }
   });
 }
+
+test('actual renderer share option changes Copy input and retires IPC updates on pagehide', async () => {
+  const f = await fixture({});
+  const music = 'https://music.youtube.com/watch?v=OtherVideo1';
+  try {
+    f.dom.document.body.insertAdjacentHTML('beforeend', '<yt-copy-link-renderer><input id="share-url"></yt-copy-link-renderer>');
+    const input = f.dom.document.querySelector<HTMLInputElement>('#share-url')!;
+    input.value = music;
+    await f.source.main();
+    const update = f.handlers.get('peard:strip-music-from-shared-links')!;
+    expect(input.value).toBe(music);
+    update({}, true);
+    expect(input.value).toBe(music.replace('music.', ''));
+    f.dom.dispatchEvent(new f.dom.Event('pagehide'));
+    expect(input.value).toBe(music);
+    expect(f.handlers.has('peard:strip-music-from-shared-links')).toBe(false);
+    update({}, true);
+    expect(input.value).toBe(music);
+    expect(f.handlers.has('plugin:enable')).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
