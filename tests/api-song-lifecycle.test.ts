@@ -37,7 +37,7 @@ export {ipcMain,fixtureWindow,createFixtureWindow,fixtureNetwork,app} from 'elec
 import {EventEmitter} from 'node:events';
 export const ipcMain=new EventEmitter(); export const app=new EventEmitter();
 class FixtureWindow extends EventEmitter {
- destroyed=false; messages=[]; webContents={send:(...args)=>this.messages.push(args),executeJavaScript:async()=>undefined};
+ destroyed=false; messages=[]; webContents=Object.assign(new EventEmitter(),{isDestroyed:()=>this.destroyed,mainFrame:{},send:(...args)=>this.messages.push(args),executeJavaScript:async()=>undefined});
  isDestroyed(){return this.destroyed;} destroy(){this.destroyed=true;this.emit('closed');}
 }
 export const createFixtureWindow=()=>new FixtureWindow();export const fixtureWindow=createFixtureWindow();
@@ -151,7 +151,13 @@ export const dialog={showMessageBox:async()=>({response:1})};
     writes: () => writes,
     emit: async (event: string, ...args: unknown[]) => {
       for (const listener of ipcMain.listeners(event))
-        await listener({}, ...args);
+        await listener(
+          {
+            sender: fixtureWindow.webContents,
+            senderFrame: fixtureWindow.webContents.mainFrame,
+          },
+          ...args,
+        );
     },
     start: async () => {
       await backend.start(ctx);

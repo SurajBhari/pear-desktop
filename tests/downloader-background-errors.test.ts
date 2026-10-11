@@ -46,7 +46,7 @@ export {fixtureState,fixtureWindow,ipcMain} from 'electron';
 import {EventEmitter} from 'node:events';
 export const fixtureState={focused:false,destroyed:false,dialogs:[],progress:[],badges:[],feedback:[],focus:[],deadCalls:[],logs:[],network:[],requests:[],notifications:[],dialogMode:'supported',notificationMode:'supported',infoMode:'reject',rejection:new Error('fixture media failed',{cause:new Error('fixture cause')}),errorHandled:undefined};
 class FixtureWindow extends EventEmitter {
- webContents={isDestroyed:()=>fixtureState.destroyed,send:(name,...args)=>{if(fixtureState.destroyed){fixtureState.deadCalls.push('feedback');throw new Error('Object has been destroyed');}fixtureState.feedback.push({name,args});},executeJavaScript:async()=>undefined,session:{cookies:{get:async()=>[]}}};
+ webContents=Object.assign(new EventEmitter(),{isDestroyed:()=>fixtureState.destroyed,mainFrame:{},send:(name,...args)=>{if(fixtureState.destroyed){fixtureState.deadCalls.push('feedback');throw new Error('Object has been destroyed');}fixtureState.feedback.push({name,args});},executeJavaScript:async()=>undefined,session:{cookies:{get:async()=>[]}}});
  isDestroyed(){return fixtureState.destroyed;} isFocused(){if(fixtureState.destroyed){fixtureState.deadCalls.push('focus-read');throw new Error('Object has been destroyed');}return fixtureState.focused;}
  focus(){fixtureState.focus.push('focus');} show(){fixtureState.focus.push('show');} getSize(){return [800,600];}
  setProgressBar(value){if(fixtureState.destroyed){fixtureState.deadCalls.push('progress');throw new Error('Object has been destroyed');}fixtureState.progress.push(value);if(value===-1)queueMicrotask(()=>fixtureState.errorHandled?.());}
@@ -183,7 +183,13 @@ export const Innertube={create:async()=>({session:{context:{client:{}}},music:{g
         .at(-1)?.args[0],
     emit: async (event: string, ...args: unknown[]) => {
       for (const listener of ipcMain.listeners(event))
-        await listener({}, ...args);
+        await listener(
+          {
+            sender: window.webContents,
+            senderFrame: window.webContents.mainFrame,
+          },
+          ...args,
+        );
     },
     close: async () => {
       delete requireRoot.cache[output];
