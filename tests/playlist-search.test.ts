@@ -1,12 +1,33 @@
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
 import { test, expect } from '@playwright/test';
-import { Window } from 'happy-dom';
+import { Window, PropertySymbol, type Node as HappyNode } from 'happy-dom';
 
 async function fixture(
   url = 'https://music.youtube.com/playlist?list=PL_owned',
 ) {
   const dom = new Window({ url });
+  // Happy DOM 20.10.6 keeps its mutation delivery closures only in WeakRefs.
+  // Real observers retain delivery while observed; preserve that lifetime in
+  // this fixture so a GC during the full suite cannot silently drop mutations.
+  const NativeObserver = dom.MutationObserver;
+  dom.MutationObserver = class extends NativeObserver {
+    private deliveries = new Set<unknown>();
+    override observe(target: HappyNode, options: MutationObserverInit) {
+      const previous = new Set(target[PropertySymbol.mutationListeners]);
+      super.observe(target, options);
+      for (const listener of target[PropertySymbol.mutationListeners]) {
+        if (!previous.has(listener)) {
+          const delivery = listener.callback.deref();
+          if (delivery) this.deliveries.add(delivery);
+        }
+      }
+    }
+    override disconnect() {
+      super.disconnect();
+      this.deliveries.clear();
+    }
+  };
   const frames = new Map<number, FrameRequestCallback>();
   let serial = 0;
   dom.requestAnimationFrame = (fn: FrameRequestCallback) => {
