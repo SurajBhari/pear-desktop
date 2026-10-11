@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
-import { build } from 'vite';
+import { build, normalizePath } from 'vite';
 const root = path.resolve(import.meta.dirname, '../..'),
   requireRoot = createRequire(path.join(root, 'package.json'));
 /** Actual broker/controller and Electron IPC; only native getters and service responses are synthetic. */
@@ -17,15 +17,15 @@ export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
     await writeFile(
       mainEntry,
       [
-        `export * from ${JSON.stringify(path.join(root, 'src/providers/music-request.ts'))};`,
-        `export {backend} from ${JSON.stringify(path.join(root, 'src/plugins/api-server/backend/main.ts'))};`,
-        `export {createMusicGrantMenu} from ${JSON.stringify(path.join(root, 'src/plugins/api-server/music-menu.ts'))};`,
-        `export {getMusicService} from ${JSON.stringify(path.join(root, 'src/plugins/api-server/backend/music-service.ts'))};`,
+        `export * from ${JSON.stringify(normalizePath(path.join(root, 'src/providers/music-request.ts')))};`,
+        `export {backend} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/api-server/backend/main.ts')))};`,
+        `export {createMusicGrantMenu} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/api-server/music-menu.ts')))};`,
+        `export {getMusicService} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/api-server/backend/music-service.ts')))};`,
       ].join('\n'),
     );
     await writeFile(
       rendererEntry,
-      `export * from ${JSON.stringify(path.join(root, 'src/providers/music-renderer.ts'))};`,
+      `export * from ${JSON.stringify(normalizePath(path.join(root, 'src/providers/music-renderer.ts')))};`,
     );
     const common = {
       root,
@@ -41,9 +41,10 @@ export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
               return '\0owned:' + id;
             if (id.startsWith('@/')) {
               const p = path.join(root, 'src', id.slice(2));
-              return [p, p + '.ts', path.join(p, 'index.ts')].find(
+              const resolved = [p, p + '.ts', path.join(p, 'index.ts')].find(
                 (f) => existsSync(f) && statSync(f).isFile(),
               );
+              return resolved && normalizePath(resolved);
             }
           },
           load(id: string) {
@@ -59,9 +60,30 @@ export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
     };
     await build({
       ...common,
+      plugins: [
+        ...common.plugins,
+        {
+          name: 'assert-native-broker-singleton',
+          generateBundle() {
+            for (const relative of [
+              'src/providers/music-request.ts',
+              'src/plugins/api-server/backend/music-service.ts',
+            ]) {
+              const expected = normalizePath(path.join(root, relative));
+              const ids = [...this.getModuleIds()].filter(
+                (id) => id.replaceAll('\\', '/').split('?')[0] === expected,
+              );
+              if (ids.length !== 1 || ids[0] !== expected)
+                this.error(
+                  `Owned native singleton identity: ${relative}: ${JSON.stringify(ids)}`,
+                );
+            }
+          },
+        },
+      ],
       ssr: { noExternal: true },
       build: {
-        ssr: mainEntry,
+        ssr: normalizePath(mainEntry),
         outDir: owned,
         emptyOutDir: false,
         minify: false,
@@ -78,7 +100,7 @@ export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
         emptyOutDir: false,
         minify: false,
         lib: {
-          entry: rendererEntry,
+          entry: normalizePath(rendererEntry),
           name: 'MusicNativeSource',
           formats: ['iife'],
           fileName: () => 'renderer.js',
@@ -102,7 +124,7 @@ export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
       `
 const {app,BrowserWindow,ipcMain,session,net}=require('electron');const fs=require('node:fs'),path=require('node:path');const owned=${JSON.stringify(owned)};
 for(const key of ['userData','sessionData','downloads']){const target=path.join(owned,key);fs.mkdirSync(target,{recursive:true});if(!fs.realpathSync(target).startsWith(fs.realpathSync(owned)+path.sep))throw Error('Unowned profile');app.setPath(key,target);}
-(async()=>{await app.whenReady();session.defaultSession.webRequest.onBeforeRequest((details,done)=>done({cancel:!details.url.startsWith('file://')}));net.fetch=async()=>{throw Error('Unexpected native remote request')};globalThis.MusicNativeProof={owned,preload:path.join(owned,'preload.cjs'),BrowserWindow,ipcMain,source:require('./source.cjs'),bundle:fs.readFileSync(path.join(owned,'renderer.js'),'utf8')};const result=await (${task.toString()})();console.log('MUSIC_NATIVE '+JSON.stringify(result));for(const w of BrowserWindow.getAllWindows())w.destroy();app.quit()})().catch(()=>{console.error('Owned native music witness failed');app.exit(1)});
+let stage='ready';(async()=>{await app.whenReady();session.defaultSession.webRequest.onBeforeRequest((details,done)=>done({cancel:!details.url.startsWith('file://')}));net.fetch=async()=>{throw Error('Unexpected native remote request')};globalThis.MusicNativeProof={owned,preload:path.join(owned,'preload.cjs'),BrowserWindow,ipcMain,source:require('./source.cjs'),bundle:fs.readFileSync(path.join(owned,'renderer.js'),'utf8')};stage='task';const result=await (${task.toString()})();stage='shutdown';console.log('MUSIC_NATIVE '+JSON.stringify(result));for(const w of BrowserWindow.getAllWindows())w.destroy();app.quit()})().catch(error=>{console.error('Owned native music witness failed at '+stage+': '+String(error?.stack??error).slice(-8000));app.exit(1)});
 `,
     );
     const env = { ...process.env };
@@ -123,11 +145,22 @@ for(const key of ['userData','sessionData','downloads']){const target=path.join(
     );
     let stdout = '',
       stderr = '';
-    child.stdout!.on('data', (chunk) => (stdout += chunk));
-    child.stderr!.on('data', (chunk) => (stderr += chunk));
+    child.stdout!.on(
+      'data',
+      (chunk) => (stdout = (stdout + chunk).slice(-16000)),
+    );
+    child.stderr!.on(
+      'data',
+      (chunk) => (stderr = (stderr + chunk).slice(-16000)),
+    );
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(Error('Owned native music witness timed out')),
+        () =>
+          reject(
+            Error(
+              `Owned native music witness timed out; stdout: ${stdout}; stderr: ${stderr}`,
+            ),
+          ),
         25000,
       );
       child!.on('error', (e) => {
@@ -140,7 +173,7 @@ for(const key of ['userData','sessionData','downloads']){const target=path.join(
           ? resolve()
           : reject(
               Error(
-                `Owned native witness exit ${code}: ${stderr.slice(-1000)}`,
+                `Owned native witness exit ${code}; stdout: ${stdout}; stderr: ${stderr}`,
               ),
             );
       });

@@ -3,9 +3,34 @@ import { equalizerBundle } from './helpers/equalizer-bundle';
 import { compressorNative } from './helpers/compressor-native';
 
 let bundle: string;
+// Observe only methods on the fixture's owned native node; never drive its clock/gain.
+const timingFixture = `
+export const observeGainTiming = node => {
+  let target = NaN, end = 0;
+  const set = node.gain.setValueAtTime.bind(node.gain);
+  const ramp = node.gain.linearRampToValueAtTime.bind(node.gain);
+  node.gain.setValueAtTime = (value, time) => {
+    target = value; end = time; return set(value, time);
+  };
+  node.gain.linearRampToValueAtTime = (value, time) => {
+    target = value; end = time; return ramp(value, time);
+  };
+  return { wait: async expected => {
+    const deadline = performance.now() + 3000;
+    while (performance.now() < deadline) {
+      const audioTime = node.context.currentTime;
+      const quantum = 128 / node.context.sampleRate;
+      if (target === expected && node.context.state === 'running' && audioTime >= end + quantum)
+        return {target, end, audioTime, value: node.gain.value};
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw Error('Owned gain did not reach its scheduled audio-clock end: ' + JSON.stringify({expected,target,end,audioTime:node.context.currentTime,state:node.context.state}));
+  }};
+};`;
 test.beforeAll(async () => {
   bundle = await equalizerBundle(
-    "export * from '@/providers/renderer-audio';export {default as compressor} from '@/plugins/audio-compressor';",
+    "export * from '@/providers/renderer-audio';export {default as compressor} from '@/plugins/audio-compressor';" +
+      timingFixture,
   );
 });
 
@@ -24,11 +49,14 @@ test('Electron native identity events, response lag, late enable and teardown fe
       context.createMediaElementSource(video),
     );
     let gain: GainNode;
+    let timing: ReturnType<typeof f.observeGainTiming>;
+    const rendered: any[] = [];
     let anchor = 1,
       anchors = 0;
     const create = context.createGain.bind(context);
     context.createGain = () => {
       gain = create();
+      timing = f.observeGainTiming(gain);
       const set = gain.gain.setValueAtTime.bind(gain.gain);
       gain.gain.setValueAtTime = (value, time) => {
         anchor = value;
@@ -72,7 +100,7 @@ test('Electron native identity events, response lag, late enable and teardown fe
       ...settings,
       autoTrackGain: true,
     });
-    await wait(160);
+    rendered.push(await timing.wait(10 ** (6 / 20)));
     const enabled = read();
     native = 'B';
     events.dispatchEvent(new Event('videodatachange'));
@@ -80,7 +108,7 @@ test('Electron native identity events, response lag, late enable and teardown fe
     await wait(20);
     const staleRendered = read();
     response = 'B';
-    await wait(550);
+    rendered.push(await timing.wait(10 ** (6 / 20)));
     const retry = read();
     native = '';
     events.dispatchEvent(new Event('videodatachange'));
@@ -91,7 +119,7 @@ test('Electron native identity events, response lag, late enable and teardown fe
     response = 'C';
     db = -3;
     events.dispatchEvent(new Event('videodatachange'));
-    await wait(160);
+    rendered.push(await timing.wait(10 ** (3 / 20)));
     const next = read();
     throws = true;
     events.dispatchEvent(new Event('videodatachange'));
@@ -121,6 +149,7 @@ test('Electron native identity events, response lag, late enable and teardown fe
       retiredWrites,
       listeners,
       count: graph.auxiliaryMediaCount,
+      rendered,
     };
   });
   console.log(JSON.stringify(result));
@@ -136,6 +165,14 @@ test('Electron native identity events, response lag, late enable and teardown fe
   expect(result.stopped).toBe(1);
   expect(result.retiredWrites).toBe(0);
   expect(result.listeners).toBe(0);
+  expect(result.rendered.map((item: any) => item.target)).toEqual([
+    10 ** (6 / 20),
+    10 ** (6 / 20),
+    10 ** (3 / 20),
+  ]);
+  expect(result.rendered.every((item: any) => item.audioTime >= item.end)).toBe(
+    true,
+  );
 });
 
 test('Electron auxiliary notifications precede dry connection, retire after disconnection and survive observer/failure adversity', async () => {
@@ -153,10 +190,13 @@ test('Electron auxiliary notifications precede dry connection, retire after disc
     );
     if (!graph.observeAuxiliaryMedia) return { available: false };
     let trackGain: GainNode;
+    let timing: ReturnType<typeof f.observeGainTiming>;
+    const rendered: any[] = [];
     let anchor = 1;
     const create = context.createGain.bind(context);
     context.createGain = () => {
       trackGain = create();
+      timing = f.observeGainTiming(trackGain);
       const set = trackGain.gain.setValueAtTime.bind(trackGain.gain);
       trackGain.gain.setValueAtTime = (value, time) => {
         anchor = value;
@@ -182,7 +222,7 @@ test('Electron auxiliary notifications precede dry connection, retire after disc
       }),
     });
     f.compressor.renderer.onPlayerApiReady(api);
-    await new Promise((resolve) => setTimeout(resolve, 160));
+    rendered.push(await timing.wait(10 ** (6 / 20)));
     const boost = trackGain!.gain.value;
     const gain = create();
     let connected = false;
@@ -217,7 +257,7 @@ test('Electron auxiliary notifications precede dry connection, retire after disc
     }
     release();
     release();
-    await new Promise((resolve) => setTimeout(resolve, 160));
+    rendered.push(await timing.wait(10 ** (6 / 20)));
     const recovered = trackGain!.gain.value;
     const failGain = create();
     const retryAux = document.createElement('audio');
@@ -271,6 +311,7 @@ test('Electron auxiliary notifications precede dry connection, retire after disc
       retainedCount,
       retainedGain,
       ownerSafe,
+      rendered,
     };
   });
   console.log(JSON.stringify(result));
@@ -294,6 +335,13 @@ test('Electron auxiliary notifications precede dry connection, retire after disc
   expect(result.retainedCount).toBe(1);
   expect(result.retainedGain).toBe(1);
   expect(result.ownerSafe).toBe(true);
+  expect(result.rendered.map((item: any) => item.target)).toEqual([
+    10 ** (6 / 20),
+    10 ** (6 / 20),
+  ]);
+  expect(result.rendered.every((item: any) => item.audioTime >= item.end)).toBe(
+    true,
+  );
 });
 
 test('Electron graph/API replacement retires old listeners and preserves HTML volume/mute ownership', async () => {
@@ -302,6 +350,7 @@ test('Electron graph/API replacement retires old listeners and preserves HTML vo
     const contexts: AudioContext[] = [];
     const graphs: any[] = [],
       gains: GainNode[] = [];
+    const timings: any[] = [];
     for (let i = 0; i < 2; i++) {
       const context = new AudioContext({
         sinkId: { type: 'none' },
@@ -322,6 +371,7 @@ test('Electron graph/API replacement retires old listeners and preserves HTML vo
       context.createGain = () => {
         const node = create();
         gains.push(node);
+        timings.push(f.observeGainTiming(node));
         return node;
       };
     }
@@ -386,7 +436,7 @@ test('Electron graph/API replacement retires old listeners and preserves HTML vo
     );
     f.compressor.renderer.onPlayerApiReady(second);
     firstEvents.dispatchEvent(new Event('videodatachange'));
-    await new Promise((resolve) => setTimeout(resolve, 160));
+    const rendered = await timings.at(-1).wait(10 ** (3 / 20));
     const gain = gains.at(-1)!.gain.value;
     const pluginWrites = volumeWrites;
     video.muted = true;
@@ -424,6 +474,7 @@ test('Electron graph/API replacement retires old listeners and preserves HTML vo
       restored,
       preserved,
       closedListeners,
+      rendered,
     };
   });
   expect(result.firstListeners).toBe(0);
@@ -435,4 +486,6 @@ test('Electron graph/API replacement retires old listeners and preserves HTML vo
   expect(result.restored).toBe(1);
   expect(result.preserved).toBe(0.4);
   expect(result.closedListeners).toBe(0);
+  expect(result.rendered.target).toBe(10 ** (3 / 20));
+  expect(result.rendered.audioTime).toBeGreaterThanOrEqual(result.rendered.end);
 });

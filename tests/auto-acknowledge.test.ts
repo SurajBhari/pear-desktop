@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 import { test, expect, type Page } from '@playwright/test';
 
@@ -1006,7 +1007,11 @@ async function pluginSource(language = 'en') {
     build: {
       write: false,
       minify: false,
-      lib: { entry: entry.pathname, name: 'AckPlugin', formats: ['iife'] },
+      lib: {
+        entry: fileURLToPath(entry),
+        name: 'AckPlugin',
+        formats: ['iife'],
+      },
     },
   });
   const chunk = (Array.isArray(result) ? result : [result])

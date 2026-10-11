@@ -3,7 +3,7 @@ import { equalizerBundle, fixturePage } from './helpers/equalizer-bundle';
 
 test('the actual translated 20-band editor fits desktop and narrow viewports with keyboard dismissal', async ({
   page,
-}) => {
+}, testInfo) => {
   await fixturePage(
     page,
     await equalizerBundle(
@@ -37,17 +37,15 @@ test('the actual translated 20-band editor fits desktop and narrow viewports wit
     ['narrow', 375, 812],
   ] as const) {
     await page.setViewportSize({ width, height });
-    const geometry = await page
-      .locator('dialog')
-      .evaluate((node) => ({
-        width: node.getBoundingClientRect().width,
-        scroll: node.scrollWidth,
-        client: node.clientWidth,
-      }));
+    const geometry = await page.locator('dialog').evaluate((node) => ({
+      width: node.getBoundingClientRect().width,
+      scroll: node.scrollWidth,
+      client: node.clientWidth,
+    }));
     expect(geometry.width).toBeLessThan(width);
     expect(geometry.scroll).toBeLessThanOrEqual(geometry.client + 1);
     await page.screenshot({
-      path: `/Users/deruta/Documents/Codex/2026-10-06/pear-desktop-reports/2026-10-11-feature-program/EQ-20-${name}.png`,
+      path: testInfo.outputPath(`EQ-20-${name}.png`),
     });
   }
   await page.keyboard.press('Escape');

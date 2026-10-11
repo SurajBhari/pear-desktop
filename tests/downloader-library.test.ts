@@ -135,21 +135,47 @@ for (const replacement of [
       await writeFile(path.join(replacementDirectory, name), tagged);
     }
     let replaced = false;
+    let pinnedRoot = false;
     try {
-      const report = await scanLibrary(root, {
-        onProgress: () => {
-          if (replaced) return;
-          replaced = true;
-          if (replacement === 'root-symlink') {
-            renameSync(root, path.join(fixture, 'retired-root'));
-            symlinkSync(outside, root, 'dir');
-            return;
-          }
-          renameSync(nested, path.join(root, '.pear-retired'));
-          if (replacement === 'symlink') symlinkSync(outside, nested, 'dir');
-          else renameSync(outside, nested);
-        },
-      });
+      let report: Awaited<ReturnType<typeof scanLibrary>>;
+      try {
+        report = await scanLibrary(root, {
+          onProgress: () => {
+            if (replaced) return;
+            replaced = true;
+            if (replacement === 'root-symlink') {
+              try {
+                renameSync(root, path.join(fixture, 'retired-root'));
+              } catch (error) {
+                if (
+                  process.platform === 'win32' &&
+                  (error as NodeJS.ErrnoException).code === 'EPERM'
+                )
+                  pinnedRoot = true;
+                throw error;
+              }
+              symlinkSync(outside, root, 'dir');
+              return;
+            }
+            renameSync(nested, path.join(root, '.pear-retired'));
+            if (replacement === 'symlink') symlinkSync(outside, nested, 'dir');
+            else renameSync(outside, nested);
+          },
+        });
+      } catch (error) {
+        if (!pinnedRoot) throw error;
+        // Windows pins the open directory: the attempted replacement never occurs.
+        expect((error as NodeJS.ErrnoException).code).toBe('EPERM');
+        expect(replaced).toBe(true);
+        expect(existsSync(path.join(fixture, 'retired-root'))).toBe(false);
+        expect(await readFile(path.join(nested, 'first.mp3'))).toEqual(
+          Buffer.from([0xff, 0xfb, 0x90, 0x64]),
+        );
+        expect(
+          await readFile(path.join(replacementDirectory, 'first.mp3')),
+        ).toEqual(tagged);
+        return;
+      }
       expect(replaced).toBe(true);
       expect(
         report.files.some((row) => row.videoId === 'outside-fixture'),
@@ -500,28 +526,54 @@ test('directory replacement after audio publication cannot write a manifest outs
   await mkdir(outside);
   await writeFile(path.join(root, 'prior.webm'), 'prior');
   let changed = false;
+  let pinnedRoot = false;
   try {
     const guard = () => {
       if (!changed && existsSync(path.join(root, 'Track.webm'))) {
         changed = true;
-        renameSync(root, moved);
+        try {
+          renameSync(root, moved);
+        } catch (error) {
+          if (
+            process.platform === 'win32' &&
+            (error as NodeJS.ErrnoException).code === 'EPERM'
+          )
+            pinnedRoot = true;
+          throw error;
+        }
         symlinkSync(outside, root, 'junction');
       }
     };
-    await expect(
-      publishCompleted(
+    let publicationError: unknown;
+    try {
+      await publishCompleted(
         root,
         root,
         'Track.webm',
         new Uint8Array([1, 2, 3]),
         input(),
         guard,
-      ),
-    ).rejects.toThrow(/directory changed|symlink/i);
+      );
+    } catch (error) {
+      publicationError = error;
+    }
+    expect(publicationError).toBeDefined();
+    expect(changed).toBe(true);
+    if (pinnedRoot) {
+      expect((publicationError as NodeJS.ErrnoException).code).toBe('EPERM');
+      expect(existsSync(moved)).toBe(false);
+    } else {
+      expect(() => {
+        throw publicationError;
+      }).toThrow(/directory changed|symlink/i);
+    }
     expect(await readdir(outside)).toEqual([]);
-    expect(await readFile(path.join(moved, 'prior.webm'), 'utf8')).toBe(
-      'prior',
-    );
+    expect(
+      await readFile(
+        path.join(pinnedRoot ? root : moved, 'prior.webm'),
+        'utf8',
+      ),
+    ).toBe('prior');
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

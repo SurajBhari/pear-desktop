@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 import { test, expect, type Page } from '@playwright/test';
 
@@ -23,7 +24,8 @@ async function fixture(
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     source = `function ${name}() { return () => {}; }`;
   }
-  await page.clock.install();
+  await page.clock.install({ time: new Date('2030-01-01T00:00:00Z') });
+  await page.clock.pauseAt(new Date('2030-01-02T00:00:00Z'));
   await page.setContent(
     '<ytmusic-app><div id="popups"></div><div id="unrelated"></div></ytmusic-app>',
   );
@@ -427,12 +429,14 @@ for (const kind of ['dismiss-multidevice-popup', 'toast-autoclose'] as const)
           enforce: 'pre',
           resolveId(id) {
             if (id === '@/utils' || id === '@/i18n') return `\0${id}`;
+            return null;
           },
           load(id) {
             if (id === '\0@/utils')
               return 'export const createPlugin = p => p;';
             if (id === '\0@/i18n')
               return `const resources=${resources}; export const t=key=>key.split('.').reduce((v,k)=>v?.[k],resources)??key;`;
+            return null;
           },
         },
       ],
@@ -440,8 +444,9 @@ for (const kind of ['dismiss-multidevice-popup', 'toast-autoclose'] as const)
         write: false,
         minify: false,
         lib: {
-          entry: new URL(`../src/plugins/${kind}/index.ts`, import.meta.url)
-            .pathname,
+          entry: fileURLToPath(
+            new URL(`../src/plugins/${kind}/index.ts`, import.meta.url),
+          ),
           name: 'PopupPlugin',
           formats: ['iife'],
         },

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
-import { build } from 'vite';
+import { build, normalizePath } from 'vite';
 
 const root = path.resolve(import.meta.dirname, '../..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
@@ -21,9 +21,9 @@ export async function scrobblerIntegrationNative<T>(
     await writeFile(
       entry,
       [
-        `export {createScrobblerManager} from ${JSON.stringify(path.join(root, 'src/plugins/scrobbler/main.ts'))};`,
-        `export {defaultConfig} from ${JSON.stringify(path.join(root, 'src/plugins/scrobbler/config.ts'))};`,
-        `export {setupSongInfo,registerCallback,getSongInfoProvenance,getCurrentSongInfoProvenance} from ${JSON.stringify(path.join(root, 'src/providers/song-info.ts'))};`,
+        `export {createScrobblerManager} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/scrobbler/main.ts')))};`,
+        `export {defaultConfig} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/scrobbler/config.ts')))};`,
+        `export {setupSongInfo,registerCallback,getSongInfoProvenance,getCurrentSongInfoProvenance} from ${JSON.stringify(normalizePath(path.join(root, 'src/providers/song-info.ts')))};`,
       ].join('\n'),
     );
     await build({
@@ -39,7 +39,19 @@ export async function scrobblerIntegrationNative<T>(
             if (['@/config', '@/utils', '@/i18n'].includes(id))
               return '\0owned:' + id;
             if (id.startsWith('@/'))
-              return path.join(root, 'src', id.slice(2)) + '.ts';
+              return normalizePath(path.join(root, 'src', id.slice(2)) + '.ts');
+          },
+          generateBundle() {
+            const expected = normalizePath(
+              path.join(root, 'src/providers/song-info.ts'),
+            );
+            const ids = [...this.getModuleIds()].filter(
+              (id) => id.replaceAll('\\', '/').split('?')[0] === expected,
+            );
+            if (ids.length !== 1 || ids[0] !== expected)
+              this.error(
+                `Owned native provenance identity: ${JSON.stringify(ids)}`,
+              );
           },
           load(id) {
             if (id === '\0owned:@/config')
@@ -57,7 +69,7 @@ export async function scrobblerIntegrationNative<T>(
         emptyOutDir: false,
         minify: false,
         rollupOptions: {
-          input: entry,
+          input: normalizePath(entry),
           external: ['electron'],
           output: { format: 'cjs', entryFileNames: 'source.cjs' },
         },
@@ -84,9 +96,9 @@ const {app,BrowserWindow,ipcMain,net,nativeImage,session}=require('electron');
 const fs=require('node:fs'),path=require('node:path');const owned=${JSON.stringify(owned)};
 for(const key of ['userData','sessionData','downloads']){const target=path.join(owned,key);fs.mkdirSync(target,{recursive:true});if(!fs.realpathSync(target).startsWith(fs.realpathSync(owned)+path.sep))throw Error('Unowned native profile');app.setPath(key,target);}
 app.on('window-all-closed',()=>{});
-(async()=>{await app.whenReady();const configured=new WeakSet();const configure=ses=>{if(configured.has(ses))return;configured.add(ses);for(const scheme of ['https','http'])ses.protocol.handle(scheme,()=>new Response('<html><body>Owned intercepted auth</body></html>',{headers:{'Content-Type':'text/html'}}));};configure(session.defaultSession);app.on('session-created',configure);
+let stage='ready';(async()=>{await app.whenReady();const configured=new WeakSet();const configure=ses=>{if(configured.has(ses))return;configured.add(ses);for(const scheme of ['https','http'])ses.protocol.handle(scheme,()=>new Response('<html><body>Owned intercepted auth</body></html>',{headers:{'Content-Type':'text/html'}}));};configure(session.defaultSession);app.on('session-created',configure);
 globalThis.ScrobbleIntegrationProof={source:require(path.join(owned,'source.cjs')),app,BrowserWindow,ipcMain,net,nativeImage,session,owned,preload:${JSON.stringify(preload)}};
-const result=await (${task.toString()})();console.log('SCROBBLER_INTEGRATION_NATIVE '+JSON.stringify(result));for(const win of BrowserWindow.getAllWindows())win.destroy();app.quit();})().catch(error=>{console.error(error);app.exit(1)});
+stage='task';const result=await (${task.toString()})();stage='shutdown';console.log('SCROBBLER_INTEGRATION_NATIVE '+JSON.stringify(result));for(const win of BrowserWindow.getAllWindows())win.destroy();app.quit();})().catch(error=>{console.error('Owned native scrobbler witness failed at '+stage+': '+String(error?.stack??error).slice(-8000));app.exit(1)});
 `,
     );
     const env = { ...process.env };
@@ -104,14 +116,19 @@ const result=await (${task.toString()})();console.log('SCROBBLER_INTEGRATION_NAT
     let stdout = '',
       stderr = '';
     child.stdout!.on('data', (value) => {
-      stdout += value;
+      stdout = (stdout + value).slice(-16000);
     });
     child.stderr!.on('data', (value) => {
-      stderr += value;
+      stderr = (stderr + value).slice(-16000);
     });
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(Error('Owned native integration timed out')),
+        () =>
+          reject(
+            Error(
+              `Owned native integration timed out; stdout: ${stdout}; stderr: ${stderr}`,
+            ),
+          ),
         25000,
       );
       child!.once('error', (error) => {
@@ -122,7 +139,11 @@ const result=await (${task.toString()})();console.log('SCROBBLER_INTEGRATION_NAT
         clearTimeout(timer);
         code === 0
           ? resolve()
-          : reject(Error(`Native integration exited ${code}: ${stderr}`));
+          : reject(
+              Error(
+                `Native integration exited ${code}; stdout: ${stdout}; stderr: ${stderr}`,
+              ),
+            );
       });
     });
     const line = stdout

@@ -3,30 +3,28 @@ import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test, expect, type Page } from '@playwright/test';
-import { build } from 'vite';
+import { build, normalizePath } from 'vite';
 import solidPlugin from 'vite-plugin-solid';
 
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
-const renderer = path.join(
-  root,
-  'src/plugins/synced-lyrics/renderer/renderer.tsx',
+const renderer = normalizePath(
+  path.join(root, 'src/plugins/synced-lyrics/renderer/renderer.tsx'),
 );
-const component = path.join(
-  root,
-  'src/plugins/synced-lyrics/renderer/components/SyncedLine.tsx',
+const component = normalizePath(
+  path.join(
+    root,
+    'src/plugins/synced-lyrics/renderer/components/SyncedLine.tsx',
+  ),
 );
-const lifecycle = path.join(
-  root,
-  'src/plugins/synced-lyrics/renderer/index.ts',
+const lifecycle = normalizePath(
+  path.join(root, 'src/plugins/synced-lyrics/renderer/index.ts'),
 );
-const provider = path.join(
-  root,
-  'src/plugins/synced-lyrics/providers/LRCLib.ts',
+const provider = normalizePath(
+  path.join(root, 'src/plugins/synced-lyrics/providers/LRCLib.ts'),
 );
-const scroll = path.join(
-  root,
-  'src/plugins/synced-lyrics/renderer/scroll-motion.ts',
+const scroll = normalizePath(
+  path.join(root, 'src/plugins/synced-lyrics/renderer/scroll-motion.ts'),
 );
 let scratch: string;
 let code: string;
@@ -44,7 +42,7 @@ test.beforeAll(async () => {
   const entry = path.join(scratch, 'entry.tsx');
   await writeFile(
     entry,
-    `import{render}from'solid-js/web';import{LyricsRenderer,currentTime,setCurrentTime,setIsVisible,setConfig,startLyricsEffects}from ${JSON.stringify(renderer)};import{renderer as plugin}from ${JSON.stringify(lifecycle)};import{LRCLib}from ${JSON.stringify(provider)};import{setLyrics}from'fixture-state';const settings={enabled:true,lineEffect:'fancy',romanization:false,convertChineseCharacter:'disabled',defaultTextString:'',showTimeCodes:false};window.mount=(lines)=>{setConfig(settings);startLyricsEffects();setLyrics({state:'done',data:{lines}});setIsVisible(true);const dispose=render(()=> <LyricsRenderer/>,document.querySelector('#lyrics-tab'));window.fixture={setConfig,setTime:setCurrentTime,time:currentTime,setVisible:setIsVisible,setLines:lines=>setLyrics({state:'done',data:{lines}}),dispose,plugin};setCurrentTime(0)};window.searchProvider=async data=>{window.fetch=async()=>new Response(JSON.stringify(data),{status:200});return new LRCLib().search({title:'Song',artist:'Artist',album:'Album',songDuration:10,videoId:'A'})};window.nativeClock=async()=>{const video=document.createElement('video');document.body.append(video);const header=new Uint8Array(44+44100*40*2);const view=new DataView(header.buffer);const ascii=(offset,value)=>[...value].forEach((c,i)=>header[offset+i]=c.charCodeAt(0));ascii(0,'RIFF');view.setUint32(4,header.length-8,true);ascii(8,'WAVE');ascii(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,44100,true);view.setUint32(28,88200,true);view.setUint16(32,2,true);view.setUint16(34,16,true);ascii(36,'data');view.setUint32(40,header.length-44,true);const url=URL.createObjectURL(new Blob([header],{type:'audio/wav'}));video.src=url;await new Promise((yes,no)=>{video.onloadedmetadata=yes;video.onerror=no});const events=new EventTarget();const api={getCurrentTime:()=>video.currentTime,getVideoData:()=>({video_id:'A'}),getPlayerResponse:()=>({videoDetails:{videoId:'A'}}),addEventListener:events.addEventListener.bind(events),removeEventListener:events.removeEventListener.bind(events),seekTo:t=>video.currentTime=t};await plugin.start({getConfig:async()=>settings,ipc:{invoke:async()=>{},subscribe:()=>()=>{}}});await plugin.onPlayerApiReady(api);window.fixture.video=video;window.fixture.disposeClock=()=>{plugin.stop();video.pause();video.remove();URL.revokeObjectURL(url)};return video.duration};`,
+    `import{render}from'solid-js/web';import{LyricsRenderer,currentTime,setCurrentTime,setIsVisible,setConfig,startLyricsEffects}from ${JSON.stringify(renderer)};import{renderer as plugin}from ${JSON.stringify(lifecycle)};import{LRCLib}from ${JSON.stringify(provider)};import{__ownedFixturePlayerAPI}from ${JSON.stringify(component)};import{setLyrics}from'fixture-state';const settings={enabled:true,lineEffect:'fancy',romanization:false,convertChineseCharacter:'disabled',defaultTextString:'',showTimeCodes:false};window.mount=(lines)=>{setConfig(settings);startLyricsEffects();setLyrics({state:'done',data:{lines}});setIsVisible(true);const dispose=render(()=> <LyricsRenderer/>,document.querySelector('#lyrics-tab'));window.fixture={setConfig,setTime:setCurrentTime,time:currentTime,setVisible:setIsVisible,setLines:lines=>setLyrics({state:'done',data:{lines}}),dispose,plugin};setCurrentTime(0)};window.searchProvider=async data=>{window.fetch=async()=>new Response(JSON.stringify(data),{status:200});return new LRCLib().search({title:'Song',artist:'Artist',album:'Album',songDuration:10,videoId:'A'})};window.nativeClock=async()=>{const video=document.createElement('video');document.body.append(video);const header=new Uint8Array(44+44100*40*2);const view=new DataView(header.buffer);const ascii=(offset,value)=>[...value].forEach((c,i)=>header[offset+i]=c.charCodeAt(0));ascii(0,'RIFF');view.setUint32(4,header.length-8,true);ascii(8,'WAVE');ascii(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,44100,true);view.setUint32(28,88200,true);view.setUint16(32,2,true);view.setUint16(34,16,true);ascii(36,'data');view.setUint32(40,header.length-44,true);const url=URL.createObjectURL(new Blob([header],{type:'audio/wav'}));video.src=url;await new Promise((yes,no)=>{video.onloadedmetadata=yes;video.onerror=no});const events=new EventTarget();const api={getCurrentTime:()=>video.currentTime,getVideoData:()=>({video_id:'A'}),getPlayerResponse:()=>({videoDetails:{videoId:'A'}}),addEventListener:events.addEventListener.bind(events),removeEventListener:events.removeEventListener.bind(events),seekTo:t=>video.currentTime=t};await plugin.start({getConfig:async()=>settings,ipc:{invoke:async()=>{},subscribe:()=>()=>{}}});await plugin.onPlayerApiReady(api);if(__ownedFixturePlayerAPI()!==api)throw new Error('Fixture lifecycle and lyric component have different player API owners');window.fixture.video=video;window.fixture.disposeClock=()=>{plugin.stop();video.pause();video.remove();URL.revokeObjectURL(url)};return video.duration};`,
   );
   const result = await build({
     root,
@@ -58,7 +56,7 @@ test.beforeAll(async () => {
           find: /^@\/providers\/song-info-front$/,
           replacement: '\0fixture-song',
         },
-        { find: '@', replacement: path.join(root, 'src') },
+        { find: '@', replacement: normalizePath(path.join(root, 'src')) },
       ],
       conditions: ['browser'],
     },
@@ -70,9 +68,11 @@ test.beforeAll(async () => {
         resolveId(id, importer) {
           const name = importer?.replaceAll('\\', '/');
           if (id === 'solid-js')
-            return requireRoot.resolve('solid-js/dist/solid.js');
+            return normalizePath(requireRoot.resolve('solid-js/dist/solid.js'));
           if (id === 'solid-js/web')
-            return requireRoot.resolve('solid-js/web/dist/web.js');
+            return normalizePath(
+              requireRoot.resolve('solid-js/web/dist/web.js'),
+            );
           if (id === 'fixture-state') return '\0fixture-state';
           if (id === '@/i18n') return '\0fixture-i18n';
           if (
@@ -89,6 +89,14 @@ test.beforeAll(async () => {
             if (id === '..') return lifecycle;
             if (id === '../utils') return '\0fixture-conversion';
           }
+          return null;
+        },
+        transform(source, id) {
+          if (normalizePath(id) === component)
+            return (
+              source + '\nexport const __ownedFixturePlayerAPI = () => _ytAPI;'
+            );
+          return null;
         },
         load(id) {
           if (id === '\0fixture-state')
@@ -109,6 +117,7 @@ test.beforeAll(async () => {
             return `import{createLyricsScrollController as actual}from ${JSON.stringify(scroll)};export function createLyricsScrollController(...args){const controller=actual(...args);const move=controller.move;controller.move=(index,immediate=false)=>{(window.centerMoves??=[]).push({index,immediate});return move(index,immediate)};return controller;}`;
           if (id === '\0fixture-picker')
             return "export const resetLyricsPickerSelection=()=>{};export const LyricsPicker=props=>{const div=document.createElement('div');div.style.height='40px';props.setStickRef(div);return div};";
+          return null;
         },
       },
     ],
@@ -119,6 +128,27 @@ test.beforeAll(async () => {
     },
   });
   const bundle = Array.isArray(result) ? result[0] : result;
+  if (!('output' in bundle))
+    throw new Error('Fixture requires a one-shot module build');
+  const moduleIds = [
+    ...new Set(
+      bundle.output.flatMap((item) =>
+        item.type === 'chunk' ? item.moduleIds : [],
+      ),
+    ),
+  ];
+  const lifecycleIds = moduleIds.filter(
+    (id) => normalizePath(id) === lifecycle,
+  );
+  if (lifecycleIds.length !== 1)
+    throw new Error(
+      `Fixture lifecycle module identity: ${JSON.stringify(lifecycleIds)}`,
+    );
+  if (process.env.PEAR_LYRICS_MODULE_GRAPH_PATH)
+    await writeFile(
+      process.env.PEAR_LYRICS_MODULE_GRAPH_PATH,
+      JSON.stringify({ lifecycle, lifecycleIds, moduleIds }, null, 2),
+    );
   code = bundle.output.find((item) => item.type === 'chunk')!.code;
   css = await readFile(
     path.join(root, 'src/plugins/synced-lyrics/style.css'),

@@ -108,7 +108,7 @@ for (const frequency of [1000, 8000])
 
 test('translated stock selector retains native keyboard interaction and fits a narrow custom editor', async ({
   page,
-}) => {
+}, testInfo) => {
   await page.setViewportSize({ width: 375, height: 812 });
   await fixturePage(page, await equalizerBundle('', true));
   await page.evaluate(async () => {
@@ -137,7 +137,7 @@ test('translated stock selector retains native keyboard interaction and fits a n
   expect(geometry.width).toBeLessThan(375);
   expect(geometry.scroll).toBeLessThanOrEqual(geometry.client + 1);
   await page.screenshot({
-    path: '/Users/deruta/Documents/Codex/2026-10-06/pear-desktop-reports/2026-10-11-feature-program/EQ-STOCK-NARROW.png',
+    path: testInfo.outputPath('EQ-STOCK-NARROW.png'),
   });
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toHaveCount(0);
