@@ -16,6 +16,18 @@ export const menu = async (
 
   return [
     {
+      label: t('plugins.synced-lyrics.menu.direct-ytmusic.label'),
+      toolTip: t('plugins.synced-lyrics.menu.direct-ytmusic.tooltip'),
+      type: 'checkbox',
+      checked: config.useYTMLyricsWithoutProxy === true,
+      click(item) {
+        if (ctx.window.isDestroyed()) return;
+        return ctx.setConfig({
+          useYTMLyricsWithoutProxy: item.checked === true,
+        });
+      },
+    },
+    {
       label: t('plugins.synced-lyrics.tools.offset'),
       async click() {
         const current = await ctx.getConfig();

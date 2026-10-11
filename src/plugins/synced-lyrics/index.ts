@@ -22,6 +22,7 @@ export default createPlugin<
   config: {
     enabled: false,
     preciseTiming: true,
+    useYTMLyricsWithoutProxy: false,
     showLyricsEvenIfInexact: true,
     showTimeCodes: false,
     defaultTextString: '♪',

@@ -92,7 +92,7 @@ test.beforeAll(async () => {
         },
         load(id) {
           if (id === '\0fixture-state')
-            return "import{createSignal}from'solid-js';export const[currentLyrics,setLyrics]=createSignal(null);export const fetchLyrics=()=>{},invalidateLyricsTrack=()=>{},startLyricsSession=()=>{},stopLyricsSession=()=>{};";
+            return "import{createSignal}from'solid-js';export const[currentLyrics,setLyrics]=createSignal(null);export const fetchLyrics=()=>{},retrySearch=()=>{},invalidateLyricsTrack=()=>{},startLyricsSession=()=>{},stopLyricsSession=()=>{};";
           if (id === '\0fixture-i18n')
             return "export const t=()=> 'Instrumental';";
           if (id === '\0fixture-create-renderer')

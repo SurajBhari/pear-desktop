@@ -5,6 +5,7 @@ export type SyncedLyricsPluginConfig = {
   enabled: boolean;
   preferredProvider?: ProviderName;
   preciseTiming: boolean;
+  useYTMLyricsWithoutProxy?: boolean;
   showTimeCodes: boolean;
   defaultTextString: string | string[];
   showLyricsEvenIfInexact: boolean;

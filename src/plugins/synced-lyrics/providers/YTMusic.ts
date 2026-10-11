@@ -1,3 +1,5 @@
+import { config } from '../renderer/renderer';
+
 import type { LyricProvider, LyricResult, SearchSongInfo } from '../types';
 import type { MusicPlayerAppElement } from '@/types/music-player-app-element';
 
@@ -20,7 +22,16 @@ export class YTMusic implements LyricProvider {
   public async search(
     { videoId, title, artist }: SearchSongInfo,
   ): Promise<LyricResult | null> {
-    const data = await this.fetchNext(videoId);
+    const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+    const network = app?.networkManager;
+    if (!app?.isConnected || typeof network?.fetch !== 'function') return null;
+    const owner: LyricsRequestOwner = {
+      app,
+      network,
+      withoutProxy: config()?.useYTMLyricsWithoutProxy === true,
+    };
+    const data = await this.fetchNext(videoId, owner);
+    if (!this.isCurrent(owner)) return null;
 
     const { tabs } =
       data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer
@@ -39,8 +50,9 @@ export class YTMusic implements LyricProvider {
     const { browseId } = lyricsTab?.tabRenderer?.endpoint?.browseEndpoint ?? {};
     if (!browseId) return null;
 
-    const { contents } = await this.fetchBrowse(browseId);
-    if (!contents) return null;
+    const browse = await this.fetchBrowse(browseId, owner);
+    if (!this.isCurrent(owner) || !browse?.contents) return null;
+    const { contents } = browse;
 
     /*
       NOTE: Due to the nature of the library, the json responses are not consistent,
@@ -107,12 +119,18 @@ export class YTMusic implements LyricProvider {
   // RATE LIMITED (2 req per sec)
   private PROXIED_ENDPOINT = 'https://ytmbrowseproxy.zvz.be/';
 
-  private fetchNext(videoId: string) {
-    const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+  private isCurrent(owner: LyricsRequestOwner) {
+    return (
+      owner.app.isConnected &&
+      document.querySelector('ytmusic-app') === owner.app &&
+      owner.app.networkManager === owner.network &&
+      (config()?.useYTMLyricsWithoutProxy === true) === owner.withoutProxy
+    );
+  }
 
-    if (!app) return null;
-
-    return app.networkManager.fetch<
+  private async fetchNext(videoId: string, owner: LyricsRequestOwner) {
+    if (!this.isCurrent(owner)) return null;
+    const data = await owner.network.fetch<
       NextData,
       {
         videoId: string;
@@ -120,19 +138,43 @@ export class YTMusic implements LyricProvider {
     >('/next?prettyPrint=false', {
       videoId,
     });
+    return this.isCurrent(owner) ? data : null;
   }
 
-  private fetchBrowse(browseId: string) {
-    return fetch(this.PROXIED_ENDPOINT + 'browse?prettyPrint=false', {
-      headers,
-      method: 'POST',
-      body: JSON.stringify({
-        browseId,
-        context: { client },
-      }),
-    }).then((res) => res.json()) as Promise<BrowseData>;
+  private async fetchBrowse(
+    browseId: string,
+    owner: LyricsRequestOwner,
+  ): Promise<BrowseData | null> {
+    if (!this.isCurrent(owner)) return null;
+    if (owner.withoutProxy) {
+      const data = await owner.network.fetch<BrowseData, { browseId: string }>(
+        '/browse?prettyPrint=false',
+        { browseId },
+      );
+      return this.isCurrent(owner) ? data : null;
+    }
+    const response = await fetch(
+      this.PROXIED_ENDPOINT + 'browse?prettyPrint=false',
+      {
+        headers,
+        method: 'POST',
+        body: JSON.stringify({
+          browseId,
+          context: { client },
+        }),
+      },
+    );
+    if (!this.isCurrent(owner)) return null;
+    const data = (await response.json()) as BrowseData;
+    return this.isCurrent(owner) ? data : null;
   }
 }
+
+type LyricsRequestOwner = {
+  app: MusicPlayerAppElement;
+  network: MusicPlayerAppElement['networkManager'];
+  withoutProxy: boolean;
+};
 
 interface NextData {
   contents: {

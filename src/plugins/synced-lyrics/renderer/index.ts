@@ -13,6 +13,7 @@ import {
   currentLyrics,
   fetchLyrics,
   invalidateLyricsTrack,
+  retrySearch,
   startLyricsSession,
   stopLyricsSession,
 } from './store';
@@ -23,6 +24,8 @@ import {
   tabStates,
   waitForLyricsElement,
 } from './utils';
+
+import { ProviderNames } from '../providers';
 
 import type { SyncedLyricsPluginConfig } from '../types';
 import type { SongInfo } from '@/providers/song-info';
@@ -77,7 +80,18 @@ export const renderer = createRenderer<
   generation: 0,
   active: false,
   onConfigChange(newConfig) {
-    if (this.active) setConfig(newConfig);
+    if (!this.active) return;
+    const changed =
+      (currentConfig()?.useYTMLyricsWithoutProxy === true) !==
+      (newConfig.useYTMLyricsWithoutProxy === true);
+    setConfig(newConfig);
+    if (!changed || !_ytAPI) return;
+    const song = getSongInfo();
+    if (
+      verifiedApiVideoId(_ytAPI) === song.videoId &&
+      (this.nativeVideoId === undefined || this.nativeVideoId === song.videoId)
+    )
+      retrySearch(ProviderNames.YTMusic, song);
   },
   observerCallback(mutations) {
     for (const mutation of mutations) {

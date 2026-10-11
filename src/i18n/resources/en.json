@@ -1006,6 +1006,10 @@
         "not-found": "⚠️ No lyrics found for this song."
       },
       "menu": {
+        "direct-ytmusic": {
+          "label": "Fetch YouTube Music lyrics directly",
+          "tooltip": "Use YouTube Music’s connection instead of the external lyrics proxy. Can help when the proxy is unavailable."
+        },
         "preferred-provider": {
           "label": "Preferred Provider",
           "tooltip": "Choose the default provider to use",
