@@ -1,4 +1,11 @@
-import { jaroWinkler } from '@skyra/jaro-winkler';
+import {
+  LRCLIB_LIMITS,
+  parseLRCLibTrack,
+  planLRCLibSearch,
+  rankLRCLibIdentity,
+  type LRCLibIdentity,
+  type LRCLibTrack,
+} from './lrclib-matching';
 
 import { LRC } from '../parsers/lrc';
 import { LyricsFile } from '../parsers/lyricsfile';
@@ -6,217 +13,233 @@ import { config } from '../renderer/renderer';
 
 import type { LyricProvider, LyricResult, SearchSongInfo } from '../types';
 
+type Candidate = {
+  result: LyricResult;
+  identity: LRCLibIdentity;
+  timed: boolean;
+};
+type Request = {
+  controller: AbortController;
+  remainingBytes: number;
+  owned(): boolean;
+  active(): boolean;
+};
+const retired = new Error('LRCLib request retired');
+const deadline = new Error('LRCLib request deadline exceeded');
+const hasFiniteClocks = (
+  lines: {
+    timeInMs: number;
+    words: { timeInMs: number; endTimeInMs?: number }[];
+  }[],
+) =>
+  lines.length > 0 &&
+  lines.every(
+    (line) =>
+      Number.isFinite(line.timeInMs) &&
+      line.words.every(
+        (word) =>
+          Number.isFinite(word.timeInMs) &&
+          (word.endTimeInMs === undefined || Number.isFinite(word.endTimeInMs)),
+      ),
+  );
+
+// Query expansion and synchronized preference adapted from #3254 @AARP41298.
+// Retain the fork's exact recording guards and LyricsFile/enhanced-LRC pipeline.
 export class LRCLib implements LyricProvider {
   name = 'LRCLib';
   baseUrl = 'https://lrclib.net';
+  private request?: Request;
 
-  async search({
-    title,
-    alternativeTitle,
-    artist,
-    album,
-    songDuration,
-    tags,
-  }: SearchSongInfo): Promise<LyricResult | null> {
-    let query = new URLSearchParams({
-      artist_name: artist,
-      track_name: title,
-    });
-
-    query.set('album_name', album!);
-    if (query.get('album_name') === 'undefined') {
-      query.delete('album_name');
-    }
-
-    let url = `${this.baseUrl}/api/search?${query.toString()}`;
-    let response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(`bad HTTPStatus(${response.statusText})`);
-    }
-
-    let data = (await response.json()) as LRCLIBSearchResponse;
-    if (!data || !Array.isArray(data)) {
-      throw new Error(`Expected an array, instead got ${typeof data}`);
-    }
-
-    if (data.length === 0) {
-      if (!config()?.showLyricsEvenIfInexact) {
-        return null;
-      }
-
-      // Try to search with the alternative title (original language)
-      const trackName = alternativeTitle || title;
-      query = new URLSearchParams({ q: `${trackName}` });
-      url = `${this.baseUrl}/api/search?${query.toString()}`;
-
-      response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`bad HTTPStatus(${response.statusText})`);
-      }
-
-      data = (await response.json()) as LRCLIBSearchResponse;
-      if (!Array.isArray(data)) {
-        throw new Error(`Expected an array, instead got ${typeof data}`);
-      }
-
-      // If still no results, try with the original title as fallback
-      if (data.length === 0 && alternativeTitle) {
-        query = new URLSearchParams({ q: title });
-        url = `${this.baseUrl}/api/search?${query.toString()}`;
-
-        response = await fetch(url);
-        if (!response.ok) {
-          throw new Error(`bad HTTPStatus(${response.statusText})`);
-        }
-
-        data = (await response.json()) as LRCLIBSearchResponse;
-        if (!Array.isArray(data)) {
-          throw new Error(`Expected an array, instead got ${typeof data}`);
-        }
-      }
-    }
-
-    const filteredResults = [];
-    for (const item of data) {
-      const { artistName } = item;
-
-      const artists = artist.split(/[&,]/g).map((i) => i.trim());
-      const itemArtists = artistName.split(/[&,]/g).map((i) => i.trim());
-
-      // Try to match using artist name first
-      const permutations = [];
-      for (const artistA of artists) {
-        for (const artistB of itemArtists) {
-          permutations.push([artistA.toLowerCase(), artistB.toLowerCase()]);
-        }
-      }
-
-      for (const artistA of itemArtists) {
-        for (const artistB of artists) {
-          permutations.push([artistA.toLowerCase(), artistB.toLowerCase()]);
-        }
-      }
-
-      let ratio = Math.max(...permutations.map(([x, y]) => jaroWinkler(x, y)));
-
-      // If direct artist match is below threshold and we have tags, try matching with tags
-      if (ratio <= 0.9 && tags && tags.length > 0) {
-        // Filter out the artist from tags to avoid duplicate comparisons
-        const filteredTags = tags.filter(
-          (tag) => tag.toLowerCase() !== artist.toLowerCase(),
-        );
-
-        const tagPermutations = [];
-        // Compare each tag with each item artist
-        for (const tag of filteredTags) {
-          for (const itemArtist of itemArtists) {
-            tagPermutations.push([tag.toLowerCase(), itemArtist.toLowerCase()]);
-          }
-        }
-
-        // Compare each item artist with each tag
-        for (const itemArtist of itemArtists) {
-          for (const tag of filteredTags) {
-            tagPermutations.push([itemArtist.toLowerCase(), tag.toLowerCase()]);
-          }
-        }
-
-        if (tagPermutations.length > 0) {
-          const tagRatio = Math.max(
-            ...tagPermutations.map(([x, y]) => jaroWinkler(x, y)),
-          );
-
-          // Use the best match ratio between direct artist match and tag match
-          ratio = Math.max(ratio, tagRatio);
-        }
-      }
-
-      if (ratio <= 0.9) continue;
-      filteredResults.push(item);
-    }
-
-    filteredResults.sort(({ duration: durationA }, { duration: durationB }) => {
-      const left = Math.abs(durationA - songDuration);
-      const right = Math.abs(durationB - songDuration);
-
-      return left - right;
-    });
-
-    const closestResult = filteredResults[0];
-    if (!closestResult) {
-      return null;
-    }
-
-    if (Math.abs(closestResult.duration - songDuration) > 15) {
-      return null;
-    }
-
-    if (
-      closestResult.instrumental &&
-      (!Number.isFinite(closestResult.duration) || closestResult.duration <= 0)
-    )
-      return null;
-    if (closestResult.instrumental)
+  private result(
+    track: LRCLibTrack,
+    identity: LRCLibIdentity,
+  ): Candidate | null {
+    if (track.instrumental)
       return {
-        title: closestResult.trackName,
-        artists: closestResult.artistName.split(/[&,]/g),
-        lines: [
-          {
-            time: '00:00',
-            timeInMs: 0,
-            duration: closestResult.duration * 1000,
-            text: '',
-            words: [],
-            instrumental: true,
-            status: 'upcoming',
-          },
-        ],
+        identity,
+        timed: true,
+        result: {
+          title: track.trackName,
+          artists: identity.artists,
+          lines: [
+            {
+              time: '00:00',
+              timeInMs: 0,
+              duration: track.duration * 1000,
+              text: '',
+              words: [],
+              instrumental: true,
+              status: 'upcoming',
+            },
+          ],
+        },
       };
-
-    const raw = closestResult.syncedLyrics;
-    const lyricsfile = closestResult.lyricsfile;
-    const plain = closestResult.plainLyrics;
-    if (!raw && !lyricsfile && !plain) {
-      return null;
-    }
-
-    // Word timing is optional. Invalid/absent lyricsfile retains the original LRC/plain path.
-    let timedLines: ReturnType<typeof LyricsFile.parse>['lines'] | undefined =
-      undefined;
-    if (typeof lyricsfile === 'string') {
+    let timedLines:
+      | ReturnType<typeof LyricsFile.parse>['lines']
+      | ReturnType<typeof LRC.parse>['lines']
+      | undefined;
+    if (track.lyricsfile) {
       try {
-        const parsed = LyricsFile.parse(lyricsfile).lines;
-        if (parsed.length) timedLines = parsed;
+        const parsed = LyricsFile.parse(track.lyricsfile).lines;
+        if (hasFiniteClocks(parsed)) timedLines = parsed;
       } catch {
-        /* use LRC */
+        /* Optional format cannot mask valid LRC/plain lyrics. */
       }
     }
-    if (!timedLines && raw) {
-      const parsed = LRC.parse(raw).lines;
-      if (parsed.length) timedLines = parsed;
+    if (!timedLines && track.syncedLyrics) {
+      const parsed = LRC.parse(track.syncedLyrics).lines;
+      if (hasFiniteClocks(parsed)) timedLines = parsed;
     }
+    if (timedLines && timedLines.length > 5000) return null;
+    const plain = track.plainLyrics?.trim() ? track.plainLyrics : undefined;
+    if (!timedLines && !plain) return null;
     return {
-      title: closestResult.trackName,
-      artists: closestResult.artistName.split(/[&,]/g),
-      lines: timedLines?.map((l) => ({
-        ...l,
-        status: 'upcoming' as const,
-      })),
-      lyrics: plain,
+      identity,
+      timed: !!timedLines,
+      result: {
+        title: track.trackName,
+        artists: identity.artists,
+        lines: timedLines?.map((line) => ({
+          ...line,
+          status: 'upcoming' as const,
+        })),
+        lyrics: plain,
+      },
     };
   }
-}
 
-type LRCLIBSearchResponse = {
-  id: number;
-  name: string;
-  trackName: string;
-  artistName: string;
-  albumName: string;
-  duration: number;
-  instrumental: boolean;
-  plainLyrics: string;
-  syncedLyrics: string;
-  lyricsfile?: string | null;
-}[];
+  private async response(
+    query: URLSearchParams,
+    request: Request,
+    interrupt: Promise<never>,
+  ): Promise<unknown[]> {
+    const assertCurrent = () => {
+      if (!request.active()) {
+        request.controller.abort(retired);
+        throw retired;
+      }
+    };
+    assertCurrent();
+    const response = await Promise.race([
+      fetch(`${this.baseUrl}/api/search?${query.toString()}`, {
+        signal: request.controller.signal,
+      }),
+      interrupt,
+    ]);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      assertCurrent();
+      if (!response.ok) throw new Error(`LRCLib HTTP ${response.status}`);
+      const declared = response.headers.get('content-length');
+      if (declared && Number(declared) > request.remainingBytes)
+        throw new Error('LRCLib response budget exceeded');
+      if (!response.body) throw new Error('LRCLib response body is missing');
+      reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      let text = '';
+      while (true) {
+        assertCurrent();
+        const chunk = await Promise.race([reader.read(), interrupt]);
+        assertCurrent();
+        if (chunk.done) break;
+        request.remainingBytes -= chunk.value.byteLength;
+        if (request.remainingBytes < 0)
+          throw new Error('LRCLib response budget exceeded');
+        text += decoder.decode(chunk.value, { stream: true });
+      }
+      text += decoder.decode();
+      assertCurrent();
+      const data: unknown = JSON.parse(text);
+      if (!Array.isArray(data))
+        throw new Error('LRCLib response must be an array');
+      return data;
+    } finally {
+      // Retire this response without aborting the search lease or waiting on
+      // an unresponsive cancellation hook. Cleanup cannot replace its error.
+      try {
+        if (reader) {
+          reader.cancel().catch(() => {});
+          reader.releaseLock();
+        } else {
+          response.body?.cancel().catch(() => {});
+        }
+      } catch {
+        /* The acquired response is already locked or retired. */
+      }
+    }
+  }
+
+  async search(info: SearchSongInfo): Promise<LyricResult | null> {
+    this.request?.controller.abort(retired);
+    this.request = undefined;
+    const planned = planLRCLibSearch(info);
+    if (!planned) return null;
+    const cfg = config(),
+      fuzzy = cfg?.showLyricsEvenIfInexact === true,
+      managed = cfg?.enabled === true;
+    const controller = new AbortController();
+    const request: Request = {
+      controller,
+      remainingBytes: LRCLIB_LIMITS.responseBytes,
+      owned: () =>
+        this.request === request &&
+        (!managed || config()?.enabled === true) &&
+        (config()?.showLyricsEvenIfInexact === true) === fuzzy,
+      active: () => request.owned() && !controller.signal.aborted,
+    };
+    this.request = request;
+    let interruptRequest!: (reason: unknown) => void;
+    const interrupt = new Promise<never>((_resolve, reject) => {
+      interruptRequest = reject;
+    });
+    const onAbort = () => interruptRequest(controller.signal.reason);
+    controller.signal.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(
+      () => controller.abort(deadline),
+      LRCLIB_LIMITS.deadlineMs,
+    );
+    timer.unref?.();
+    let best: Candidate | undefined,
+      examined = 0;
+    const better = (a: Candidate, b: Candidate) =>
+      a.identity.rank - b.identity.rank ||
+      Number(a.timed) - Number(b.timed) ||
+      a.identity.album - b.identity.album ||
+      b.identity.duration - a.identity.duration;
+    try {
+      for (const query of planned.queries) {
+        const data = await this.response(query, request, interrupt);
+        if (data.length > LRCLIB_LIMITS.candidates - examined)
+          throw new Error('LRCLib candidate budget exceeded');
+        for (const value of data) {
+          examined++;
+          const track = parseLRCLibTrack(value);
+          if (!track) continue;
+          const identity = rankLRCLibIdentity(planned, track, fuzzy);
+          if (!identity) continue;
+          const candidate = this.result(track, identity);
+          if (candidate && (!best || better(candidate, best) > 0))
+            best = candidate;
+        }
+        if (
+          best?.identity.exact &&
+          best.timed &&
+          best.identity.duration <= 2 &&
+          (!planned.album || best.identity.album === 1)
+        )
+          return request.active() ? best.result : null;
+        if (examined === LRCLIB_LIMITS.candidates) break;
+      }
+      return request.active() ? (best?.result ?? null) : null;
+    } catch (error) {
+      if (!request.owned() || controller.signal.reason === retired) return null;
+      if (best) return best.result;
+      if (controller.signal.reason === deadline) throw deadline;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      controller.signal.removeEventListener('abort', onAbort);
+      if (this.request === request) this.request = undefined;
+    }
+  }
+}
