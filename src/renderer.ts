@@ -21,6 +21,7 @@ import {
   loadAllRendererPlugins,
 } from './loader/renderer';
 import { startingPages } from './providers/extracted-data';
+import { createPlaylistQueueController } from './providers/queue-playlist-renderer';
 import { createRepeatPreference } from './providers/repeat-preference';
 import { setupSongInfo } from './providers/song-info-front';
 
@@ -35,6 +36,7 @@ setTheme('dark');
 
 let api: (Element & MusicPlayer) | null = null;
 let repeatPreference: ReturnType<typeof createRepeatPreference> | undefined;
+let playlistQueue: ReturnType<typeof createPlaylistQueueController> | undefined;
 let isPluginLoaded = false;
 let isApiLoaded = false;
 let firstDataLoaded = false;
@@ -81,6 +83,8 @@ async function callOnPlayerApiReady(
 }
 
 async function onApiLoaded() {
+  playlistQueue?.dispose();
+  playlistQueue = createPlaylistQueueController(api, () => api);
   repeatPreference?.dispose();
   repeatPreference = createRepeatPreference();
   // Workaround for macOS traffic lights
@@ -285,66 +289,6 @@ async function onApiLoaded() {
     } satisfies QueueResponse);
   });
 
-  window.ipcRenderer.on(
-    'peard:add-to-queue',
-    (_, videoId: string, queueInsertPosition: string) => {
-      (
-        window as unknown as {
-          blockerSceneGuard?: { cancelFromUser: () => void };
-        }
-      ).blockerSceneGuard?.cancelFromUser();
-      const queue = document.querySelector<QueueElement>('#queue');
-      const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
-      if (!app) return;
-
-      const store = queue?.queue.store.store;
-      if (!store) return;
-
-      app.networkManager
-        .fetch('/music/get_queue', {
-          queueContextParams: store.getState().queue.queueContextParams,
-          queueInsertPosition,
-          videoIds: [videoId],
-        })
-        .then((result) => {
-          if (
-            result &&
-            typeof result === 'object' &&
-            'queueDatas' in result &&
-            Array.isArray(result.queueDatas)
-          ) {
-            const queueItems = store.getState().queue.items;
-            const queueItemsLength = queueItems.length ?? 0;
-            queue?.dispatch({
-              type: 'ADD_ITEMS',
-              payload: {
-                nextQueueItemId: store.getState().queue.nextQueueItemId,
-                index:
-                  queueInsertPosition === 'INSERT_AFTER_CURRENT_VIDEO'
-                    ? queueItems.findIndex(
-                        (it) =>
-                          (
-                            it.playlistPanelVideoRenderer ||
-                            it.playlistPanelVideoWrapperRenderer
-                              ?.primaryRenderer.playlistPanelVideoRenderer
-                          )?.selected,
-                      ) + 1 || queueItemsLength
-                    : queueItemsLength,
-                items: result.queueDatas
-                  .map((it) =>
-                    typeof it === 'object' && it && 'content' in it
-                      ? it.content
-                      : null,
-                  )
-                  .filter(Boolean),
-                shuffleEnabled: false,
-                shouldAssignIds: true,
-              },
-            });
-          }
-        });
-    },
-  );
   window.ipcRenderer.on(
     'peard:move-in-queue',
     (_, fromIndex: number, toIndex: number) => {

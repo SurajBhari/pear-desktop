@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
 import { test, expect } from '@playwright/test';
 import { Window } from 'happy-dom';
+import { playlistProviderSource } from './helpers/playlist-provider-source';
 
 // Run the actual renderer entry's startup and IPC hooks. Only native, style,
 // translation and plugin-registry boundaries are replaced; no copied hook logic.
@@ -33,6 +34,13 @@ async function fixture(plugins: Record<string, any>) {
       },
       mainConfig: { get: () => undefined },
       ipcRenderer: {
+        subscribe: (id: string, fn: (...args: unknown[]) => void) => {
+          const handler = (_: unknown, ...args: unknown[]) => fn(...args);
+          handlers.set(id, handler);
+          return () => {
+            if (handlers.get(id) === handler) handlers.delete(id);
+          };
+        },
         on: (id: string, fn: (...args: any[]) => any) => handlers.set(id, fn),
         send() {},
       },
@@ -81,7 +89,7 @@ const forceUnloadRendererPlugin=async()=>{};
 class AudioContext {destination={};addEventListener(){}removeEventListener(){}createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(){return {connect(){},disconnect(){}}}}
 `;
   const source = await import(
-    `data:text/javascript;base64,${Buffer.from(boundaries + repeatProvider + actual).toString('base64')}`
+    `data:text/javascript;base64,${Buffer.from(boundaries + repeatProvider + (await playlistProviderSource()) + actual).toString('base64')}`
   );
   return {
     ...state,

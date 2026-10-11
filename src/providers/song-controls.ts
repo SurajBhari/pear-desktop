@@ -3,6 +3,8 @@ import { type BrowserWindow, ipcMain } from 'electron';
 
 import { LikeType } from '@/types/datahost-get-state';
 
+import { requestPlaylistQueue } from './queue-playlist-request';
+
 // see protocol-handler.ts
 type ArgsType<T> = T | string[] | undefined;
 
@@ -116,6 +118,24 @@ export const getSongControls = (win: BrowserWindow) => {
         queueInsertPosition,
       );
     },
+    addPlaylistToQueue: (
+      playlistId: ArgsType<string>,
+      videoId?: ArgsType<string>,
+      queueInsertPosition: ArgsType<string> = 'INSERT_AT_END',
+      signal?: AbortSignal,
+    ) =>
+      requestPlaylistQueue(
+        win,
+        {
+          playlistId: parseStringFromArgsType(playlistId),
+          videoId:
+            videoId === undefined
+              ? undefined
+              : parseStringFromArgsType(videoId),
+          insertPosition: parseStringFromArgsType(queueInsertPosition),
+        },
+        signal,
+      ),
     moveSongInQueue: (
       fromIndex: ArgsType<number>,
       toIndex: ArgsType<number>,

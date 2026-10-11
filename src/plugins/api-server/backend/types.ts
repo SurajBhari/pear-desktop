@@ -6,7 +6,9 @@ import type { SongInfo } from '@/providers/song-info';
 import type { BackendContext } from '@/types/contexts';
 import type { RepeatMode, VolumeState } from '@/types/datahost-get-state';
 
-export type HonoApp = Hono;
+export type HonoApp = Hono<{
+  Variables: { playlistQueueSignal?: AbortSignal };
+}>;
 export type BackendType = {
   app?: HonoApp;
   server?: ReturnType<typeof serve>;
@@ -14,6 +16,7 @@ export type BackendType = {
   songInfo?: SongInfo;
   startRevision?: number;
   unsubscribeSongInfo?: () => void;
+  queueRequestScope?: AbortController;
   currentRepeatMode?: RepeatMode;
   volumeState?: VolumeState;
 

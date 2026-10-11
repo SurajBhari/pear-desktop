@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
 import { Window } from 'happy-dom';
 import { test, expect } from '@playwright/test';
+import { playlistProviderSource } from './helpers/playlist-provider-source';
 
 async function fixture(mode = 'ALL') {
   const dom = new Window();
@@ -35,6 +36,13 @@ async function fixture(mode = 'ALL') {
   };
   w.mainConfig = { get: () => undefined };
   w.ipcRenderer = {
+    subscribe: (id: string, fn: (...args: unknown[]) => void) => {
+      const handler = (_: unknown, ...args: unknown[]) => fn(...args);
+      state.handlers.set(id, handler);
+      return () => {
+        if (state.handlers.get(id) === handler) state.handlers.delete(id);
+      };
+    },
     on: (id: string, fn: any) => state.handlers.set(id, fn),
     send() {},
   };
@@ -69,11 +77,14 @@ async function fixture(mode = 'ALL') {
       'export {onApiLoaded};',
     );
   const audioProvider = stripTypeScriptTypes(
-    await readFile(new URL('../src/providers/renderer-audio.ts', import.meta.url), 'utf8'),
+    await readFile(
+      new URL('../src/providers/renderer-audio.ts', import.meta.url),
+      'utf8',
+    ),
   ).replace(/^export /gm, '');
   const boundaries = `const fixture=globalThis[${JSON.stringify(key)}];const window=fixture.dom;const document=window.document;const Element=window.Element;const HTMLElement=window.HTMLElement;const Event=window.Event;const CustomEvent=window.CustomEvent;const setTheme=()=>{};const registerWindowDefaultTrustedTypePolicy=()=>{};const LoggerPrefix='fixture';const i18t=x=>x;const getAllLoadedRendererPlugins=()=>({});const startingPages={};class AudioContext extends window.EventTarget{destination={};createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return{mediaElement:element,connect(){},disconnect(){}}}};`;
   const source = await import(
-    `data:text/javascript;base64,${Buffer.from(boundaries + audioProvider + helper + actual).toString('base64')}`
+    `data:text/javascript;base64,${Buffer.from(boundaries + audioProvider + helper + (await playlistProviderSource()) + actual).toString('base64')}`
   );
   await source.onApiLoaded();
   return {

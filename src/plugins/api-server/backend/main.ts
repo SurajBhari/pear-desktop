@@ -29,6 +29,8 @@ import type { MiddlewareHandler } from 'hono';
 
 export const backend = createBackend<BackendType, APIServerConfig>({
   async start(ctx) {
+    this.queueRequestScope?.abort();
+    this.queueRequestScope = undefined;
     const revision = (this.startRevision = (this.startRevision ?? 0) + 1);
     this.unsubscribeSongInfo?.();
     this.unsubscribeSongInfo = undefined;
@@ -80,6 +82,9 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     this.end();
   },
   onConfigChange(config) {
+    // Reconfiguration, including authorization changes, retires admitted playlist work.
+    this.queueRequestScope?.abort();
+    this.queueRequestScope = new AbortController();
     const old = this.oldConfig;
     if (
       old?.hostname === config.hostname &&
@@ -99,7 +104,8 @@ export const backend = createBackend<BackendType, APIServerConfig>({
 
   // Custom
   init(backendCtx) {
-    this.app = new Hono();
+    this.app = new Hono<{ Variables: { playlistQueueSignal?: AbortSignal } }>();
+    const owningApp = this.app;
 
     this.app.use('*', cors());
 
@@ -109,6 +115,16 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       await next();
     });
 
+    // Capture scope before asynchronous authentication so stop/reconfigure cannot admit old work later.
+    this.app.use(`/api/${API_VERSION}/queue/playlist`, async (ctx, next) => {
+      ctx.set(
+        'playlistQueueSignal',
+        this.app === owningApp
+          ? (this.queueRequestScope?.signal ?? AbortSignal.abort())
+          : AbortSignal.abort(),
+      );
+      await next();
+    });
     // middlewares
     const jwtGuard: MiddlewareHandler = async (ctx, next) => {
       if (ctx.req.path.endsWith(`${API_VERSION}/ws`)) {
@@ -189,6 +205,8 @@ export const backend = createBackend<BackendType, APIServerConfig>({
   },
   run(config) {
     if (!this.app) return;
+    if (!this.queueRequestScope || this.queueRequestScope.signal.aborted)
+      this.queueRequestScope = new AbortController();
 
     try {
       const wss = new WebSocketServer({ noServer: true });
@@ -219,6 +237,8 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     }
   },
   end() {
+    this.queueRequestScope?.abort();
+    this.queueRequestScope = undefined;
     this.server?.close();
     this.server = undefined;
   },
