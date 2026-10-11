@@ -11,12 +11,13 @@ const root = path.resolve(import.meta.dirname, '..');
 let scratch: string;
 let backend: any;
 let NetEase: any;
+let nativeIpc: any;
 test.beforeAll(async () => {
   scratch = await mkdtemp(path.join(root, '.tmp-netease-test-'));
   const entry = path.join(scratch, 'entry.ts');
   await writeFile(
     entry,
-    `export {backend} from ${JSON.stringify(path.join(root, 'src/plugins/synced-lyrics/backend.ts'))};export {NetEase} from ${JSON.stringify(path.join(root, 'src/plugins/synced-lyrics/providers/NetEase.ts'))};`,
+    `export {backend} from ${JSON.stringify(path.join(root, 'src/plugins/synced-lyrics/backend.ts'))};export {NetEase} from ${JSON.stringify(path.join(root, 'src/plugins/synced-lyrics/providers/NetEase.ts'))};export {ipcMain} from 'electron';`,
   );
   await build({
     root,
@@ -27,6 +28,11 @@ test.beforeAll(async () => {
       alias: [
         { find: /^@\/utils$/, replacement: '\0fixture-utils' },
         { find: /^electron$/, replacement: '\0fixture-electron' },
+        { find: /^@\/i18n$/, replacement: '\0fixture-i18n' },
+        {
+          find: /^@\/providers\/song-info$/,
+          replacement: '\0fixture-song-info',
+        },
         { find: '@', replacement: path.join(root, 'src') },
       ],
     },
@@ -35,14 +41,16 @@ test.beforeAll(async () => {
         name: 'native-lyrics-boundaries',
         enforce: 'pre',
         resolveId(id) {
-          if (id === '\0fixture-utils' || id === '\0fixture-electron')
-            return id;
+          if (id.startsWith('\0fixture-')) return id;
         },
         load(id) {
           if (id === '\0fixture-utils')
             return 'export const createBackend=value=>value;';
           if (id === '\0fixture-electron')
-            return 'export const net={fetch:()=>{throw Error("Unexpected global fetch")}};';
+            return 'import {EventEmitter} from "node:events";export const handlers=new Map();export const ipcMain=Object.assign(new EventEmitter(),{handle:(name,fn)=>handlers.set(name,fn),removeHandler:name=>handlers.delete(name)});export const dialog={showSaveDialog:()=>{throw Error("Unexpected save dialog in NetEase witness")}};export const net={fetch:()=>{throw Error("Unexpected global fetch")}};';
+          if (id === '\0fixture-i18n') return 'export const t=value=>value;';
+          if (id === '\0fixture-song-info')
+            return 'export const registerCallback=()=>()=>{};';
         },
       },
     ],
@@ -57,9 +65,11 @@ test.beforeAll(async () => {
       },
     },
   });
-  ({ backend, NetEase } = await import(
-    pathToFileURL(path.join(scratch, 'fixture.mjs')).href
-  ));
+  ({
+    backend,
+    NetEase,
+    ipcMain: nativeIpc,
+  } = await import(pathToFileURL(path.join(scratch, 'fixture.mjs')).href));
 });
 test.afterAll(async () => {
   if (scratch) await rm(scratch, { recursive: true, force: true });
@@ -133,7 +143,10 @@ function fixture(
   const handlers = new Map<string, (...args: any[]) => any>();
   const ipc = {
     handle: (key: string, fn: (...args: any[]) => any) => handlers.set(key, fn),
-    removeHandler: (key: string) => handlers.delete(key),
+    removeHandler: (key: string) => {
+      handlers.delete(key);
+      nativeIpc.removeHandler(key);
+    },
     send() {},
   };
   const context = () => ({

@@ -1,8 +1,37 @@
+import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
+import { fileURLToPath } from 'node:url';
+
 import { test, expect } from '@playwright/test';
+import { build } from 'vite';
 
 async function fixture() {
+  // Keep the actual NetEase bridge in this composed backend witness.
+  const bridge = await build({
+    root: fileURLToPath(new URL('../', import.meta.url)),
+    configFile: false,
+    logLevel: 'error',
+    ssr: { noExternal: true },
+    resolve: {
+      alias: { '@': fileURLToPath(new URL('../src', import.meta.url)) },
+    },
+    build: {
+      ssr: fileURLToPath(
+        new URL(
+          '../src/plugins/synced-lyrics/providers/netease-backend.ts',
+          import.meta.url,
+        ),
+      ),
+      write: false,
+      minify: false,
+      rollupOptions: { output: { format: 'es' } },
+    },
+  });
+  const output = Array.isArray(bridge) ? bridge[0] : bridge;
+  const code = output.output.find((item: any) => item.type === 'chunk')!.code;
+  const bridgeUrl = `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`;
+  const bridgeBoundary = `import {startNetEaseProvider,stopNetEaseProvider} from '${bridgeUrl}';`;
   const key = `lyricsExport_${crypto.randomUUID()}`;
   const state: any = {
     handlers: new Map(),
@@ -40,13 +69,20 @@ async function fixture() {
   ).replace(/^import[\s\S]*?;\n/gm, '');
   const boundary = `import {serializeLyricsExport} from '${utilsUrl}'; const state=globalThis[${JSON.stringify(key)}]; const net={fetch:()=>{}};const ipcMain={handle:(name,fn)=>state.nativeHandlers.set(name,fn),on:(name,fn)=>state.nativeListeners.set(name,fn),removeListener:(name,fn)=>{if(state.nativeListeners.get(name)===fn)state.nativeListeners.delete(name)}};const t=x=>x; const createBackend=x=>x; const writeFile=async(...args)=>state.writes.push(args); const dialog={showSaveDialog:async(...args)=>{state.dialogs.push(args);if(state.wait)await state.wait;return {canceled:false,filePath:'/owned/chosen.lrc'}}};const registerCallback=(callback)=>{state.callback=callback; callback({videoId:state.song});return ()=>{state.dispose++}};`;
   const m = await import(
-    `data:text/javascript;base64,${Buffer.from(boundary + raw).toString('base64')}`
+    `data:text/javascript;base64,${Buffer.from(bridgeBoundary + boundary + raw).toString('base64')}`
   );
   const ctx: any = {
-    window: {
+    window: Object.assign(new EventEmitter(), {
       isDestroyed: () => state.destroyed,
-      webContents: { isDestroyed: () => state.destroyed },
-    },
+      webContents: {
+        isDestroyed: () => state.destroyed,
+        session: {
+          fetch: async () => {
+            throw Error('Unexpected NetEase network request in export witness');
+          },
+        },
+      },
+    }),
     ipc: {
       handle: (name: string, fn: any) => state.handlers.set(name, fn),
       removeHandler: (name: string) => {
