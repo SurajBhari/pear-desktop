@@ -12,12 +12,17 @@ import {
   type MusicGrantRecord,
   type MusicTransport,
 } from './music-grants';
+import {
+  createWindowsPrivatePath,
+  type WindowsPrivatePath,
+} from './windows-private-path';
 
 import { failMusic, type MusicScope } from '../music-types';
 
 /** Native main-process ledger. No record can be imported from renderer-writable plugin settings. */
 export class MusicGrantStore {
   private records: MusicGrantRecord[] | undefined;
+  private windowsBinding: string | null | undefined;
   private readonly observers = new Set<() => void>();
   subscribe(observer: () => void) {
     this.observers.add(observer);
@@ -28,6 +33,11 @@ export class MusicGrantStore {
   constructor(
     private readonly directory: string,
     private readonly now = Date.now,
+    private readonly windows:
+      | WindowsPrivatePath
+      | undefined = process.platform === 'win32'
+      ? createWindowsPrivatePath()
+      : undefined,
   ) {
     this.file = path.join(directory, 'grants.json');
   }
@@ -40,14 +50,25 @@ export class MusicGrantStore {
     return (
       (directory ? s.isDirectory() : s.isFile()) &&
       !s.isSymbolicLink() &&
-      (process.platform === 'win32' ||
-        ((s.mode & 0o777) === (directory ? 0o700 : 0o600) &&
-          s.uid === process.getuid?.())) &&
+      (s.mode & 0o777) === (directory ? 0o700 : 0o600) &&
+      s.uid === process.getuid?.() &&
       (directory || (s.nlink === 1 && s.size <= GRANT_MAX_BYTES))
     );
   }
   private async load() {
     if (this.records) return;
+    if (this.windows) {
+      try {
+        const snapshot = await this.windows.read(this.directory);
+        const records =
+          snapshot.contents === null ? [] : this.parse(snapshot.contents);
+        this.windowsBinding = snapshot.binding;
+        this.records = records;
+        return;
+      } catch {
+        return failMusic('unavailable');
+      }
+    }
     try {
       let dir: Stats;
       try {
@@ -79,30 +100,35 @@ export class MusicGrantStore {
         const contents = await handle.readFile({ encoding: 'utf8' });
         if (Buffer.byteLength(contents) > GRANT_MAX_BYTES)
           return failMusic('unavailable');
-        const value: unknown = JSON.parse(contents);
-        if (!value || typeof value !== 'object' || Array.isArray(value))
-          return failMusic('unavailable');
-        const raw = value as Record<string, unknown>;
-        if (
-          Object.keys(raw).length !== 2 ||
-          raw.version !== 1 ||
-          !Array.isArray(raw.records) ||
-          raw.records.length > GRANT_MAX_RECORDS
-        )
-          return failMusic('unavailable');
-        const records = raw.records.map(parseMusicGrantRecord);
-        if (
-          records.some((r) => !r) ||
-          new Set(records.map((r) => r?.id)).size !== records.length
-        )
-          return failMusic('unavailable');
-        this.records = records as MusicGrantRecord[];
+        this.records = this.parse(contents);
       } finally {
         await handle.close();
       }
     } catch {
       return failMusic('unavailable');
     }
+  }
+  private parse(contents: string): MusicGrantRecord[] {
+    if (Buffer.byteLength(contents) > GRANT_MAX_BYTES)
+      return failMusic('unavailable');
+    const value: unknown = JSON.parse(contents);
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      return failMusic('unavailable');
+    const raw = value as Record<string, unknown>;
+    if (
+      Object.keys(raw).length !== 2 ||
+      raw.version !== 1 ||
+      !Array.isArray(raw.records) ||
+      raw.records.length > GRANT_MAX_RECORDS
+    )
+      return failMusic('unavailable');
+    const records = raw.records.map(parseMusicGrantRecord);
+    if (
+      records.some((record) => !record) ||
+      new Set(records.map((record) => record?.id)).size !== records.length
+    )
+      return failMusic('unavailable');
+    return records as MusicGrantRecord[];
   }
   private async save(records: MusicGrantRecord[], current: () => boolean) {
     if (!current()) return failMusic('retired');
@@ -112,6 +138,35 @@ export class MusicGrantStore {
       Buffer.byteLength(content) > GRANT_MAX_BYTES
     )
       return failMusic('budget');
+    if (this.windows) {
+      if (this.windowsBinding === undefined) return failMusic('unavailable');
+      let prepared:
+        | Awaited<ReturnType<WindowsPrivatePath['stage']>>
+        | undefined;
+      try {
+        prepared = await this.windows.stage(
+          this.directory,
+          content,
+          this.windowsBinding,
+        );
+        if (!current()) return failMusic('retired');
+        this.windowsBinding = await prepared.commit();
+        this.records = records;
+        for (const observer of this.observers) observer();
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          ['retired', 'budget', 'unavailable'].includes(
+            (error as Error & { code?: string }).code ?? '',
+          )
+        )
+          throw error;
+        return failMusic('unavailable');
+      } finally {
+        await prepared?.close();
+      }
+      return;
+    }
     const temporary = path.join(this.directory, `.grants-${randomUUID()}.tmp`);
     try {
       await mkdir(this.directory, { mode: 0o700, recursive: true });
