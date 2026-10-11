@@ -219,6 +219,10 @@
     }
   },
   "plugins": {
+    "taskbar-progress": {
+      "name": "Taskbar progress",
+      "description": "Show the current track's playback progress in the taskbar or dock."
+    },
     "toast-autoclose": {
       "name": "Toast Auto-Close",
       "description": "Close YouTube Music notifications after three seconds. Notifications with focused actions stay open."
