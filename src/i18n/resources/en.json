@@ -1234,6 +1234,32 @@
       "pronunciation": "Include pronunciation",
       "max-length": "Maximum length",
       "failed": "Could not update menu bar lyrics"
+    },
+    "blocklist": {
+      "name": "Artist blocklist",
+      "description": "Automatically skip blocked artists, using confirmed current-track identity.",
+      "templates": {
+        "button": "Block {{name}}"
+      },
+      "menu": {
+        "add": {
+          "label": "Add blocked artist…",
+          "prompt-title": "Block artist",
+          "prompt-label": "Artist name (up to 200 characters)"
+        },
+        "edit": {
+          "label": "Edit artist…",
+          "prompt-title": "Edit blocked artist"
+        },
+        "remove": "Remove",
+        "clear": "Clear all",
+        "no-artists": "No blocked artists",
+        "unsupported": "Artist list has unsupported entries; stored data is preserved."
+      }
+    },
+    "skip-live-songs": {
+      "name": "Skip live recordings",
+      "description": "Skip explicitly marked live recordings. Ordinary city, radio and studio titles are retained."
     }
   }
 }
