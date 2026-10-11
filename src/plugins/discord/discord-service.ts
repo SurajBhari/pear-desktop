@@ -3,8 +3,15 @@ import { ActivityType } from 'discord-api-types/v10';
 import is from 'electron-is';
 
 import { t } from '@/i18n';
+import {
+  getSongInfoProvenance,
+  getCurrentSongInfoProvenance,
+  type SongInfo,
+  type SongInfoProvenance,
+} from '@/providers/song-info';
 import { LoggerPrefix } from '@/utils';
 
+import { DiscordArtistArtwork } from './artist-artwork';
 import { clientId, PROGRESS_THROTTLE_MS, TimerKey } from './constants';
 import { TimerManager } from './timer-manager';
 import {
@@ -15,11 +22,37 @@ import {
 } from './utils';
 
 import type { DiscordPluginConfig } from './index';
-import type { SongInfo } from '@/providers/song-info';
 import type { SetActivity } from '@xhayper/discord-rpc/dist/structures/ClientUser';
+
+type ArtistOwner = {
+  token: SongInfoProvenance;
+  client: DiscordClient;
+  window: Electron.BrowserWindow;
+  contents: Electron.WebContents;
+  revision: number;
+  videoId: string;
+  artistUrl: string;
+  artist: string;
+  pending: boolean;
+  image?: string;
+};
+const artworkServices = new WeakMap<Electron.BrowserWindow, DiscordService>();
+const artworkPools = new WeakMap<
+  Electron.BrowserWindow,
+  DiscordArtistArtwork
+>();
 
 // Public API definition for the Discord Service
 export class DiscordService {
+  private readonly artistArtwork: DiscordArtistArtwork;
+  private artistOwner?: ArtistOwner;
+  private songProvenance: SongInfoProvenance | null = null;
+  private artworkRevision = 0;
+  private artworkStopped = false;
+  private readonly retireWindowArtwork = () => {
+    this.retireArtistArtwork();
+    this.songProvenance = null;
+  };
   /**
    * Discord RPC client instance.
    */
@@ -61,12 +94,22 @@ export class DiscordService {
   ) {
     this.config = config;
     this.mainWindow = mainWindow;
+    artworkServices.get(mainWindow)?.retireArtistArtwork();
+    this.artistArtwork =
+      artworkPools.get(mainWindow) ?? new DiscordArtistArtwork();
+    artworkPools.set(mainWindow, this.artistArtwork);
+    artworkServices.set(mainWindow, this);
     this.autoReconnect = config?.autoReconnect ?? true; // Default autoReconnect to true
+    mainWindow.once('closed', this.retireWindowArtwork);
+    mainWindow.webContents.on('did-navigate', this.retireWindowArtwork);
+    mainWindow.webContents.on('render-process-gone', this.retireWindowArtwork);
+    mainWindow.webContents.once('destroyed', this.retireWindowArtwork);
 
     this.initializeRpc();
   }
 
   private initializeRpc() {
+    this.retireArtistArtwork();
     if (this.rpc) {
       try {
         this.rpc.destroy();
@@ -100,6 +143,111 @@ export class DiscordService {
     });
   }
 
+  private retireArtistArtwork(clearCache = false) {
+    this.artistOwner = undefined;
+    // An older service's delayed cleanup must not cancel its replacement's work.
+    if (artworkServices.get(this.mainWindow) === this)
+      this.artistArtwork.cancel(clearCache);
+  }
+
+  private ownsArtist(owner: ArtistOwner): boolean {
+    try {
+      return (
+        !this.artworkStopped &&
+        artworkServices.get(owner.window) === this &&
+        this.artistOwner === owner &&
+        this.config?.enabled === true &&
+        this.config.showArtistImage === true &&
+        this.artworkRevision === owner.revision &&
+        this.rpc === owner.client &&
+        this.ready &&
+        owner.client.isConnected &&
+        this.mainWindow === owner.window &&
+        !owner.window.isDestroyed() &&
+        owner.window.webContents === owner.contents &&
+        !owner.contents.isDestroyed() &&
+        this.songProvenance === owner.token &&
+        getCurrentSongInfoProvenance(owner.window) === owner.token
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private prepareArtistArtwork(songInfo: SongInfo) {
+    const token =
+      getSongInfoProvenance(songInfo) ??
+      (songInfo === this.lastSongInfo ? this.songProvenance : null);
+    this.songProvenance = token;
+    if (
+      !token ||
+      !this.config?.enabled ||
+      this.config.showArtistImage !== true ||
+      !songInfo.artistUrl ||
+      !songInfo.artist.trim() ||
+      getCurrentSongInfoProvenance(this.mainWindow) !== token
+    ) {
+      this.retireArtistArtwork();
+      return;
+    }
+    const display = { ...songInfo };
+    padHangulFields(display);
+    let owner = this.artistOwner;
+    if (
+      !owner ||
+      owner.token !== token ||
+      owner.client !== this.rpc ||
+      owner.revision !== this.artworkRevision ||
+      owner.videoId !== songInfo.videoId ||
+      owner.artistUrl !== songInfo.artistUrl ||
+      owner.artist !== display.artist
+    ) {
+      this.retireArtistArtwork();
+      owner = {
+        token,
+        client: this.rpc,
+        window: this.mainWindow,
+        contents: this.mainWindow.webContents,
+        revision: this.artworkRevision,
+        videoId: songInfo.videoId,
+        artistUrl: songInfo.artistUrl,
+        artist: display.artist,
+        pending: false,
+      };
+      this.artistOwner = owner;
+    }
+    if (owner.image || owner.pending || !this.ownsArtist(owner)) return;
+    owner.pending = true;
+    const captured = owner;
+    this.artistArtwork
+      .load(owner.artistUrl, () => this.ownsArtist(captured))
+      .then((image) => {
+        captured.pending = false;
+        if (
+          !image ||
+          !this.ownsArtist(captured) ||
+          !this.lastSongInfo ||
+          !this.config
+        )
+          return;
+        captured.image = image;
+        const activity = this.buildActivityInfo(this.lastSongInfo, this.config);
+        if (!this.ownsArtist(captured)) return;
+        const user = captured.client.user;
+        if (!this.ownsArtist(captured)) return;
+        this.timerManager.clear(TimerKey.UpdateTimeout);
+        user
+          ?.setActivity(activity)
+          .catch((err) =>
+            console.error(LoggerPrefix, 'Failed to set artist activity:', err),
+          );
+        this.lastProgressUpdate = Date.now();
+      })
+      .catch(() => {
+        captured.pending = false;
+      });
+  }
+
   /**
    * Builds the SetActivity payload for Discord Rich Presence.
    * @param songInfo - Current song information.
@@ -128,6 +276,18 @@ export class DiscordService {
       buttons: buildDiscordButtons(config, songInfo),
     };
 
+    const owner = this.artistOwner;
+    if (
+      owner?.image &&
+      this.ownsArtist(owner) &&
+      owner.videoId === songInfo.videoId &&
+      owner.artistUrl === songInfo.artistUrl &&
+      owner.artist === songInfo.artist
+    ) {
+      activityInfo.smallImageKey = owner.image;
+      activityInfo.smallImageText = sanitizeActivityText(songInfo.artist);
+    }
+
     // Handle paused state display
     if (songInfo.isPaused) {
       activityInfo.largeImageText = '⏸︎';
@@ -136,10 +296,12 @@ export class DiscordService {
       songInfo.songDuration > 0 &&
       typeof songInfo.elapsedSeconds === 'number'
     ) {
-      const songStartTime = Date.now() - (songInfo.elapsedSeconds * 1000);
+      const elapsedMs = songInfo.elapsedSeconds * 1000;
+      const durationMs = songInfo.songDuration * 1000;
+      const songStartTime = Date.now() - elapsedMs;
       activityInfo.startTimestamp = Math.floor(songStartTime / 1000);
       activityInfo.endTimestamp = Math.floor(
-        (songStartTime + (songInfo.songDuration * 1000)) / 1000,
+        (songStartTime + durationMs) / 1000,
       );
     }
 
@@ -173,6 +335,8 @@ export class DiscordService {
    * Resets the internal state (except config and mainWindow), clears timers, and logs disconnection.
    */
   private resetInfo() {
+    this.retireArtistArtwork();
+    this.songProvenance = null;
     this.ready = false;
     this.lastSongInfo = undefined;
     this.lastProgressUpdate = 0;
@@ -269,6 +433,7 @@ export class DiscordService {
    * Disconnects from Discord RPC, prevents auto-reconnection, and clears timers.
    */
   disconnect(): void {
+    this.retireArtistArtwork();
     this.autoReconnect = false;
     this.timerManager.clear(TimerKey.DiscordConnectRetry);
     this.timerManager.clear(TimerKey.ClearActivity);
@@ -305,6 +470,7 @@ export class DiscordService {
       // skip update if not ready
       return;
     }
+    this.prepareArtistArtwork(songInfo);
 
     const now = Date.now();
     const elapsedSeconds = songInfo.elapsedSeconds ?? 0;
@@ -380,6 +546,7 @@ export class DiscordService {
    * Clears the Discord Rich Presence activity.
    */
   clearActivity(): void {
+    this.retireArtistArtwork();
     if (this.rpc.isConnected && this.ready) {
       this.rpc.user?.clearActivity();
     }
@@ -394,10 +561,15 @@ export class DiscordService {
    * @param newConfig - The new plugin configuration.
    */
   onConfigChange(newConfig: DiscordPluginConfig): void {
+    const artworkChanged =
+      this.config?.showArtistImage !== newConfig.showArtistImage;
+    this.artworkRevision++;
+    this.retireArtistArtwork();
     this.config = newConfig;
     this.autoReconnect = newConfig.autoReconnect ?? true;
 
     if (this.lastSongInfo && this.ready && this.rpc.isConnected) {
+      if (artworkChanged) this.lastProgressUpdate = 0;
       this.updateActivity(this.lastSongInfo);
     }
 
@@ -426,6 +598,23 @@ export class DiscordService {
    * Should be called when the plugin stops or the application quits.
    */
   cleanup(): void {
+    this.artworkStopped = true;
+    this.retireArtistArtwork(true);
+    if (artworkServices.get(this.mainWindow) === this)
+      artworkServices.delete(this.mainWindow);
+    this.mainWindow.removeListener('closed', this.retireWindowArtwork);
+    this.mainWindow.webContents.removeListener(
+      'did-navigate',
+      this.retireWindowArtwork,
+    );
+    this.mainWindow.webContents.removeListener(
+      'render-process-gone',
+      this.retireWindowArtwork,
+    );
+    this.mainWindow.webContents.removeListener(
+      'destroyed',
+      this.retireWindowArtwork,
+    );
     this.disconnect();
     this.refreshCallbacks = [];
   }

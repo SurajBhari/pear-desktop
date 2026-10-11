@@ -511,6 +511,7 @@
         "connected": "Подключено",
         "disconnected": "Отключено",
         "hide-duration-left": "Скрыть сколько осталось времени",
+        "show-artist-image": "Показывать аватар исполнителя (публичный запрос)",
         "hide-github-button": "Скрыть ссылку на GitHub",
         "play-on-application": "Воспроизвести на {{applicationName}}",
         "set-inactivity-timeout": "Поставить таймер неактивности",
