@@ -50,6 +50,7 @@ import {
   setupProtocolHandler,
 } from '@/providers/protocol-handler';
 import { setupSongInfo } from '@/providers/song-info';
+import { setupInitialWindowVisibility } from '@/providers/window-visibility';
 import { setUpTray } from '@/tray';
 import { LoggerPrefix } from '@/utils';
 import { isTesting } from '@/utils/testing';
@@ -522,11 +523,9 @@ async function createMainWindow() {
     showUnresponsiveDialog(win, details);
   });
 
-  win.once('ready-to-show', () => {
-    if (config.get('options.appVisible')) {
-      win.show();
-    }
-  });
+  setupInitialWindowVisibility(win, () =>
+    Boolean(config.get('options.appVisible')),
+  );
 
   removeContentSecurityPolicy();
 
