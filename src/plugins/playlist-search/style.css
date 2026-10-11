@@ -1,0 +1,50 @@
+.pear-playlist-search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px 12px;
+  margin: 16px 0;
+  color: var(--ytmusic-text-primary);
+  font: inherit;
+}
+.pear-playlist-search label {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+.pear-playlist-search label > span {
+  font-size: 1.4rem;
+}
+.pear-playlist-search input,
+.pear-playlist-search button {
+  min-height: 44px;
+  border: 1px solid var(--ytmusic-text-secondary);
+  border-radius: 6px;
+  padding: 8px 12px;
+  background: var(--ytmusic-background);
+  color: inherit;
+  font: inherit;
+}
+.pear-playlist-search input {
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+.pear-playlist-search input:focus-visible,
+.pear-playlist-search button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.pear-playlist-search button {
+  cursor: pointer;
+}
+.pear-playlist-search button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.pear-playlist-search p {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 1.2rem;
+  color: var(--ytmusic-text-secondary);
+}

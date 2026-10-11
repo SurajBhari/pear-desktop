@@ -1215,6 +1215,14 @@
         "to": "To",
         "to-placeholder": "end of song"
       }
+    },
+    "playlist-search": {
+      "name": "Collection search",
+      "description": "Filter items already loaded in playlists, albums and library lists. Does not download the full collection.",
+      "label": "Search loaded items",
+      "placeholder": "Title or artist",
+      "clear": "Clear",
+      "results": "{{matches}} of {{total}} loaded items match"
     }
   }
 }
