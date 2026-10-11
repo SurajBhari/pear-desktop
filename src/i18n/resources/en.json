@@ -218,6 +218,14 @@
     }
   },
   "plugins": {
+    "toast-autoclose": {
+      "name": "Toast Auto-Close",
+      "description": "Close YouTube Music notifications after three seconds. Notifications with focused actions stay open."
+    },
+    "dismiss-multidevice-popup": {
+      "name": "Dismiss Multidevice Popup",
+      "description": "Close the simultaneous playback dialog using its native close action. Other dialogs stay open."
+    },
     "ad-speedup": {
       "description": "If an ad play it mutes the audio and sets playback speed to 16x",
       "name": "Ad Speedup"
