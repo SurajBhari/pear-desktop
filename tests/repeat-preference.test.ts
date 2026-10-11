@@ -73,7 +73,7 @@ async function fixture(mode = 'ALL') {
   const actual = stripTypeScriptTypes(raw)
     .replace(/^import[\s\S]*?;\n/gm, '')
     .replace(
-      'initObserver().then(preload).then(main);',
+      /initObserver\(\)\s*\.then\(preload\)[\s\S]*?;\s*$/,
       'export {onApiLoaded};',
     );
   const audioProvider = stripTypeScriptTypes(
@@ -82,7 +82,7 @@ async function fixture(mode = 'ALL') {
       'utf8',
     ),
   ).replace(/^export /gm, '');
-  const boundaries = `const fixture=globalThis[${JSON.stringify(key)}];const window=fixture.dom;const document=window.document;const Element=window.Element;const HTMLElement=window.HTMLElement;const Event=window.Event;const CustomEvent=window.CustomEvent;const setTheme=()=>{};const registerWindowDefaultTrustedTypePolicy=()=>{};const LoggerPrefix='fixture';const i18t=x=>x;const getAllLoadedRendererPlugins=()=>({});const startingPages={};class AudioContext extends window.EventTarget{destination={};createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return{mediaElement:element,connect(){},disconnect(){}}}};`;
+  const boundaries = `const fixture=globalThis[${JSON.stringify(key)}];const window=fixture.dom;const document=window.document;const Element=window.Element;const HTMLElement=window.HTMLElement;const Event=window.Event;const CustomEvent=window.CustomEvent;const setTheme=()=>{};const registerWindowDefaultTrustedTypePolicy=()=>{};const LoggerPrefix='fixture';const retireLanguageRequests=()=>{};const i18t=x=>x;const getAllLoadedRendererPlugins=()=>({});const startingPages={};class AudioContext extends window.EventTarget{destination={};createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return{mediaElement:element,connect(){},disconnect(){}}}};`;
   const source = await import(
     `data:text/javascript;base64,${Buffer.from(boundaries + audioProvider + helper + (await playlistProviderSource()) + actual).toString('base64')}`
   );

@@ -1,7 +1,13 @@
 import i18next from 'i18next';
 import { setTheme } from 'mdui/functions/setTheme.js';
 
-import { loadI18n, setLanguage, t as i18t } from '@/i18n';
+import {
+  loadI18n,
+  retireLanguageRequests,
+  setLanguage,
+  t as i18t,
+} from '@/i18n';
+
 import 'mdui/mdui.css';
 import 'mdui';
 
@@ -33,6 +39,17 @@ import type { QueueElement } from '@/types/queue';
 import type { SearchBoxElement } from '@/types/search-box-element';
 
 setTheme('dark');
+
+let languageDocumentActive = true;
+const isLanguageDocumentCurrent = () => languageDocumentActive;
+window.addEventListener(
+  'pagehide',
+  () => {
+    languageDocumentActive = false;
+    retireLanguageRequests();
+  },
+  { once: true },
+);
 
 let api: (Element & MusicPlayer) | null = null;
 let repeatPreference: ReturnType<typeof createRepeatPreference> | undefined;
@@ -508,7 +525,12 @@ const definePearTransElements = () => {
 
 const preload = async () => {
   await loadI18n();
-  await setLanguage(window.mainConfig.get('options.language') ?? 'en');
+  if (!isLanguageDocumentCurrent()) return;
+  await setLanguage(
+    window.mainConfig.get('options.language') ?? 'en',
+    isLanguageDocumentCurrent,
+  );
+  if (!isLanguageDocumentCurrent()) return;
   window.i18n = {
     t: i18t.bind(i18next),
   };
@@ -601,4 +623,9 @@ const initObserver = async () => {
   });
 };
 
-initObserver().then(preload).then(main);
+initObserver()
+  .then(preload)
+  .then(() => {
+    if (isLanguageDocumentCurrent()) return main();
+    return undefined;
+  });

@@ -6,7 +6,7 @@ import {
 } from 'electron';
 import is from 'electron-is';
 
-import { loadI18n, setLanguage } from '@/i18n';
+import { loadI18n, retireLanguageRequests, setLanguage } from '@/i18n';
 import { installBlockerSceneGuard } from '@/providers/blocker-scene-preload';
 
 import * as config from './config';
@@ -15,6 +15,17 @@ import {
   forceUnloadPreloadPlugin,
   loadAllPreloadPlugins,
 } from './loader/preload';
+
+let languageDocumentActive = true;
+const isLanguageDocumentCurrent = () => languageDocumentActive;
+window.addEventListener(
+  'pagehide',
+  () => {
+    languageDocumentActive = false;
+    retireLanguageRequests();
+  },
+  { once: true },
+);
 
 // @ts-expect-error dummy
 globalThis.customElements = { define() {} };
@@ -41,7 +52,12 @@ new MutationObserver((mutations, observer) => {
 }).observe(document, { subtree: true, childList: true });
 
 loadI18n().then(async () => {
-  await setLanguage(config.get('options.language') ?? 'en');
+  if (!isLanguageDocumentCurrent()) return;
+  await setLanguage(
+    config.get('options.language') ?? 'en',
+    isLanguageDocumentCurrent,
+  );
+  if (!isLanguageDocumentCurrent()) return;
   await loadAllPreloadPlugins();
 });
 

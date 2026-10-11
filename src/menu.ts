@@ -10,7 +10,7 @@ import {
 } from 'electron';
 import is from 'electron-is';
 import { satisfies } from 'semver';
-import { languageResources } from 'virtual:i18n';
+import { availableLanguages, languageLabels } from 'virtual:i18n';
 import { allPlugins } from 'virtual:plugins';
 
 import { APPLICATION_NAME, setLanguage, t } from '@/i18n';
@@ -31,10 +31,10 @@ const inAppMenuActive = await config.plugins.isEnabled('in-app-menu');
 const pluginEnabledMenu = async (
   plugin: string,
   label = '',
-  description?: string ,
+  description?: string,
   isNew = false,
   hasSubmenu = false,
-  refreshMenu?: (() => void) ,
+  refreshMenu?: () => void,
 ): Promise<Electron.MenuItemConstructorOptions> => ({
   label: label || plugin,
   sublabel: isNew ? t('main.menu.plugins.new') : undefined,
@@ -54,9 +54,34 @@ const pluginEnabledMenu = async (
   },
 });
 
-export const refreshMenu = async (win: BrowserWindow) => {
-  await setApplicationMenu(win);
-  if (inAppMenuActive) {
+let applicationMenuWindow: BrowserWindow | undefined;
+let languageSelection = 0;
+let menuPublication = 0;
+const isMenuWindowAlive = (win: BrowserWindow) =>
+  !win.isDestroyed() && !win.webContents.isDestroyed();
+
+const ownMenuPublication = (win: BrowserWindow, isCurrent: () => boolean) => {
+  const generation = ++menuPublication;
+  return () =>
+    generation === menuPublication &&
+    isCurrent() &&
+    generation === menuPublication &&
+    isMenuWindowAlive(win) &&
+    generation === menuPublication;
+};
+
+export const refreshMenu = async (
+  win: BrowserWindow,
+  isCurrent: () => boolean = () => true,
+) => {
+  const ownsPublication = ownMenuPublication(win, isCurrent);
+  const published = await publishApplicationMenu(win, ownsPublication);
+  if (
+    published &&
+    ownsPublication() &&
+    applicationMenuWindow === win &&
+    inAppMenuActive
+  ) {
     win.webContents.send('refresh-in-app-menu');
   }
 };
@@ -146,9 +171,6 @@ export const mainMenuTemplate = async (
         );
       }),
   );
-
-  const langResources = await languageResources();
-  const availableLanguages = Object.keys(langResources);
 
   return [
     {
@@ -494,14 +516,30 @@ export const mainMenuTemplate = async (
             availableLanguages
               .map(
                 (lang): Electron.MenuItemConstructorOptions => ({
-                  label: `${langResources[lang].translation.language?.name ?? 'Unknown'} (${langResources[lang].translation.language?.['local-name'] ?? 'Unknown'})`,
+                  label: `${languageLabels[lang].name} (${languageLabels[lang].localName})`,
                   type: 'checkbox',
                   checked: (config.get('options.language') ?? 'en') === lang,
-                  click() {
+                  async click() {
+                    if (
+                      !isMenuWindowAlive(win) ||
+                      (applicationMenuWindow && applicationMenuWindow !== win)
+                    )
+                      return;
+                    const selection = ++languageSelection;
+                    const isCurrent = () =>
+                      selection === languageSelection &&
+                      !config.get('options.restartOnConfigChanges') &&
+                      isMenuWindowAlive(win) &&
+                      (!applicationMenuWindow ||
+                        applicationMenuWindow === win) &&
+                      config.get('options.language') === lang;
                     config.setMenuOption('options.language', lang);
-                    refreshMenu(win);
-                    setLanguage(lang);
-                    dialog.showMessageBox(win, {
+                    if (!isCurrent()) return;
+                    await setLanguage(lang, isCurrent);
+                    if (!isCurrent()) return;
+                    await refreshMenu(win, isCurrent);
+                    if (!isCurrent()) return;
+                    await dialog.showMessageBox(win, {
                       title: t(
                         'main.menu.options.submenu.language.dialog.title',
                       ),
@@ -695,7 +733,17 @@ export const mainMenuTemplate = async (
     },
   ];
 };
-export const setApplicationMenu = async (win: Electron.BrowserWindow) => {
+export const setApplicationMenu = (
+  win: Electron.BrowserWindow,
+  isCurrent: () => boolean = () => true,
+) => publishApplicationMenu(win, ownMenuPublication(win, isCurrent));
+
+const publishApplicationMenu = async (
+  win: Electron.BrowserWindow,
+  ownsPublication: () => boolean,
+) => {
+  if (!ownsPublication()) return false;
+  applicationMenuWindow = win;
   const menuTemplate: MenuTemplate = [...(await mainMenuTemplate(win))];
   if (process.platform === 'darwin') {
     const { name } = app;
@@ -720,8 +768,11 @@ export const setApplicationMenu = async (win: Electron.BrowserWindow) => {
     });
   }
 
+  if (!ownsPublication() || applicationMenuWindow !== win) return false;
   const menu = Menu.buildFromTemplate(menuTemplate);
+  if (!ownsPublication() || applicationMenuWindow !== win) return false;
   Menu.setApplicationMenu(menu);
+  return ownsPublication() && applicationMenuWindow === win;
 };
 
 async function setProxy(item: Electron.MenuItem, win: BrowserWindow) {

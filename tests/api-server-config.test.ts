@@ -47,7 +47,7 @@ async function buildActualInitHook(directory: string) {
     initHookStart,
   );
   const initHookSource = indexSource
-    .slice(initHookStart, initHookEnd)
+    .slice(indexSource.indexOf('let configIpcRegistered'), initHookEnd)
     .replace('const initHook = async', 'export const initHook = async');
   const configSource = (
     await readFile(path.join(root, 'src/config/index.ts'), 'utf8')
@@ -151,7 +151,11 @@ test('API server defaults bind locally and use a persistent strong secret', asyn
   const directory = await makeTestDirectory('.pear-api-config-');
   try {
     const source = await buildActualInitHook(directory);
-    await source.initHook({ webContents: { send: () => {} } });
+    await source.initHook({
+      isDestroyed: () => false,
+      once: () => {},
+      webContents: { isDestroyed: () => false, send: () => {} },
+    });
     const reopened = new Conf({ cwd: directory, configName: 'config' });
     const persisted = reopened.get('plugins.api-server') as APIServerConfig;
 
@@ -177,7 +181,11 @@ test('saved API server settings survive default materialization and reopen', asy
     const firstStore = new Conf(options);
     firstStore.set('plugins.api-server', saved);
     const source = await buildActualInitHook(directory);
-    await source.initHook({ webContents: { send: () => {} } });
+    await source.initHook({
+      isDestroyed: () => false,
+      once: () => {},
+      webContents: { isDestroyed: () => false, send: () => {} },
+    });
 
     const reopened = new Conf(options);
     const result = reopened.get('plugins.api-server') as APIServerConfig;
@@ -204,7 +212,11 @@ test('missing secret materialization preserves every saved API setting', async (
     const store = new Conf({ cwd: directory, configName: 'config' });
     store.set('plugins.api-server', saved);
     const source = await buildActualInitHook(directory);
-    await source.initHook({ webContents: { send: () => {} } });
+    await source.initHook({
+      isDestroyed: () => false,
+      once: () => {},
+      webContents: { isDestroyed: () => false, send: () => {} },
+    });
     const reopened = new Conf({ cwd: directory, configName: 'config' });
     const merged = reopened.get('plugins.api-server') as APIServerConfig;
 

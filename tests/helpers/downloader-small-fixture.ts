@@ -236,7 +236,7 @@ export const BG={Challenge:{create:async()=>({program:'owned-program',globalName
           if (id === '\0unused-plugins')
             return 'export const allPlugins=async()=>({});';
           if (id === '\0owned-languages')
-            return `import en from ${JSON.stringify(path.join(root, 'src/i18n/resources/en.json'))};export const languageResources=async()=>({en:{translation:en}});`;
+            return `import en from ${JSON.stringify(path.join(root, 'src/i18n/resources/en.json'))};export const availableLanguages=["en"];export const loadLanguageResource=async(name)=>name==="en"?en:undefined;export const languageResources=async()=>({en:{translation:en}});`;
         },
         transform(code: string, id: string) {
           if (policy.isSongInfo(id))

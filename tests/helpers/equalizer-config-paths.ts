@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { Project, ts } from 'ts-morph';
 import { isDeepStrictEqual } from 'node:util';
 import { stripTypeScriptTypes } from 'node:module';
 import { deepmerge, deepmergeCustom } from 'deepmerge-ts';
@@ -18,14 +19,21 @@ async function statements(file: string, name: string) {
     found = source.match(/export const setPartial = \([\s\S]*?\n\};/)?.[0];
   else if (name === 'createContext')
     found = source.match(/const createContext = \([\s\S]*?\n\}\);/)?.[0];
-  else if (name === 'ipc') {
-    const start = source.indexOf("  ipcMain.handle(\n    'peard:get-config'");
-    const end = source.indexOf('  config.watch(', start);
-    if (start >= 0 && end > start) found = source.slice(start, end);
-  } else if (name === 'watch') {
-    const start = source.indexOf('  config.watch(');
-    const end = source.indexOf('\n};', start);
-    if (start >= 0 && end > start) found = source.slice(start, end);
+  else if (name === 'ipc' || name === 'watch') {
+    const syntax = new Project({
+      useInMemoryFileSystem: true,
+    }).createSourceFile(file, source);
+    const calls = syntax.getDescendantsOfKind(ts.SyntaxKind.CallExpression);
+    const wanted = calls.filter((call) =>
+      name === 'watch'
+        ? call.getExpression().getText() === 'config.watch'
+        : call.getExpression().getText() === 'ipcMain.handle' &&
+          ['peard:get-config', 'peard:set-config'].includes(
+            call.getArguments()[0]?.getText().slice(1, -1),
+          ),
+    );
+    if (wanted.length === (name === 'watch' ? 1 : 2))
+      found = wanted.map((call) => call.getText() + ';').join('\n');
   }
   if (!found) throw new Error(`Actual ${file} ${name} statement not found`);
   return [found];
@@ -68,7 +76,9 @@ export async function configPaths() {
     },
   };
   const win = {
+    isDestroyed: () => false,
     webContents: {
+      isDestroyed: () => false,
       send: (...args: unknown[]) => {
         if (args[0] === 'config-changed') reads.push(args[2]);
       },
@@ -95,7 +105,7 @@ export async function configPaths() {
     'forceUnloadMainPlugin',
     'showNeedToRestartDialog',
     'getAllLoadedMainPlugins',
-    compile([...ipc, ...watch].join(';\n')),
+    compile(['const configWindow=win;', ...ipc, ...watch].join(';\n')),
   )(
     config,
     ipcMain,

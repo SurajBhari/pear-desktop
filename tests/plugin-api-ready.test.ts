@@ -63,7 +63,10 @@ async function fixture(plugins: Record<string, any>) {
   );
   const actual = stripTypeScriptTypes(raw)
     .replace(/^import[\s\S]*?;\n/gm, '')
-    .replace('initObserver().then(preload).then(main);', 'export { main };');
+    .replace(
+      /initObserver\(\)\s*\.then\(preload\)[\s\S]*?;\s*$/,
+      'export { main };',
+    );
   const repeatProvider = stripTypeScriptTypes(
     await readFile(
       new URL('../src/providers/repeat-preference.ts', import.meta.url),
@@ -78,7 +81,7 @@ const {window}=fixture; const document=fixture.dom.document;
 const {Element,CustomEvent}=fixture.dom;
 const initializeAudioGraph=fixture.initializeAudioGraph;
 const setTheme=()=>{}; const registerWindowDefaultTrustedTypePolicy=()=>{};
-const i18t=(key,options)=>({key,options}); const LoggerPrefix='[YTMusic]';
+const retireLanguageRequests=()=>{};const i18t=(key,options)=>({key,options}); const LoggerPrefix='[YTMusic]';
 const console={error:(...args)=>fixture.errors.push(args),trace:err=>fixture.traces.push(err)};
 const startingPages={}; const setInterval=()=>0;
 const createContext=id=>{if(!fixture.contexts.has(id))fixture.contexts.set(id,{id});return fixture.contexts.get(id)};
