@@ -884,9 +884,15 @@
         },
         "priority": "Notification Priority",
         "toast-style": "Toast style",
-        "unpause-notification": "Show notification on unpause"
+        "unpause-notification": "Show notification on unpause",
+        "notify-on-like-change": "Notify when rating changes"
       },
-      "name": "Notifications"
+      "name": "Notifications",
+      "rating": {
+        "liked": "Liked",
+        "disliked": "Disliked",
+        "removed": "Removed rating"
+      }
     },
     "performance-improvement": {
       "description": "Improve performance by enabling experimental scripts",

@@ -99,6 +99,12 @@ export const onMenu = async ({
   return [
     ...getMenu(),
     {
+      label: t('plugins.notifications.menu.notify-on-like-change'),
+      type: 'checkbox',
+      checked: config.notifyOnLikeChange,
+      click: (item) => setConfig({ notifyOnLikeChange: item.checked }),
+    },
+    {
       label: t('plugins.notifications.menu.unpause-notification'),
       type: 'checkbox',
       checked: config.unpauseNotification,

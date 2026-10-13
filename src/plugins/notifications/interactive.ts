@@ -2,19 +2,24 @@ import nextIcon from '@assets/media-icons-black/next.png?asset&asarUnpack';
 import pauseIcon from '@assets/media-icons-black/pause.png?asset&asarUnpack';
 import playIcon from '@assets/media-icons-black/play.png?asset&asarUnpack';
 import previousIcon from '@assets/media-icons-black/previous.png?asset&asarUnpack';
-import { app, type BrowserWindow, Notification } from 'electron';
+import {
+  app,
+  ipcMain,
+  type BrowserWindow,
+  Notification,
+  type IpcMainEvent,
+} from 'electron';
 
 import {
   APP_PROTOCOL,
-  changeProtocolHandler,
+  registerOwnedProtocolHandler,
 } from '@/providers/protocol-handler';
 import { getSongControls } from '@/providers/song-controls';
+import { type SongInfo, type SongInfoEvent } from '@/providers/song-info';
 import {
-  registerCallback,
-  type SongInfo,
-  SongInfoEvent,
-} from '@/providers/song-info';
-import { setTrayOnClick, setTrayOnDoubleClick } from '@/tray';
+  registerOwnedTrayOnClick,
+  registerOwnedTrayOnDoubleClick,
+} from '@/tray';
 import { mediaIcons } from '@/types/media-icons';
 
 import { notificationImage, secondsToMinutes, ToastStyles } from './utils';
@@ -22,50 +27,92 @@ import { notificationImage, secondsToMinutes, ToastStyles } from './utils';
 import type { NotificationsPluginConfig } from './index';
 import type { BackendContext } from '@/types/contexts';
 
-let songControls: ReturnType<typeof getSongControls>;
-let savedNotification: Notification | undefined;
-
 type Accessor<T> = () => T;
 
 export default (
   win: BrowserWindow,
   config: Accessor<NotificationsPluginConfig>,
-  { ipc: { on, send } }: BackendContext<NotificationsPluginConfig>,
+  { ipc: { send } }: BackendContext<NotificationsPluginConfig>,
+  owner: { isCurrent(): boolean },
 ) => {
-  const sendNotification = (songInfo: SongInfo) => {
-    const iconSrc = notificationImage(songInfo, config());
-
-    savedNotification?.close();
-
-    let icon: string;
-    if (typeof iconSrc === 'object') {
-      icon = iconSrc.toDataURL();
-    } else {
-      icon = iconSrc;
+  const closeListeners = new Map<Notification, () => void>();
+  let live = true,
+    savedNotification: Notification | undefined,
+    savedSongInfo: SongInfo | undefined,
+    timer: ReturnType<typeof setTimeout> | undefined;
+  const releases: Array<() => void> = [];
+  const current = () => live && owner.isCurrent() && live;
+  const close = () => {
+    clearTimeout(timer);
+    timer = undefined;
+    const previous = savedNotification;
+    savedNotification = undefined;
+    if (previous) {
+      const listener = closeListeners.get(previous);
+      if (listener) previous.removeListener('close', listener);
+      closeListeners.delete(previous);
+      previous.close();
     }
-
-    savedNotification = new Notification({
+  };
+  const sendNotification = (songInfo: SongInfo) => {
+    if (!current()) return;
+    const iconSrc = notificationImage(songInfo, config());
+    if (!current()) return;
+    const icon = typeof iconSrc === 'object' ? iconSrc.toDataURL() : iconSrc;
+    if (!current()) return;
+    const xml = getXml(songInfo, icon);
+    if (!current()) return;
+    close();
+    if (!current()) return;
+    const candidate = new Notification({
       title: songInfo.title || 'Playing',
       body: songInfo.artist,
       icon: iconSrc,
       silent: true,
-      // https://learn.microsoft.com/en-us/uwp/schemas/tiles/toastschema/schema-root
-      // https://learn.microsoft.com/en-us/windows/apps/design/shell/tiles-and-notifications/toast-schema
-      // https://learn.microsoft.com/en-us/windows/apps/design/shell/tiles-and-notifications/adaptive-interactive-toasts?tabs=xml
-      // https://learn.microsoft.com/en-us/uwp/api/windows.ui.notifications.toasttemplatetype
-      toastXml: getXml(songInfo, icon),
+      toastXml: xml,
     });
-
-    // To fix the notification not closing
-    setTimeout(() => savedNotification?.close(), 5000);
-
-    savedNotification.on('close', () => {
-      savedNotification = undefined;
-    });
-
-    savedNotification.show();
+    if (!current()) {
+      candidate.close();
+      return;
+    }
+    savedNotification = candidate;
+    const onClose = () => {
+      closeListeners.delete(candidate);
+      candidate.removeListener('close', onClose);
+      if (savedNotification === candidate) {
+        savedNotification = undefined;
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+    closeListeners.set(candidate, onClose);
+    const on = candidate.on.bind(candidate) as (
+      event: 'close',
+      listener: () => void,
+    ) => Notification;
+    if (!current()) {
+      closeListeners.delete(candidate);
+      candidate.close();
+      return;
+    }
+    on('close', onClose);
+    if (!current()) {
+      candidate.removeListener('close', onClose);
+      candidate.close();
+      return;
+    }
+    timer = setTimeout(() => {
+      timer = undefined;
+      if (current() && savedNotification === candidate) close();
+    }, 5000);
+    const show = candidate.show.bind(candidate);
+    if (!current()) {
+      close();
+      return;
+    }
+    show();
+    if (!current() && savedNotification === candidate) close();
   };
-
   const getXml = (songInfo: SongInfo, iconSrc: string) => {
     switch (config().toastStyle) {
       default:
@@ -259,77 +306,69 @@ export default (
     return 'Subtitle';
   };
 
-  songControls = getSongControls(win);
-
-  let currentSeconds = 0;
-  on('peard:player-api-loaded', () =>
-    send('peard:setup-time-changed-listener'),
-  );
-
-  let savedSongInfo: SongInfo;
-  let lastUrl: string | undefined;
-
-  // Register songInfoCallback
-  registerCallback((songInfo, event) => {
-    if (event === SongInfoEvent.TimeChanged) {
-      currentSeconds = songInfo.elapsedSeconds ?? 0;
-    }
-    if (!songInfo.artist && !songInfo.title) {
-      return;
-    }
-
-    savedSongInfo = { ...songInfo };
-    if (
-      !songInfo.isPaused &&
-      (songInfo.url !== lastUrl || config().unpauseNotification)
-    ) {
-      lastUrl = songInfo.url;
-      sendNotification(songInfo);
-    }
-  });
-
-  if (config().trayControls) {
-    setTrayOnClick(() => {
-      if (savedNotification) {
-        savedNotification.close();
-        savedNotification = undefined;
-      } else if (savedSongInfo) {
-        sendNotification({
-          ...savedSongInfo,
-          elapsedSeconds: currentSeconds,
-        });
-      }
-    });
-
-    setTrayOnDoubleClick(() => {
-      if (win.isVisible()) {
-        win.hide();
-      } else {
-        win.show();
-      }
-    });
-  }
-
-  app.once('before-quit', () => {
-    savedNotification?.close();
-  });
-
-  changeProtocolHandler((cmd, ...args) => {
-    if (Object.keys(songControls).includes(cmd)) {
-      // @ts-expect-error: cmd is a key of songControls
-      songControls[cmd as keyof typeof songControls](...args);
+  const songControls = getSongControls(win);
+  const loaded = (event: IpcMainEvent) => {
+    if (!current()) return;
+    try {
+      const contents = win.webContents,
+        frame = contents.mainFrame;
       if (
-        config().refreshOnPlayPause &&
-        (cmd === 'pause' || (cmd === 'play' && !config().unpauseNotification))
-      ) {
-        setImmediate(() =>
-          sendNotification({
-            ...savedSongInfo,
-            isPaused: cmd === 'pause',
-            elapsedSeconds: currentSeconds,
-          }),
-        );
-      }
-    }
-  });
+        event.sender !== contents ||
+        event.senderFrame !== frame ||
+        !current() ||
+        win.webContents !== contents ||
+        contents.mainFrame !== frame
+      )
+        return;
+      send('peard:setup-time-changed-listener');
+    } catch {}
+  };
+  ipcMain.on('peard:player-api-loaded', loaded);
+  releases.push(() =>
+    ipcMain.removeListener('peard:player-api-loaded', loaded),
+  );
+  if (config().trayControls) {
+    releases.push(
+      registerOwnedTrayOnClick({ isCurrent: current }, () => {
+        if (!current()) return;
+        if (savedNotification) close();
+        else if (savedSongInfo) sendNotification(savedSongInfo);
+      }),
+    );
+    releases.push(
+      registerOwnedTrayOnDoubleClick({ isCurrent: current }, () => {
+        if (!current()) return;
+        const visible = win.isVisible();
+        if (!current()) return;
+        if (visible) win.hide();
+        else win.show();
+      }),
+    );
+  }
+  const beforeQuit = () => {
+    if (current()) close();
+  };
+  app.on('before-quit', beforeQuit);
+  releases.push(() => app.removeListener('before-quit', beforeQuit));
+  releases.push(
+    registerOwnedProtocolHandler({ isCurrent: current }, (cmd, ...args) => {
+      if (!current() || !Object.keys(songControls).includes(cmd)) return;
+      // @ts-expect-error: cmd is a runtime-validated key of songControls
+      songControls[cmd as keyof typeof songControls](...args);
+      // Notification refresh follows observed PlayOrPaused, never a guessed command result.
+    }),
+  );
+  return {
+    show: sendNotification,
+    observe(info: SongInfo, _event: SongInfoEvent) {
+      if (current()) savedSongInfo = { ...info };
+    },
+    dispose() {
+      if (!live) return;
+      live = false;
+      for (const release of releases.splice(0)) release();
+      close();
+      savedSongInfo = undefined;
+    },
+  };
 };
