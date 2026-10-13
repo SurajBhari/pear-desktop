@@ -639,11 +639,29 @@ test('native link popups cannot inherit desktop privileges, owned session denies
         'https://www.last.fm',
         {},
       );
+      const cancellation = f.watchCancelledDownload(ownedSession);
       await auth.webContents.executeJavaScript(
         "location.href='https://www.last.fm/download';void 0",
       );
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Native cancellation and file removal run on different Chromium tasks.
+      // Observe the real guard before waiting for all owned files to disappear.
+      for (let i = 0; i < 100 && !cancellation.read(); i++)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      const downloadCancellation = cancellation.read() ?? {
+        guardCount: 0,
+        prevented: false,
+        cancelledOrRemoved: false,
+      };
+      if (
+        downloadCancellation.guardCount === 1 &&
+        downloadCancellation.prevented &&
+        downloadCancellation.cancelledOrRemoved
+      ) {
+        for (let i = 0; i < 100 && f.downloadFiles().length; i++)
+          await new Promise((resolve) => setTimeout(resolve, 10));
+      }
       const downloads = f.downloadFiles();
+      cancellation.dispose();
       surface.close();
       await surface.closed;
       return {
@@ -655,6 +673,7 @@ test('native link popups cannot inherit desktop privileges, owned session denies
         permission,
         permissionCheck,
         downloads,
+        downloadCancellation,
         permissionsRemoved:
           f.permissions.get(ownedSession) === null &&
           f.permissionChecks.get(ownedSession) === null,
@@ -669,6 +688,11 @@ test('native link popups cannot inherit desktop privileges, owned session denies
       permission: false,
       permissionCheck: false,
       downloads: [],
+      downloadCancellation: {
+        guardCount: 1,
+        prevented: true,
+        cancelledOrRemoved: true,
+      },
       permissionsRemoved: true,
     });
   } finally {
