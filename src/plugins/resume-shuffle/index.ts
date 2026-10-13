@@ -1,6 +1,8 @@
 import { t } from '@/i18n';
 import { createPlugin } from '@/utils';
 
+import { createShuffleActionOwner } from '../../utils/shuffle-action-owner';
+
 import type { RendererContext } from '@/types/contexts';
 import type { MusicPlayer } from '@/types/music-player';
 import type { VideoDataChanged } from '@/types/video-data-changed';
@@ -84,6 +86,7 @@ export default createPlugin<
       if (!bar) return;
       let alive = true;
       let pending = false;
+      let restoreOwner: ReturnType<typeof createShuffleActionOwner> | undefined;
       let preserveSavedChoice = false;
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let discovery: MutationObserver | undefined;
@@ -124,6 +127,9 @@ export default createPlugin<
       };
       const finishRestore = () => {
         pending = false;
+        const lease = restoreOwner;
+        restoreOwner = undefined;
+        lease?.release();
         if (timeout !== undefined) clearTimeout(timeout);
         timeout = undefined;
         discovery?.disconnect();
@@ -169,6 +175,7 @@ export default createPlugin<
       }
       preserveSavedChoice = true;
       pending = true;
+      restoreOwner = createShuffleActionOwner(document, 'restore');
       timeout = setTimeout(finishRestore, RESTORE_TIMEOUT_MS);
       const initialId = videoId(api);
       // Never erase a saved shuffled queue because its native player is not ready.
@@ -228,10 +235,25 @@ export default createPlugin<
                   ? items[index]
                   : undefined;
             if (selectedVideo(current)?.videoId !== initialId) return;
+            if (
+              !bar.hasAttribute('shuffle-on') &&
+              (!owned() || !restoreOwner?.canBegin(Date.now()))
+            )
+              return;
+            const actionOwner = restoreOwner;
+            restoreOwner = undefined;
             preserveSavedChoice = false;
-            finishRestore();
-            if (owned() && !bar.hasAttribute('shuffle-on'))
-              actionQueue.shuffle?.();
+            try {
+              finishRestore();
+              if (
+                owned() &&
+                !bar.hasAttribute('shuffle-on') &&
+                actionOwner?.begin(Date.now())
+              )
+                actionQueue.shuffle?.();
+            } finally {
+              actionOwner?.release();
+            }
           } catch {
             finishRestore();
           }

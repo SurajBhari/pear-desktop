@@ -998,6 +998,14 @@
         }
       }
     },
+    "force-shuffle": {
+      "name": "Force Shuffle",
+      "description": "Keep native shuffle enabled on track changes, always or while preserving your choice",
+      "menu": {
+        "always": "Always enable shuffle on new tracks",
+        "preserve": "Preserve my shuffle choice"
+      }
+    },
     "fullscreen-auto-hide": {
       "name": "Fullscreen auto-hide",
       "description": "Hide idle fullscreen controls; show them on activity, focus or pause."
