@@ -9,6 +9,7 @@ import {
 } from '@/plugins/api-server/music-types';
 
 import { normalizeMusicSource } from './music-catalog';
+import { createMusicQueueOwner } from './music-queue';
 import {
   nativeElapsedMilliseconds,
   nativePlaybackIdentity,
@@ -70,6 +71,8 @@ const browseId = (value: unknown) =>
 export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
   if (!isRecord(value)) return null;
   const keys = Object.keys(value);
+  if (value.operation === 'queue' && keys.length === 1)
+    return { operation: 'queue' };
   if (value.operation === 'current' && keys.length === 1)
     return { operation: 'current' };
   if (
@@ -135,6 +138,7 @@ export function createMusicRendererController(
     owner: Owner | undefined,
     disposed = false;
   const releases: (() => void)[] = [];
+  let queueOwner: ReturnType<typeof createMusicQueueOwner> | undefined;
   const send = (packet: object) => {
     try {
       ipc.send('peard:music-reply', packet);
@@ -269,7 +273,12 @@ export function createMusicRendererController(
       const input = job.input!;
       if (input.operation === 'current')
         settled(job, { ok: true, value: snapshot(job) });
-      else {
+      else if (input.operation === 'queue') {
+        queueOwner ??= createMusicQueueOwner(apiOwner, getApi, document);
+        const value = queueOwner.snapshot();
+        if (!valid(job)) throw new MusicServiceError('retired');
+        settled(job, { ok: true, value });
+      } else {
         let endpoint: 'search' | 'browse', data: Record<string, string>;
         if (input.operation === 'search') {
           endpoint = 'search';
@@ -437,6 +446,7 @@ export function createMusicRendererController(
     if (disposed) return;
     invalidate();
     disposed = true;
+    queueOwner?.dispose();
     for (const release of releases.splice(0)) release();
     window.removeEventListener('pagehide', dispose);
     clearInterval(timer);

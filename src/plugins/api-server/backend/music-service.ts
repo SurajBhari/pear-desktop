@@ -9,6 +9,8 @@ import {
 
 import {
   parseMusicInput,
+  parseMusicQueueInput,
+  parseNativeQueue,
   parseNativeCatalog,
   parseNativeSnapshot,
   type MusicTarget,
@@ -25,6 +27,8 @@ import {
   type MusicItem,
   type MusicShelf,
   type NormalizedMusicSource,
+  type NativeQueueSnapshot,
+  type QueuePage,
 } from '../music-types';
 
 import type { APIServerConfig } from '../config';
@@ -50,21 +54,32 @@ export interface MusicPage {
   kind?: string;
   target?: MusicTarget;
 }
-interface Cursor {
+interface CursorBase {
   id: string;
   principal: MusicGrantRecord;
   scope: MusicScope;
   revision: number;
-  context: PageContext;
-  source: NormalizedMusicSource;
   owner: SourceOwner;
   offset: number;
   limit: number;
   expires: number;
   busy: boolean;
-  replay?: MusicPage;
   bytes: number;
 }
+type Cursor = CursorBase &
+  (
+    | {
+        kind: 'catalog';
+        context: PageContext;
+        source: NormalizedMusicSource;
+        replay?: MusicPage;
+      }
+    | {
+        kind: 'queue';
+        source: NativeQueueSnapshot;
+        replay?: QueuePage;
+      }
+  );
 interface TargetReference {
   id: string;
   principal: MusicGrantRecord;
@@ -372,6 +387,132 @@ export class MusicService {
       },
     );
   }
+  async queue(
+    token: unknown,
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<QueuePage> {
+    const input = parseMusicQueueInput(value);
+    return this.admitted(
+      token,
+      'playback.read',
+      [],
+      signal,
+      true,
+      async (lease) => {
+        if (!input.cursor) {
+          const captured = await this.native(lease, { operation: 'queue' });
+          return this.queuePage(
+            lease,
+            parseNativeQueue(captured.value),
+            captured.owner,
+            0,
+            input.limit,
+          );
+        }
+        const cursor = this.cursors.get(input.cursor);
+        if (
+          !cursor ||
+          cursor.kind !== 'queue' ||
+          cursor.principal.id !== lease.principal.id ||
+          cursor.principal.digest !== lease.principal.digest ||
+          cursor.expires <= this.now()
+        )
+          return failMusic('not_found');
+        if (
+          cursor.revision !== this.revision ||
+          !cursor.owner.current() ||
+          !this.grants.isCurrent(cursor.principal, cursor.scope)
+        )
+          return failMusic('retired');
+        if (input.limit !== cursor.limit) return failMusic('invalid');
+        if (cursor.busy) return failMusic('busy');
+        cursor.busy = true;
+        try {
+          const captured = await this.native(lease, { operation: 'queue' });
+          const fresh = parseNativeQueue(captured.value);
+          if (
+            fresh.queueRevision !== cursor.source.queueRevision ||
+            captured.owner.epoch !== cursor.owner.epoch ||
+            !cursor.owner.current() ||
+            JSON.stringify(fresh) !== JSON.stringify(cursor.source)
+          )
+            return failMusic('retired');
+          if (cursor.replay) return structuredClone(cursor.replay);
+          const page = this.queuePage(
+            lease,
+            cursor.source,
+            captured.owner,
+            cursor.offset,
+            cursor.limit,
+          );
+          const bytes = utf8Bytes(JSON.stringify(page)) + 32;
+          if (this.bytes() + bytes > MUSIC_LIMITS.cacheBytes) {
+            if (page.nextCursor) this.cursors.delete(page.nextCursor);
+            return failMusic('budget');
+          }
+          cursor.bytes += bytes;
+          cursor.replay = structuredClone(page);
+          return page;
+        } finally {
+          cursor.busy = false;
+        }
+      },
+    );
+  }
+  private queuePage(
+    lease: Lease,
+    source: NativeQueueSnapshot,
+    owner: SourceOwner,
+    offset: number,
+    limit: number,
+  ): QueuePage {
+    if (!lease.current() || !owner.current()) return failMusic('retired');
+    const items = source.items
+      .slice(offset, offset + limit)
+      .map((item, index) => ({
+        index: offset + index,
+        selected: offset + index === source.selectedIndex,
+        item,
+      }));
+    const result: QueuePage = {
+      version: 1,
+      queueRevision: source.queueRevision,
+      total: source.items.length,
+      selectedIndex: source.selectedIndex,
+      items,
+      nextCursor: null,
+    };
+    for (;;) {
+      result.nextCursor =
+        offset + items.length < source.items.length ? opaque('mcur') : null;
+      if (utf8Bytes(JSON.stringify(result)) <= MUSIC_LIMITS.pageBytes) break;
+      if (!items.length) return failMusic('budget');
+      items.pop();
+    }
+    if (!items.length && offset < source.items.length)
+      return failMusic('budget');
+    if (result.nextCursor) {
+      const cursor: Cursor = {
+        kind: 'queue',
+        id: result.nextCursor,
+        principal: lease.principal,
+        scope: lease.scope,
+        revision: lease.revision,
+        source,
+        owner,
+        offset: offset + items.length,
+        limit,
+        expires: this.now() + MUSIC_LIMITS.cursorMs,
+        busy: false,
+        bytes: 0,
+      };
+      cursor.bytes = utf8Bytes(JSON.stringify(cursor)) + 64;
+      this.allocate(cursor);
+      this.scheduleCacheCleanup();
+    }
+    return structuredClone(result);
+  }
   search(token: unknown, value: unknown, signal?: AbortSignal) {
     return this.catalog(token, parseMusicInput(value, 'search'), signal);
   }
@@ -597,6 +738,7 @@ export class MusicService {
       return failMusic('budget');
     if (result.nextCursor) {
       const cursor: Cursor = {
+        kind: 'catalog',
         id: result.nextCursor,
         principal: lease.principal,
         scope: lease.scope,
@@ -632,6 +774,7 @@ export class MusicService {
     const cursor = this.cursors.get(id);
     if (
       !cursor ||
+      cursor.kind !== 'catalog' ||
       cursor.principal.id !== lease.principal.id ||
       cursor.principal.digest !== lease.principal.digest ||
       cursor.context.route !== route ||

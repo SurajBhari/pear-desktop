@@ -202,3 +202,48 @@ export function parseNativeSnapshot(value: unknown) {
     return failMusic('source');
   return parsed.data;
 }
+
+const queueInputSchema = z
+  .object({
+    limit,
+    cursor: z
+      .string()
+      .regex(/^mcur_[A-Za-z0-9_-]{43}$/)
+      .optional(),
+  })
+  .strict();
+export function parseMusicQueueInput(value: unknown) {
+  const parsed = queueInputSchema.safeParse(value);
+  if (!parsed.success) return failMusic('invalid');
+  return parsed.data;
+}
+export function parseMusicQueueQuery(query: URLSearchParams) {
+  const value: Record<string, unknown> = {};
+  for (const [key, field] of query) {
+    if (!['limit', 'cursor'].includes(key) || Object.hasOwn(value, key))
+      return failMusic('invalid');
+    if (key === 'limit') {
+      if (!/^[1-9][0-9]{0,2}$/.test(field)) return failMusic('invalid');
+      value.limit = Number(field);
+    } else value.cursor = field;
+  }
+  return parseMusicQueueInput(value);
+}
+const queueSchema = z
+  .object({
+    version: z.literal(1),
+    queueRevision: z.string().regex(/^[0-9a-f]{32}$/),
+    selectedIndex: z.number().int().nonnegative().nullable(),
+    items: z.array(itemSchema).max(MUSIC_LIMITS.sourceItems),
+  })
+  .strict()
+  .refine((v) => v.selectedIndex === null || v.selectedIndex < v.items.length);
+export function parseNativeQueue(value: unknown) {
+  const parsed = queueSchema.safeParse(value);
+  if (
+    !parsed.success ||
+    utf8Bytes(JSON.stringify(parsed.data)) > MUSIC_LIMITS.nativeBytes
+  )
+    return failMusic('source');
+  return parsed.data;
+}

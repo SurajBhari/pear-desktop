@@ -382,3 +382,13 @@ test('idle cached payloads are deleted by absolute grant expiry without another 
     await f.close();
   }
 });
+
+
+test('queue client schema rejects malformed input before native dispatch', async () => {
+  const f = await musicServiceFixture();
+  try {
+    for (const input of [{ limit: 0 }, { limit: 101 }, { limit: '1' }, { limit: 1, token: 'raw' }, { cursor: 'raw', limit: 1 }])
+      await expect(f.service.queue(f.grant.token, input)).rejects.toMatchObject({ code: 'invalid' });
+    expect(f.calls).toHaveLength(0);
+  } finally { await f.close(); }
+});
