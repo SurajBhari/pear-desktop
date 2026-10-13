@@ -26,6 +26,12 @@ const ACL_FIXTURE = String.raw`
 $ErrorActionPreference='Stop';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 try {
  $r=[Console]::ReadLine()|ConvertFrom-Json;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+ if($r.operation -eq 'alias') {
+  Add-Type -TypeDefinition 'using System;using System.Text;using System.Runtime.InteropServices;public static class FixturePathAlias{[DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]public static extern uint GetShortPathNameW(string input,StringBuilder output,uint size);}'
+  $short=[Text.StringBuilder]::new(4096);$n=[FixturePathAlias]::GetShortPathNameW($r.path,$short,4096)
+  if($n -eq 0 -or $n -ge 4096){throw 'fixture alias unavailable'}
+  [Console]::WriteLine((@{longPath=[IO.Path]::GetFullPath($r.path);shortPath=$short.ToString()}|ConvertTo-Json -Compress));exit 0
+ }
  if($r.operation -eq 'parent') {
   $acl=[Security.AccessControl.DirectorySecurity]::new();$acl.SetOwner($sid);$acl.SetAccessRuleProtection($true,$false)
   foreach($who in @($sid,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'),[Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))){$acl.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new($who,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow))}
@@ -86,7 +92,11 @@ async function nativeTestBridge(folder: string) {
   });
 }
 
-async function windowsProtocol(mode = 'normal', timeoutMs = 8000) {
+async function windowsProtocol(
+  mode = 'normal',
+  timeoutMs = 8000,
+  delayKillMs = 0,
+) {
   const m = await musicModuleSource(
     'src/plugins/api-server/backend/windows-private-path.ts',
   );
@@ -101,20 +111,24 @@ async function windowsProtocol(mode = 'normal', timeoutMs = 8000) {
     const mode=process.argv[2],calls=process.argv[3],seen=[];let content='{"version":1,"records":[]}';
     const binding=()=> 'a'.repeat(48)+':'+crypto.createHash('sha256').update(content).digest('hex');
     const reply=data=>process.stdout.write(JSON.stringify({version:1,...data})+'\\n');
-    readline.createInterface({input:process.stdin}).on('line',line=>{
+    const input=readline.createInterface({input:process.stdin});let terminal;input.on('close',()=>{if(terminal)terminal()});input.on('line',line=>{
       const data=JSON.parse(line);seen.push(data.operation??data.action);fs.writeFileSync(calls,JSON.stringify(seen));
+      if(mode==='held-failure'){reply({type:'failure'});setInterval(()=>{},1000);return;}
       if(mode==='hang')return;
       if(mode==='oversize'){process.stdout.write('x'.repeat(1024*1024+1));return;}
       if(mode==='early-exit'){process.exit(0);return;}
       if(mode==='detail'){reply({type:'failure',detail:'PRIVATE_DETAIL'});return;}
-      if(data.operation==='read'){reply({type:'read',contents64:mode==='bad-base64'?'%%%%':Buffer.from(content).toString('base64'),binding:mode==='wrong-binding'?'a'.repeat(48)+':'+ '0'.repeat(64):binding()});process.exit(0);}
+      if(mode==='require-eof'&&data.operation==='read'){terminal=()=>{reply({type:'read',contents64:Buffer.from(content).toString('base64'),binding:binding()});process.exit(0)};return;}
+    if(mode==='require-eof'&&data.action==='commit'){terminal=()=>{reply({type:'committed',binding:binding(),challenge:data.challenge});process.exit(0)};return;}
+    if(data.operation==='read'){reply({type:'read',contents64:mode==='bad-base64'?'%%%%':Buffer.from(content).toString('base64'),binding:mode==='wrong-binding'?'a'.repeat(48)+':'+ '0'.repeat(64):binding()});process.exit(0);}
       if(data.operation==='prepare'){content=Buffer.from(data.contents64,'base64').toString('utf8');reply({type:'ready'});if(mode==='premature')reply({type:'committed',binding:binding()});}
       if(data.action==='commit'){reply({type:'committed',binding:binding(),challenge:mode==='wrong-challenge'?'00000000-0000-0000-0000-000000000000':data.challenge});process.exit(0);}
       if(data.action==='abort')process.exit(0);
     });
   `,
   );
-  let launches = 0;
+  let launches = 0,
+    physicallyClosed = false;
   const commands: { file: string; args: string[] }[] = [];
   const bridge = m.createWindowsPrivatePath({
     systemRoot: 'C:\\Windows',
@@ -122,13 +136,25 @@ async function windowsProtocol(mode = 'normal', timeoutMs = 8000) {
     launch(_file: string, _args: string[], options: any) {
       launches++;
       commands.push({ file: _file, args: [..._args] });
-      return spawn(process.execPath, [entry, mode, calls], options);
+      const child = spawn(process.execPath, [entry, mode, calls], options);
+      child.once('close', () => {
+        physicallyClosed = true;
+      });
+      if (delayKillMs) {
+        const kill = child.kill.bind(child);
+        child.kill = (signal) => {
+          setTimeout(() => kill(signal), delayKillMs);
+          return true;
+        };
+      }
+      return child;
     },
   });
   return {
     bridge,
     calls,
     launches: () => launches,
+    physicallyClosed: () => physicallyClosed,
     commands,
     close: () => rm(folder, { recursive: true, force: true }),
   };
@@ -787,5 +813,249 @@ test('Windows native command is fixed while literal path data never becomes exec
     expect(f.launches()).toBe(before);
   } finally {
     await f.close();
+  }
+});
+
+for (const operation of ['read', 'stage'] as const)
+  test(`Windows adapter rejects mixed forward-slash paths before ${operation} worker launch`, async () => {
+    const f = await windowsProtocol();
+    const contents = '{"version":1,"records":[]}';
+    try {
+      const before = f.launches();
+      const rejected: boolean[] = [];
+      for (const value of [
+        'C:\\private/../escape',
+        'C:\\private/./grants',
+        'C:\\private//grants',
+        'C:\\private/CON/grants',
+        'C:\\private/grants',
+      ]) {
+        try {
+          if (operation === 'read') await f.bridge.read(value);
+          else {
+            const lease = await f.bridge.stage(
+              value,
+              contents,
+              testBinding(contents),
+            );
+            await lease.close();
+          }
+          rejected.push(false);
+        } catch (error) {
+          rejected.push((error as { code?: string }).code === 'unavailable');
+        }
+      }
+      expect(f.launches()).toBe(before);
+      expect(rejected).toEqual([true, true, true, true, true]);
+    } finally {
+      await f.close();
+    }
+  });
+
+test('Windows terminal read and commit requests send EOF while prepare remains open', async () => {
+  const f = await windowsProtocol('require-eof', 1000);
+  try {
+    const read = await f.bridge.read('C:\\Owned\\grants');
+    expect(read.contents).toBe('{"version":1,"records":[]}');
+    const lease = await f.bridge.stage(
+      'C:\\Owned\\grants',
+      read.contents!,
+      read.binding,
+    );
+    expect(JSON.parse(await readFile(f.calls, 'utf8'))).toEqual(['prepare']);
+    expect(await lease.commit()).toBe(read.binding);
+    await lease.close();
+    expect(JSON.parse(await readFile(f.calls, 'utf8'))).toEqual([
+      'prepare',
+      'commit',
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+test('Windows actual short and long aliases share owned ledger identity across reload and revoke', async () => {
+  test.skip(
+    process.platform !== 'win32',
+    'Mandatory native alias ownership proof runs on Windows',
+  );
+  test.setTimeout(60000);
+  const m = await musicModuleSource(
+    'src/plugins/api-server/backend/music-grant-store.ts',
+  );
+  const folder = await privateTestFolder(),
+    native = await nativeTestBridge(folder),
+    dir = path.join(folder, 'owned');
+  try {
+    const grant = await new m.MusicGrantStore(dir, Date.now, native).issue(
+      'Alias fixture',
+      'rest',
+      resource,
+      ['playback.read'],
+      () => true,
+    );
+    const aliases = fixtureAcl(folder, dir, 'alias', true);
+    expect(
+      typeof aliases.longPath === 'string' &&
+        typeof aliases.shortPath === 'string',
+    ).toBe(true);
+    expect(aliases.longPath !== aliases.shortPath).toBe(true);
+    const longRead = await native.read(aliases.longPath),
+      shortRead = await native.read(aliases.shortPath);
+    expect(
+      longRead.binding !== null && longRead.binding === shortRead.binding,
+    ).toBe(true);
+    expect(longRead.contents === shortRead.contents).toBe(true);
+    const reloaded = new m.MusicGrantStore(aliases.shortPath, Date.now, native);
+    const authorized = await reloaded.authorize(
+      grant.token,
+      'rest',
+      resource,
+      'playback.read',
+    );
+    expect(authorized.id === grant.record.id).toBe(true);
+    await new m.MusicGrantStore(aliases.longPath, Date.now, native).revoke(
+      grant.record.id,
+      () => true,
+    );
+    await expect(
+      new m.MusicGrantStore(aliases.shortPath, Date.now, native).authorize(
+        grant.token,
+        'rest',
+        resource,
+        'playback.read',
+      ),
+    ).rejects.toMatchObject({ code: 'unauthorized' });
+    const longRevoked = await native.read(aliases.longPath),
+      shortRevoked = await native.read(aliases.shortPath);
+    expect(
+      longRevoked.binding !== null &&
+        longRevoked.binding === shortRevoked.binding,
+    ).toBe(true);
+    expect(longRevoked.contents === shortRevoked.contents).toBe(true);
+    for (const invalid of [
+      dir + '\\..\\owned',
+      dir + ':stream',
+      '\\\\?\\' + dir,
+      dir + '/../escape',
+      dir + '/./owned',
+      dir + '//owned',
+      dir + '/CON/owned',
+      dir + '/owned',
+      ...[9, 10, 11, 12, 13, 133, 160].map(
+        (code) => dir + String.fromCharCode(code),
+      ),
+    ])
+      await expect(native.read(invalid)).rejects.toMatchObject({
+        code: 'unavailable',
+      });
+  } finally {
+    await rm(folder, { recursive: true, force: true });
+  }
+});
+
+test('Windows failed native caller waits for physical worker close before returning cleanup ownership', async () => {
+  const f = await windowsProtocol('held-failure', 500, 150);
+  try {
+    await expect(f.bridge.read('C:\\Owned\\grants')).rejects.toMatchObject({
+      code: 'unavailable',
+    });
+    expect(f.physicallyClosed()).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const operation of ['read', 'stage'] as const)
+  test(`Windows adapter rejects C0 and trimmed terminal whitespace before ${operation} launch`, async () => {
+    const f = await windowsProtocol();
+    const contents = '{"version":1,"records":[]}';
+    const invalid = [
+      ...Array.from(
+        { length: 32 },
+        (_, code) => 'C:\\Owned\\grants' + String.fromCharCode(code),
+      ),
+      'C:\\Owned\\grants\u0085',
+      'C:\\Owned\\grants\u00a0',
+      'C:\\Ow\tner\\grants',
+      'C:\\Ow\nner\\grants',
+    ];
+    try {
+      const before = f.launches();
+      const rejected: boolean[] = [];
+      for (const value of invalid) {
+        try {
+          if (operation === 'read') await f.bridge.read(value);
+          else {
+            const lease = await f.bridge.stage(
+              value,
+              contents,
+              testBinding(contents),
+            );
+            await lease.close();
+          }
+          rejected.push(false);
+        } catch (error) {
+          rejected.push((error as { code?: string }).code === 'unavailable');
+        }
+      }
+      expect(f.launches()).toBe(before);
+      expect(rejected).toEqual(invalid.map(() => true));
+    } finally {
+      await f.close();
+    }
+  });
+
+for (const operation of ['read', 'stage'] as const)
+  test(`Windows adapter preserves healthy Unicode and aliases for ${operation}`, async () => {
+    const f = await windowsProtocol();
+    const contents = '{"version":1,"records":[]}';
+    try {
+      const before = f.launches();
+      for (const value of [
+        'C:\\Owned\\Музыка\u2003',
+        'C:\\Owned\\Audio\u0085Name',
+        'C:\\Owned\\Audio\u00a0Name',
+        'C:\\OWNED~1\\Audio',
+      ]) {
+        if (operation === 'read')
+          expect((await f.bridge.read(value)).contents).toBe(contents);
+        else {
+          const lease = await f.bridge.stage(
+            value,
+            contents,
+            testBinding(contents),
+          );
+          expect(await lease.commit()).toBe(testBinding(contents));
+          await lease.close();
+        }
+      }
+      expect(f.launches() - before).toBe(4);
+    } finally {
+      await f.close();
+    }
+  });
+
+test('Windows actual private ledgers retain healthy Unicode directory namespaces', async () => {
+  test.skip(
+    process.platform !== 'win32',
+    'Mandatory native Unicode namespace proof runs on Windows',
+  );
+  test.setTimeout(60000);
+  const folder = await privateTestFolder(),
+    native = await nativeTestBridge(folder);
+  const contents = '{"version":1,"records":[]}';
+  try {
+    for (const name of ['Музыка\u2003', 'Audio\u0085Name', 'Audio\u00a0Name']) {
+      const dir = path.join(folder, name);
+      const lease = await native.stage(dir, contents, null);
+      const committed = await lease.commit();
+      await lease.close();
+      const read = await native.read(dir);
+      expect(read.contents).toBe(contents);
+      expect(read.binding).toBe(committed);
+    }
+  } finally {
+    await rm(folder, { recursive: true, force: true });
   }
 });
