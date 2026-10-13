@@ -1,28 +1,21 @@
-import { readFile } from 'node:fs/promises';
-import { stripTypeScriptTypes } from 'node:module';
 import { test, expect } from '@playwright/test';
+import { shortcutRatingSource } from './helpers/shortcut-rating-source';
 
 async function fixture() {
-  const key = `seekMenu_${crypto.randomUUID()}`;
-  const calls: any[] = [];
-  const writes: any[] = [];
+  const f = await shortcutRatingSource();
+  const calls: any[] = [],
+    writes: any[] = [];
   const state = {
     output: undefined as any,
     calls,
     destroyed: false,
     configGate: undefined as undefined | Promise<void>,
   };
-  (globalThis as any)[key] = state;
-  const raw = stripTypeScriptTypes(
-    await readFile(
-      new URL('../src/plugins/shortcuts/menu.ts', import.meta.url),
-      'utf8',
-    ),
-  ).replace(/^import[\s\S]*?;\n/gm, '');
-  const boundary = `const state=globalThis[${JSON.stringify(key)}];const prompt=async options=>{state.calls.push(options);return state.output};const t=x=>x;const promptOptions=()=>({});`;
-  const source = await import(
-    `data:text/javascript;base64,${Buffer.from(boundary + raw).toString('base64')}`
-  );
+  f.window.isDestroyed = () => state.destroyed;
+  f.state.prompt = async (options: any) => {
+    calls.push(options);
+    return state.output;
+  };
   const config = {
     enabled: true,
     overrideMediaKeys: false,
@@ -33,13 +26,15 @@ async function fixture() {
     podcastSeekForwardSeconds: 10,
     podcastSeekBackwardSeconds: 30,
   };
-  const menu = await source.onMenu({
-    window: { isDestroyed: () => state.destroyed },
+  const menu = await f.source.onMenu({
+    window: f.window,
     getConfig: async () => {
       await state.configGate;
       return config;
     },
-    setConfig: async (x: any) => writes.push(x),
+    setConfig: async (value: any) => {
+      writes.push(value);
+    },
   });
   return {
     state,
@@ -47,7 +42,9 @@ async function fixture() {
     writes,
     config,
     menu,
-    close: () => delete (globalThis as any)[key],
+    close: () => {
+      void f.close();
+    },
   };
 }
 

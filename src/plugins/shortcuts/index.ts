@@ -10,10 +10,13 @@ export type ShortcutMappingType = {
   next: string;
   seekForward: string;
   seekBackward: string;
+  like: string;
+  dislike: string;
 };
 export type ShortcutsPluginConfig = {
   enabled: boolean;
   overrideMediaKeys: boolean;
+  focusWindowOnDoublePlayPause: boolean;
   global: ShortcutMappingType;
   local: ShortcutMappingType;
   seekForwardSeconds: number;
@@ -35,12 +38,15 @@ export default createPlugin({
   config: {
     enabled: false,
     overrideMediaKeys: false,
+    focusWindowOnDoublePlayPause: false,
     global: {
       previous: '',
       playPause: '',
       next: '',
       seekForward: '',
       seekBackward: '',
+      like: '',
+      dislike: '',
     },
     local: {
       previous: '',
@@ -48,6 +54,8 @@ export default createPlugin({
       next: '',
       seekForward: '',
       seekBackward: '',
+      like: '',
+      dislike: '',
     },
     seekForwardSeconds: 5,
     seekBackwardSeconds: 5,

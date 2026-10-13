@@ -1,9 +1,10 @@
 import prompt, { type KeybindOptions } from 'custom-electron-prompt';
-import { globalShortcut, type MenuItem } from 'electron';
+import { type MenuItem, type BrowserWindow } from 'electron';
 
 import { t } from '@/i18n';
 import promptOptions from '@/providers/prompt-options';
-import { createPlugin } from '@/utils';
+import { createPlugin, createBackend } from '@/utils';
+import { registerOwnedGlobalShortcut } from '@/utils/global-shortcut-owner';
 
 import { overrideListener } from './override';
 import { onConfigChange, onPlayerApiReady } from './renderer';
@@ -27,6 +28,21 @@ export type PreciseVolumePluginConfig = {
    * Plugin save volume between session here
    */
   savedVolume: number | undefined;
+};
+
+type VolumeBackend = {
+  window?: BrowserWindow;
+  config?: PreciseVolumePluginConfig;
+  send?: (event: string, direction: boolean) => void;
+  active: boolean;
+  generation: number;
+  revision: number;
+  reconciling: boolean;
+  scope?: AbortController;
+  closeListener?: () => void;
+  releases: (() => void)[];
+  reconcile(): void;
+  stop(): void;
 };
 
 export default createPlugin({
@@ -168,21 +184,139 @@ export default createPlugin({
     ];
   },
 
-  async backend({ getConfig, ipc }) {
-    const config = await getConfig();
-
-    if (config.globalShortcuts?.volumeUp) {
-      globalShortcut.register(config.globalShortcuts.volumeUp, () =>
-        ipc.send('changeVolume', true),
-      );
-    }
-
-    if (config.globalShortcuts?.volumeDown) {
-      globalShortcut.register(config.globalShortcuts.volumeDown, () =>
-        ipc.send('changeVolume', false),
-      );
-    }
-  },
+  backend: createBackend<VolumeBackend, PreciseVolumePluginConfig>({
+    active: false,
+    generation: 0,
+    revision: 0,
+    reconciling: false,
+    releases: [],
+    async start({ getConfig, ipc, window }) {
+      this.stop();
+      const generation = this.generation;
+      this.window = window;
+      this.send = (event, direction) => ipc.send(event, direction);
+      const closed = () => {
+        if (this.generation === generation && this.window === window)
+          this.stop();
+      };
+      window.on?.('closed', closed);
+      if (this.generation !== generation || this.window !== window) {
+        window.off?.('closed', closed);
+        return;
+      }
+      this.closeListener = () => window.off?.('closed', closed);
+      let loaded: PreciseVolumePluginConfig;
+      try {
+        loaded = await getConfig();
+      } catch (error) {
+        if (this.generation !== generation || this.window !== window) return;
+        if (!this.config) {
+          this.stop();
+          throw error;
+        }
+        loaded = this.config;
+      }
+      if (this.generation !== generation || this.window !== window) return;
+      const destroyed = window.isDestroyed();
+      if (destroyed || this.generation !== generation || this.window !== window)
+        return;
+      const desired = this.config ?? loaded;
+      if (desired.enabled !== true) {
+        this.stop();
+        return;
+      }
+      this.config = desired;
+      this.active = true;
+      this.reconcile();
+    },
+    onConfigChange(config) {
+      if (config.enabled !== true) {
+        this.stop();
+        return;
+      }
+      this.revision++;
+      this.config = config;
+      this.scope?.abort();
+      if (this.active) this.reconcile();
+    },
+    stop() {
+      this.active = false;
+      this.generation++;
+      this.revision++;
+      const scope = this.scope,
+        close = this.closeListener,
+        releases = this.releases.splice(0);
+      this.scope = undefined;
+      this.closeListener = undefined;
+      this.window = undefined;
+      this.config = undefined;
+      this.send = undefined;
+      scope?.abort();
+      for (const release of releases) release();
+      close?.();
+    },
+    reconcile() {
+      if (this.reconciling) return;
+      this.reconciling = true;
+      try {
+        for (;;) {
+          const old = this.scope,
+            releases = this.releases.splice(0);
+          this.scope = undefined;
+          old?.abort();
+          for (const release of releases) release();
+          const window = this.window,
+            config = this.config,
+            send = this.send,
+            revision = this.revision;
+          if (!this.active || !window || !config || !send) return;
+          const scope = new AbortController();
+          this.scope = scope;
+          const contents = window.webContents;
+          const scalar = () =>
+            this.active &&
+            this.window === window &&
+            this.config === config &&
+            this.send === send &&
+            this.revision === revision &&
+            this.scope === scope &&
+            !scope.signal.aborted;
+          const current = () => {
+            if (!scalar()) return false;
+            try {
+              const unavailable =
+                window.isDestroyed() ||
+                window.webContents !== contents ||
+                contents.isDestroyed?.();
+              return !unavailable && scalar();
+            } catch {
+              return false;
+            }
+          };
+          for (const [name, direction] of [
+            ['volumeUp', true],
+            ['volumeDown', false],
+          ] as const) {
+            if (!current()) break;
+            const accelerator = config.globalShortcuts?.[name];
+            if (typeof accelerator !== 'string' || !accelerator.trim())
+              continue;
+            const release = registerOwnedGlobalShortcut(
+              { signal: scope.signal, isCurrent: current },
+              accelerator,
+              () => {
+                if (current() && scalar()) send('changeVolume', direction);
+              },
+            );
+            if (release) this.releases.push(release);
+          }
+          if (scalar()) return;
+        }
+      } finally {
+        this.reconciling = false;
+      }
+    },
+  }),
 
   renderer: {
     start() {

@@ -3,6 +3,8 @@ import prompt, { type KeybindOptions } from 'custom-electron-prompt';
 import { t } from '@/i18n';
 import promptOptions from '@/providers/prompt-options';
 
+import { backend } from './main';
+
 import type {
   SeekSecondsKey,
   ShortcutMappingType,
@@ -17,6 +19,8 @@ const actions: (keyof ShortcutMappingType)[] = [
   'next',
   'seekForward',
   'seekBackward',
+  'like',
+  'dislike',
 ];
 const labels: Record<keyof ShortcutMappingType, string> = {
   previous: 'previous',
@@ -24,6 +28,8 @@ const labels: Record<keyof ShortcutMappingType, string> = {
   next: 'next',
   seekForward: 'seek-forward',
   seekBackward: 'seek-backward',
+  like: 'like',
+  dislike: 'dislike',
 };
 const seekSettings: { key: SeekSecondsKey; label: string; fallback: number }[] =
   [
@@ -46,10 +52,32 @@ export const onMenu = async ({
   getConfig,
   setConfig,
 }: MenuContext<ShortcutsPluginConfig>): Promise<MenuTemplate> => {
+  const generation = backend.generation,
+    documentRevision = backend.documentRevision;
+  const contents = window.webContents,
+    frame = contents.mainFrame;
+  const currentOwner = () => {
+    try {
+      const unavailable =
+        window.isDestroyed() ||
+        window.webContents !== contents ||
+        contents.isDestroyed?.() ||
+        contents.mainFrame !== frame;
+      return (
+        !unavailable &&
+        generation === backend.generation &&
+        documentRevision === backend.documentRevision
+      );
+    } catch {
+      return false;
+    }
+  };
   const config = await getConfig();
+  if (!currentOwner()) return [];
   const promptKeybind = async (scope: 'global' | 'local') => {
     const current = await getConfig();
-    if (window.isDestroyed()) return;
+    if (!currentOwner()) return;
+    const originalMapping = { ...current[scope] };
     const options: KeybindOptions[] = actions.map((action) => ({
       value: action,
       label: t(
@@ -68,9 +96,9 @@ export const onMenu = async ({
       },
       window,
     );
-    if (!Array.isArray(output) || window.isDestroyed()) return;
+    if (!Array.isArray(output) || !currentOwner()) return;
     const latest = await getConfig();
-    if (window.isDestroyed()) return;
+    if (!currentOwner()) return;
     const mapping = { ...latest[scope] };
     let changed = false;
     for (const entry of output) {
@@ -84,7 +112,13 @@ export const onMenu = async ({
         !actions.includes(entry.value as keyof ShortcutMappingType)
       )
         continue;
-      mapping[entry.value as keyof ShortcutMappingType] = entry.accelerator;
+      const action = entry.value as keyof ShortcutMappingType;
+      if (
+        entry.accelerator === originalMapping[action] ||
+        latest[scope]?.[action] !== originalMapping[action]
+      )
+        continue;
+      mapping[action] = entry.accelerator;
       changed = true;
     }
     if (changed) await setConfig({ [scope]: mapping });
@@ -105,7 +139,8 @@ export const onMenu = async ({
         label: t(`plugins.shortcuts.menu.seek.${label}`),
         async click() {
           const current = await getConfig();
-          if (window.isDestroyed()) return;
+          if (!currentOwner()) return;
+          const originalValue = current[key];
           const output: unknown = await prompt(
             {
               title: t('plugins.shortcuts.prompt.seek.title'),
@@ -121,12 +156,19 @@ export const onMenu = async ({
           if (
             output === null ||
             output === undefined ||
-            window.isDestroyed() ||
+            !currentOwner() ||
             (typeof output !== 'string' && typeof output !== 'number')
           )
             return;
           const value = Number(output);
-          if (Number.isFinite(value) && value >= 1 && value <= 600)
+          const latest = await getConfig();
+          if (
+            Number.isFinite(value) &&
+            value >= 1 &&
+            value <= 600 &&
+            currentOwner() &&
+            latest[key] === originalValue
+          )
             await setConfig({ [key]: value });
         },
       })),
@@ -135,7 +177,20 @@ export const onMenu = async ({
       label: t('plugins.shortcuts.menu.override-media-keys'),
       type: 'checkbox',
       checked: config.overrideMediaKeys,
-      click: (item) => setConfig({ overrideMediaKeys: item.checked }),
+      click: (item) =>
+        currentOwner()
+          ? setConfig({ overrideMediaKeys: item.checked })
+          : undefined,
+    },
+    {
+      label: t('plugins.shortcuts.menu.focus-window-on-double-play-pause'),
+      sublabel: t('plugins.shortcuts.menu.double-command-repeat-info'),
+      type: 'checkbox',
+      checked: config.focusWindowOnDoublePlayPause === true,
+      click: (item) =>
+        currentOwner()
+          ? setConfig({ focusWindowOnDoublePlayPause: item.checked })
+          : undefined,
     },
   ];
 };
