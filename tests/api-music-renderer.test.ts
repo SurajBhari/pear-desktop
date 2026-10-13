@@ -651,3 +651,26 @@ test('owner-phase cancellation cannot free or mark an already dispatched physica
     f.close();
   }
 });
+
+
+test('owned queue snapshot reads real native methods without catalog fetch and retires notified ABA', async () => {
+  const f = await musicRendererFixture();
+  try {
+    const element = f.dom.document.createElement('div') as any; element.id = 'queue'; f.dom.document.body.append(element);
+    const original = [{ playlistPanelVideoRenderer: { videoId: 'current0001', title: { simpleText: 'Owned current' }, shortBylineText: { runs: [{ text: 'Owned artist' }] }, lengthText: { simpleText: '3:35' }, selected: true } }];
+    let items = original;
+    const listeners = new Set<() => void>();
+    const store = { getState: () => ({ queue: { items, selectedItemIndex: 0 } }), subscribe(callback: () => void) { listeners.add(callback); return () => listeners.delete(callback); } };
+    element.queue = { getItems: () => items, store: { store } };
+    const first = f.read(f.query(), { operation: 'queue' }); await f.flush();
+    expect(f.result(first)).toMatchObject({ ok: true, value: { version: 1, selectedIndex: 0, items: [{ id: 'current0001', title: 'Owned current', durationSeconds: 215 }] } });
+    const revision = f.result(first).value.queueRevision;
+    items = [{ playlistPanelVideoRenderer: { ...original[0].playlistPanelVideoRenderer, videoId: 'changed0001' } }]; for (const listener of [...listeners]) listener();
+    items = original; for (const listener of [...listeners]) listener();
+    const after = f.read(f.query(), { operation: 'queue' }); await f.flush();
+    expect(f.result(after).ok).toBe(true);
+    expect(f.result(after).value.queueRevision).not.toBe(revision);
+    expect(f.fetches).toHaveLength(0);
+    f.controller.dispose(); expect(listeners.size).toBe(0);
+  } finally { f.close(); }
+});

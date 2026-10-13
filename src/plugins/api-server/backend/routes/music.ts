@@ -6,6 +6,7 @@ import {
   type MusicFailure,
 } from '../../music-types';
 import { parseMusicBearer, type MusicGrantRecord } from '../music-grants';
+import { parseMusicQueueQuery } from '../scheme/music';
 
 import type { MusicService } from '../music-service';
 import type { Env, Hono } from 'hono';
@@ -229,17 +230,20 @@ export function registerMusicRoutes<E extends Env>(
         return reject(409, 'retired');
       if (
         !rawTarget.startsWith(prefix + '/') ||
-        /[%?#\\]/.test(rawTarget) ||
+        /[%#\\]/.test(rawTarget.split('?')[0]) ||
         rawTarget.includes('//')
       )
         return reject(400);
-      const route = rawTarget.slice(prefix.length);
-      const current = route === '/current';
-      if (!current && route !== '/search' && route !== '/browse')
+      const route = rawTarget.split('?')[0].slice(prefix.length);
+      const current = route === '/current',
+        queue = route === '/queue';
+      if (rawTarget.includes('?') && !queue) return reject(400);
+      if (!current && !queue && route !== '/search' && route !== '/browse')
         return reject(404, 'not_found');
-      if (context.req.method !== (current ? 'GET' : 'POST')) return reject(405);
+      if (context.req.method !== (current || queue ? 'GET' : 'POST'))
+        return reject(405);
       if (
-        current &&
+        (current || queue) &&
         (incoming.headers['transfer-encoding'] !== undefined ||
           Number(incoming.headers['content-length'] ?? '0') > 0)
       )
@@ -263,10 +267,10 @@ export function registerMusicRoutes<E extends Env>(
       ]);
       timer = setTimeout(
         () => controller.abort(new MusicServiceError('timeout')),
-        current ? 5000 : 15000,
+        current || queue ? 5000 : 15000,
       );
       timer.unref?.();
-      const scope = current ? 'playback.read' : 'catalog.read';
+      const scope = current || queue ? 'playback.read' : 'catalog.read';
       let principal: MusicGrantRecord | undefined;
       const live = () =>
         !signal.aborted &&
@@ -282,19 +286,28 @@ export function registerMusicRoutes<E extends Env>(
         signal,
       );
       if (!live()) return reject(409, 'retired');
+      const query = rawTarget.includes('?')
+        ? rawTarget.slice(rawTarget.indexOf('?') + 1)
+        : '';
+      if (queue && /[%#\\]/.test(query)) return reject(400);
       const input = current
         ? undefined
-        : await jsonBody(context.req.raw, incoming, signal);
+        : queue
+          ? parseMusicQueueQuery(new URLSearchParams(query))
+          : await jsonBody(context.req.raw, incoming, signal);
       if (!live()) return reject(409, 'retired');
       const result = await wait<
         | Awaited<ReturnType<MusicService['current']>>
         | Awaited<ReturnType<MusicService['search']>>
+        | Awaited<ReturnType<MusicService['queue']>>
       >(
         current
           ? service.current(token, signal)
-          : route === '/search'
-            ? service.search(token, input, signal)
-            : service.browse(token, input, signal),
+          : queue
+            ? service.queue(token, input, signal)
+            : route === '/search'
+              ? service.search(token, input, signal)
+              : service.browse(token, input, signal),
         signal,
       );
       if (!live()) return reject(409, 'retired');

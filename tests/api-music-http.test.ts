@@ -182,3 +182,15 @@ test('matching forged Host and valid grant cannot cross an actual listener port 
     await f.close();
   }
 });
+
+
+test('queue GET rejects duplicate and coercing query fields without native work', async () => {
+  const f = await musicHttpFixture();
+  try {
+    for (const query of ['limit=0', 'limit=101', 'limit=01', 'limit=1.0', 'limit=1&limit=2', 'unknown=1', '%6cimit=1']) {
+      const result = await f.http('/api/v1/music/queue?' + query, 'GET', undefined, { authorization: 'Bearer ' + f.grant.token });
+      expect(result.status, query).toBe(400);
+    }
+    expect(f.calls).toHaveLength(0);
+  } finally { await f.close(); }
+});

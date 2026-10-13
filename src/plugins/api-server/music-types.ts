@@ -34,6 +34,7 @@ export type MusicKind =
 export type CatalogOperation = 'search' | 'browse' | 'home' | 'library';
 export type MusicReadInput =
   | { operation: 'current' }
+  | { operation: 'queue' }
   | {
       operation: 'search';
       query: string;
@@ -41,7 +42,24 @@ export type MusicReadInput =
     }
   | { operation: 'browse'; browseId: string; params?: string }
   | { operation: 'continuation'; endpoint: 'search' | 'browse'; token: string };
-export type NativeMusicValue = PlaybackSnapshot | NormalizedMusicSource;
+export type NativeMusicValue =
+  | PlaybackSnapshot
+  | NormalizedMusicSource
+  | NativeQueueSnapshot;
+export interface NativeQueueSnapshot {
+  version: 1;
+  queueRevision: string;
+  selectedIndex: number | null;
+  items: MusicItem[];
+}
+export interface QueuePage {
+  version: 1;
+  queueRevision: string;
+  total: number;
+  selectedIndex: number | null;
+  items: { index: number; selected: boolean; item: MusicItem }[];
+  nextCursor: string | null;
+}
 export type NativeMusicResult =
   | { ok: true; value: NativeMusicValue }
   | { ok: false; reason: MusicFailure };
