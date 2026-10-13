@@ -1,6 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { readFile } from 'node:fs/promises';
-import { nativeLocale } from './helpers/i18n-built-native';
+import { nativeLocale, nativeLocaleProof } from './helpers/i18n-built-native';
 import {
   assertStartupFacts,
   refreshStartupFacts,
@@ -14,9 +13,7 @@ for (const language of ['en', 'fr-CA'])
       try {
         const expected = language === 'en' ? ['en'] : ['en', 'fr'];
         await expect
-          .poll(() =>
-            f.app.evaluate(() => (globalThis as any).__localeSnapshot?.()),
-          )
+          .poll(() => nativeLocaleProof(f).then((proof) => proof?.snapshot))
           .toMatchObject({
             ids: expected,
             resolved: language === 'en' ? 'en' : 'fr',
@@ -86,9 +83,7 @@ test('missing selected main/preload chunks keep English usable without source or
   const f = await nativeLocale('fr-CA', { missing: true });
   try {
     await expect
-      .poll(() =>
-        f.app.evaluate(() => (globalThis as any).__localeSnapshot?.()),
-      )
+      .poll(() => nativeLocaleProof(f).then((proof) => proof?.snapshot))
       .toMatchObject({ ids: ['en'], resolved: 'en' });
     const page = await f.app.firstWindow();
     await expect
@@ -121,13 +116,18 @@ test('compiled slow selection from a closed owner cannot publish; replacement re
       const g = globalThis as any;
       g.__holdLocale = true;
       const { Menu, BrowserWindow } = g.__nativeLocale;
+      const owner = BrowserWindow.getAllWindows()[0];
+      // Non-macOS quits on window-all-closed. Keep this owned process alive
+      // while the actual main owner closes and activation creates its successor.
+      g.__localeKeeper = new BrowserWindow({ show: false });
+      g.__localeOwner = owner;
       const flat = (items: any[]): any[] =>
         items.flatMap((item) => [item, ...flat(item.submenu?.items ?? [])]);
       const russian = flat(Menu.getApplicationMenu().items).find((item) =>
         item.label.startsWith('Russian ('),
       );
       void russian.click();
-      return BrowserWindow.getAllWindows()[0].id;
+      return owner.id;
     });
     await expect
       .poll(() =>
@@ -140,7 +140,7 @@ test('compiled slow selection from a closed owner cannot publish; replacement re
     await f.app.evaluate(() => {
       setTimeout(() => {
         const { app, BrowserWindow } = (globalThis as any).__nativeLocale;
-        BrowserWindow.getAllWindows()[0].destroy();
+        (globalThis as any).__localeOwner.destroy();
         app.emit('activate');
         setImmediate(() => (globalThis as any).__releaseLocale());
       }, 25);
@@ -148,12 +148,7 @@ test('compiled slow selection from a closed owner cannot publish; replacement re
     let replacementProof: any;
     await expect
       .poll(async () => {
-        replacementProof = await readFile(
-          `${f.owned}/native-proof.json`,
-          'utf8',
-        )
-          .then(JSON.parse)
-          .catch(() => undefined);
+        replacementProof = await nativeLocaleProof(f);
         return replacementProof;
       })
       .toMatchObject({
@@ -162,6 +157,7 @@ test('compiled slow selection from a closed owner cannot publish; replacement re
           expect.objectContaining({
             url: expect.stringMatching(/^https:\/\/music\./),
             id: expect.any(Number),
+            loaded: true,
           }),
         ]),
         labels: expect.arrayContaining(['Язык (Language)']),
@@ -171,7 +167,15 @@ test('compiled slow selection from a closed owner cannot publish; replacement re
       win.url.startsWith('https://music.'),
     );
     expect(replacement?.id).toBeTruthy();
+    expect(replacementProof.loadEvents).toContainEqual({
+      id: replacement.id,
+      event: 'did-finish-load',
+      url: replacement.url,
+    });
     expect(replacement.id).not.toBe(oldId);
+    expect(replacementProof.windows.some((win: any) => win.id === oldId)).toBe(
+      false,
+    );
     expect(replacementProof.pid).toBe(f.app.process().pid);
     expect(f.app.process().exitCode).toBeNull();
     expect(f.app.process().signalCode).toBeNull();

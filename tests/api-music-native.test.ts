@@ -4,9 +4,12 @@ import { musicNative } from './helpers/api-music-native';
 test('actual Electron raw sender physical tombstones reload and renderer loss preserve usable owned reads', async () => {
   const result = await musicNative(async () => {
     const f = (globalThis as any).MusicNativeProof;
+    let phase = 'initial';
+    const bounded = <T>(label: string, operation: Promise<T>): Promise<T> =>
+      f.bounded(phase + ':' + label, operation);
     const wait = async (check: () => Promise<boolean> | boolean) => {
       const end = Date.now() + 5000;
-      while (!(await check())) {
+      while (!(await bounded('observation', Promise.resolve().then(check)))) {
         if (Date.now() >= end) throw Error('Missing native observation');
         await new Promise((r) => setTimeout(r, 5));
       }
@@ -24,16 +27,20 @@ test('actual Electron raw sender physical tombstones reload and renderer loss pr
       });
     const window = make(),
       foreign = make();
-    await window.loadFile(f.owned + '/main.html');
-    await foreign.loadFile(f.owned + '/child.html');
+    await bounded('initial-load', window.loadFile(f.owned + '/main.html'));
+    await bounded('foreign-load', foreign.loadFile(f.owned + '/child.html'));
     const evaluate = (code: string) =>
-      window.webContents.executeJavaScript(code);
+      bounded(
+        'renderer-evaluation',
+        window.webContents.executeJavaScript(code),
+      );
     const setup = async () => {
       await evaluate(f.bundle);
       await evaluate(
         `window.held=[];window.fetches=[];window.nativeListeners={};window.nativeApi={getVideoData:()=>({video_id:'current0001'}),getPlayerResponse:()=>({videoDetails:{videoId:'current0001',title:'Native current',author:'Native artist',musicVideoType:'MUSIC_VIDEO_TYPE_ATV'}}),getCurrentTime:()=>1.2345,getDuration:()=>215,getVolume:()=>77,getPlayerState:()=>1,addEventListener:(name,fn)=>{window.nativeListeners[name]=fn},removeEventListener:()=>{}};document.querySelector('ytmusic-app').networkManager={fetch:(url,data)=>new Promise(resolve=>window.fetches.push({url,data,resolve}))};window.musicController=MusicNativeSource.createMusicRendererController(window.nativeApi,()=>window.nativeApi,{subscribe:window.musicProof.subscribe,send:(channel,packet)=>{if(packet.type==='ready')window.held.push(packet);else window.musicProof.send(channel,packet)}});undefined;`,
       );
     };
+    phase = 'physical-dispatch';
     await setup();
     const broker = f.source.createMusicRequestBroker(window),
       controllers = Array.from({ length: 5 }, () => new AbortController());
@@ -49,20 +56,27 @@ test('actual Electron raw sender physical tombstones reload and renderer loss pr
     );
     await wait(async () => await evaluate('window.held.length===4'));
     const query = await evaluate('window.held[0]');
-    await foreign.webContents.executeJavaScript(
-      `window.musicProof.send('peard:music-reply',${JSON.stringify(query)})`,
+    await bounded(
+      'foreign-reply',
+      foreign.webContents.executeJavaScript(
+        `window.musicProof.send('peard:music-reply',${JSON.stringify(query)})`,
+      ),
     );
     const child = window.webContents.mainFrame.frames[0];
-    await child.executeJavaScript(
-      `window.musicProof.send('peard:music-reply',${JSON.stringify(query)})`,
+    await bounded(
+      'child-reply',
+      child.executeJavaScript(
+        `window.musicProof.send('peard:music-reply',${JSON.stringify(query)})`,
+      ),
     );
     const beforeValid = await evaluate('window.fetches.length');
     await evaluate(
       `for(const packet of window.held.splice(0))window.musicProof.send('peard:music-reply',packet)`,
     );
     await wait(async () => await evaluate('window.fetches.length===4'));
+    phase = 'physical-cancel';
     controllers[0].abort();
-    const canceled = await calls[0],
+    const canceled = await bounded('aborted-call-retired', calls[0]),
       physicalAfterCancel = broker.stats().dispatched,
       nativeAfterCancel = await evaluate('window.fetches.length');
     await evaluate(
@@ -73,12 +87,14 @@ test('actual Electron raw sender physical tombstones reload and renderer loss pr
       `window.musicProof.send('peard:music-reply',window.held.shift())`,
     );
     await wait(async () => await evaluate('window.fetches.length===5'));
+    phase = 'same-frame-navigation';
     const frame = window.webContents.mainFrame;
-    await window.loadFile(f.owned + '/main.html');
+    await bounded('same-frame-reload', window.loadFile(f.owned + '/main.html'));
     const reusedFrame = frame === window.webContents.mainFrame;
-    await Promise.all(calls);
+    await bounded('old-calls-retired', Promise.all(calls));
     const afterReload = broker.stats().dispatched;
     await setup();
+    phase = 'late-old-reply';
     const snapshotPromise = broker.read(
       broker.capture(),
       { operation: 'current' },
@@ -92,7 +108,8 @@ test('actual Electron raw sender physical tombstones reload and renderer loss pr
     await evaluate(
       `window.musicProof.send('peard:music-reply',window.held.shift())`,
     );
-    const snapshot = await snapshotPromise;
+    const snapshot = await bounded('snapshot-settled', snapshotPromise);
+    phase = 'renderer-loss';
     const crashPromise = broker
       .read(
         broker.capture(),
@@ -105,15 +122,54 @@ test('actual Electron raw sender physical tombstones reload and renderer loss pr
       `window.musicProof.send('peard:music-reply',window.held.shift())`,
     );
     await wait(async () => await evaluate('window.fetches.length===1'));
-    const gone = new Promise<void>((resolve) =>
-      window.webContents.once('render-process-gone', resolve),
+    const rendererPid = window.webContents.getOSProcessId();
+    const ownedRenderer = f.app
+      .getAppMetrics()
+      .find((entry: any) => entry.pid === rendererPid && entry.type === 'Tab');
+    if (
+      !Number.isInteger(rendererPid) ||
+      rendererPid <= 0 ||
+      rendererPid === process.pid ||
+      !ownedRenderer
+    )
+      throw Error('Missing distinct owned native renderer process');
+    const gone = new Promise<{ reason: string }>((resolve) =>
+      window.webContents.once(
+        'render-process-gone',
+        (_event: any, details: any) => resolve({ reason: details.reason }),
+      ),
     );
-    window.webContents.forcefullyCrashRenderer();
-    await gone;
-    const crashResult = await crashPromise,
+    // The Linux runner did not emit terminal evidence after force-crashing.
+    // Terminate only this verified owned renderer; Electron must still deliver
+    // its actual terminal process event below.
+    if (process.platform === 'linux') process.kill(rendererPid, 'SIGKILL');
+    else window.webContents.forcefullyCrashRenderer();
+    const termination = await bounded('renderer-gone', gone);
+    if (
+      process.platform === 'linux'
+        ? termination.reason !== 'killed'
+        : !['crashed', 'killed'].includes(termination.reason)
+    )
+      throw Error(
+        'Unexpected native renderer termination: ' + termination.reason,
+      );
+    const crashResult = await bounded('crash-call-retired', crashPromise),
       afterCrash = broker.stats().dispatched;
-    await window.loadFile(f.owned + '/main.html');
+    phase = 'renderer-recovery';
+    await bounded(
+      'crashed-renderer-reload',
+      window.loadFile(f.owned + '/main.html'),
+    );
+    const replacementRendererPid = window.webContents.getOSProcessId();
+    if (
+      !Number.isInteger(replacementRendererPid) ||
+      replacementRendererPid <= 0 ||
+      replacementRendererPid === rendererPid ||
+      replacementRendererPid === process.pid
+    )
+      throw Error('Missing replacement native renderer process');
     await setup();
+    phase = 'recovered-read';
     const after = broker.read(
       broker.capture(),
       { operation: 'current' },
@@ -123,7 +179,7 @@ test('actual Electron raw sender physical tombstones reload and renderer loss pr
     await evaluate(
       `window.musicProof.send('peard:music-reply',window.held.shift())`,
     );
-    const reloaded = await after;
+    const reloaded = await bounded('recovered-read-settled', after);
     broker.dispose();
     return {
       beforeValid,
@@ -136,6 +192,8 @@ test('actual Electron raw sender physical tombstones reload and renderer loss pr
       snapshot: { id: snapshot.current.id, ms: snapshot.elapsedMilliseconds },
       crashResult,
       afterCrash,
+      termination: termination.reason,
+      distinctRenderer: replacementRendererPid !== rendererPid,
       reloaded: reloaded.current.id,
     };
   });
@@ -150,6 +208,11 @@ test('actual Electron raw sender physical tombstones reload and renderer loss pr
     snapshot: { id: 'current0001', ms: 1234.5 },
     crashResult: 'retired',
     afterCrash: 0,
+    termination:
+      process.platform === 'linux'
+        ? 'killed'
+        : expect.stringMatching(/^(crashed|killed)$/),
+    distinctRenderer: true,
     reloaded: 'current0001',
   });
 });

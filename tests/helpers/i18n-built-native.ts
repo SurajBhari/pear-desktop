@@ -1,4 +1,12 @@
-import { cp, mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import {
+  cp,
+  mkdtemp,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -62,6 +70,33 @@ const parentSources=${JSON.stringify(parentSources)};export default async enviro
     return owned;
   })();
   return output;
+}
+
+/** Main-process evidence independent of Playwright's startup inspector handle. */
+export async function nativeLocaleProof(f: {
+  owned: string;
+  app: {
+    process(): {
+      pid?: number;
+      exitCode: number | null;
+      signalCode: string | null;
+    };
+  };
+}) {
+  const process = f.app.process();
+  if (process.exitCode !== null || process.signalCode !== null)
+    throw Error('Owned locale process exited before native proof');
+  let value: string;
+  try {
+    value = await readFile(path.join(f.owned, 'native-proof.json'), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const proof = JSON.parse(value);
+  if (proof.pid !== process.pid)
+    throw Error('Native locale proof PID mismatch');
+  return proof;
 }
 
 export async function nativeLocale(
@@ -136,7 +171,7 @@ export async function nativeLocale(
   const entry = path.join(owned, 'entry.cjs');
   await writeFile(
     entry,
-    `const {app,session,BrowserWindow,Menu,dialog}=require('electron');const fs=require('node:fs'),path=require('node:path');const owned=${JSON.stringify(owned)};for(const key of ['userData','sessionData','downloads']){const target=path.join(owned,key);fs.mkdirSync(target,{recursive:true});if(!fs.realpathSync(target).startsWith(fs.realpathSync(owned)+path.sep))throw Error('Unowned locale profile');app.setPath(key,target);}app.setLoginItemSettings=()=>{};globalThis.__nativeLocale={app,BrowserWindow,Menu,requests:[],dialogs:[]};dialog.showMessageBox=async(...args)=>{globalThis.__nativeLocale.dialogs.push(args);return {response:0};};setInterval(()=>{try{const flat=items=>items.flatMap(item=>[item,...flat(item.submenu?.items??[])]);const menu=Menu.getApplicationMenu();const proof={pid:process.pid,time:Date.now(),snapshot:globalThis.__localeSnapshot?.(),windows:BrowserWindow.getAllWindows().map(win=>({id:win.id,url:win.webContents.getURL()})),labels:flat(menu?.items??[]).map(item=>item.label),dialogs:globalThis.__nativeLocale.dialogs.length};fs.writeFileSync(path.join(owned,'native-proof.json'),JSON.stringify(proof));}catch{}},25);app.whenReady().then(()=>{for(const scheme of ['https','http'])session.defaultSession.protocol.handle(scheme,request=>{globalThis.__nativeLocale.requests.push(request.url);return new Response('<html><body><ytmusic-app></ytmusic-app><ytmusic-player-bar></ytmusic-player-bar></body></html>',{headers:{'Content-Type':'text/html'}});});});import(${JSON.stringify(pathToFileURL(path.join(appRoot, 'dist/main/index.js')).href)}).catch(error=>{fs.writeFileSync(path.join(owned,'native-error.txt'),String(error.stack??error));console.error(error);app.exit(1);});`,
+    `const {app,session,BrowserWindow,Menu,dialog}=require('electron');const fs=require('node:fs'),path=require('node:path');const owned=${JSON.stringify(owned)};for(const key of ['userData','sessionData','downloads']){const target=path.join(owned,key);fs.mkdirSync(target,{recursive:true});if(!fs.realpathSync(target).startsWith(fs.realpathSync(owned)+path.sep))throw Error('Unowned locale profile');app.setPath(key,target);}app.setLoginItemSettings=()=>{};globalThis.__nativeLocale={app,BrowserWindow,Menu,requests:[],dialogs:[],loadEvents:[]};app.on('browser-window-created',(_event,win)=>{const id=win.id;for(const event of ['did-finish-load','did-fail-load','destroyed'])win.webContents.on(event,()=>globalThis.__nativeLocale.loadEvents.push({id,event,...(event==='did-finish-load'?{url:win.webContents.getURL()}:{})}));});dialog.showMessageBox=async(...args)=>{globalThis.__nativeLocale.dialogs.push(args);return {response:0};};setInterval(()=>{try{const flat=items=>items.flatMap(item=>[item,...flat(item.submenu?.items??[])]);const menu=Menu.getApplicationMenu();const proof={pid:process.pid,time:Date.now(),snapshot:globalThis.__localeSnapshot?.(),windows:BrowserWindow.getAllWindows().map(win=>({id:win.id,url:win.webContents.getURL(),loaded:globalThis.__nativeLocale.loadEvents.some(event=>event.id===win.id&&event.event==='did-finish-load'&&event.url===win.webContents.getURL())})),labels:flat(menu?.items??[]).map(item=>item.label),dialogs:globalThis.__nativeLocale.dialogs.length,loadEvents:globalThis.__nativeLocale.loadEvents};fs.writeFileSync(path.join(owned,'native-proof-next.json'),JSON.stringify(proof));fs.renameSync(path.join(owned,'native-proof-next.json'),path.join(owned,'native-proof.json'));}catch{}},25);app.whenReady().then(()=>{for(const scheme of ['https','http'])session.defaultSession.protocol.handle(scheme,request=>{globalThis.__nativeLocale.requests.push(request.url);return new Response('<html><body><ytmusic-app></ytmusic-app><ytmusic-player-bar></ytmusic-player-bar></body></html>',{headers:{'Content-Type':'text/html'}});});});import(${JSON.stringify(pathToFileURL(path.join(appRoot, 'dist/main/index.js')).href)}).catch(error=>{fs.writeFileSync(path.join(owned,'native-error.txt'),String(error.stack??error));console.error(error);app.exit(1);});`,
   );
   const env = {
     ...process.env,
