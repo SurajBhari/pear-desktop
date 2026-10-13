@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { deepmergeCustom } from 'deepmerge-ts';
 import { test, expect } from '@playwright/test';
 import { scrobblerBundle } from './helpers/scrobbler-integration-bundle';
+import { discordArtworkFixture } from './helpers/discord-artist-artwork';
 
 const merge = deepmergeCustom({ mergeArrays: false });
 const deferred = () => {
@@ -198,7 +199,7 @@ test('failed or canceled forced login preserves an existing session', async () =
   expect(f.writes).toEqual([]);
   service.stop();
 });
-test('both compatible services post to their configured endpoint with preserved alternate metadata', async () => {
+test('both compatible services preserve alternative titles while preferring the actual artist', async () => {
   const f = await fixture();
   expect(typeof f.module.createLibreFmService).toBe('function');
   for (const [name, factory] of [
@@ -241,7 +242,7 @@ test('both compatible services post to their configured endpoint with preserved 
       ),
     ).toEqual({
       track: 'Alt',
-      artist: 'Alt Artist',
+      artist: 'Primary Artist',
       album: 'Album',
       duration: '301',
       sk: 'existing-session',
@@ -249,6 +250,176 @@ test('both compatible services post to their configured endpoint with preserved 
     service.stop();
   }
 });
+test('Rolling Girl uses its primary artist in every transport for new and existing defaults', async () => {
+  const f = await fixture();
+  const song = {
+    title: 'Rolling Girl',
+    artist: 'urei',
+    tags: ['ローリンガール', 'VOCALOID'],
+    songDuration: 200,
+    elapsedSeconds: 100,
+  };
+  const discord = await discordArtworkFixture();
+  try {
+    discord.admit({ ...discord.song(), ...song });
+    await discord.flush();
+    expect(discord.state.activities.at(-1).state).toBe('urei');
+  } finally {
+    await discord.close();
+  }
+  for (const legacy of [undefined, true, false]) {
+    const config = merge({}, f.config);
+    if (legacy !== undefined) {
+      delete config.artistSource;
+      config.alternativeArtist = legacy;
+    }
+    for (const [name, factory] of [
+      ['lastfm', f.module.createLastFmService],
+      ['librefm', f.module.createLibreFmService],
+      ['listenbrainz', f.module.createListenbrainzService],
+    ] as const) {
+      config.scrobblers[name] =
+        name === 'listenbrainz'
+          ? {
+              enabled: true,
+              token: 'dummy-token',
+              apiRoot: 'https://listen.invalid/1/',
+            }
+          : {
+              ...config.scrobblers.lastfm,
+              enabled: true,
+              sessionKey: 'existing-session',
+            };
+      f.config = config;
+      const service = factory(f.runtime, f.dependencies);
+      for (const action of ['setNowPlaying', 'addScrobble']) {
+        expect(
+          await service[action](song, config, {
+            signal: new AbortController().signal,
+            isCurrent: () => true,
+          }),
+        ).toBe(true);
+        const call = f.calls.at(-1);
+        const artist =
+          name === 'listenbrainz'
+            ? JSON.parse(call.options.body).payload[0].track_metadata
+                .artist_name
+            : new URLSearchParams(call.options.body).get('artist');
+        expect(artist, `${name}/${action}/legacy=${legacy}`).toBe('urei');
+      }
+      service.stop();
+    }
+  }
+});
+test('artist source menu requires a fresh explicit legacy opt-in without changing account leaves', async () => {
+  const f = await fixture();
+  expect(f.module.defaultConfig.artistSource).toBe('primary');
+  const accounts = merge({}, f.config.scrobblers);
+  delete f.config.artistSource;
+  f.config.alternativeArtist = true;
+  let menu = await f.module.onMenu({ ...f.context, refresh() {} });
+  expect(menu[2].checked).toBe(false);
+  await menu[2].click({ checked: true });
+  expect(f.writes).toEqual([{ artistSource: 'first-tag' }]);
+  expect(f.config.alternativeArtist).toBe(true);
+  expect(f.config.scrobblers).toEqual(accounts);
+  menu = await f.module.onMenu({ ...f.context, refresh() {} });
+  expect(menu[2].checked).toBe(true);
+  await menu[2].click({ checked: false });
+  expect(f.writes.at(-1)).toEqual({ artistSource: 'primary' });
+  expect(f.config.scrobblers).toEqual(accounts);
+});
+
+for (const name of ['lastfm', 'librefm', 'listenbrainz']) {
+  test(`${name} preserves explicit first-tag selection and rejects unsafe selected artists`, async () => {
+    const f = await fixture();
+    f.config.scrobblers[name] =
+      name === 'listenbrainz'
+        ? {
+            enabled: true,
+            token: 'dummy-token',
+            apiRoot: 'https://listen.invalid/1/',
+          }
+        : {
+            ...f.config.scrobblers.lastfm,
+            enabled: true,
+            sessionKey: 'existing-session',
+          };
+    const factory =
+      name === 'lastfm'
+        ? f.module.createLastFmService
+        : name === 'librefm'
+          ? f.module.createLibreFmService
+          : f.module.createListenbrainzService;
+    const service = factory(f.runtime, f.dependencies);
+    const song = {
+      title: 'Rolling Girl',
+      artist: 'urei',
+      tags: ['ローリンガール'],
+      songDuration: 200,
+      elapsedSeconds: 100,
+    };
+    const owner = {
+      signal: new AbortController().signal,
+      isCurrent: () => true,
+    };
+    for (const [artistSource, artist, tags, expected] of [
+      ['first-tag', 'urei', ['ローリンガール'], 'ローリンガール'],
+      ['first-tag', 'urei', undefined, 'urei'],
+      ['primary', '', ['Fallback tag'], 'Fallback tag'],
+      ['primary', '  ', ['Fallback tag'], 'Fallback tag'],
+      ['primary', undefined, ['Fallback tag'], 'Fallback tag'],
+      ['unknown', 'urei', ['ローリンガール'], 'urei'],
+    ]) {
+      f.config.artistSource = artistSource;
+      for (const action of ['setNowPlaying', 'addScrobble']) {
+        expect(
+          await service[action]({ ...song, artist, tags }, f.config, owner),
+        ).toBe(true);
+        const call = f.calls.at(-1);
+        expect(
+          name === 'listenbrainz'
+            ? JSON.parse(call.options.body).payload[0].track_metadata
+                .artist_name
+            : new URLSearchParams(call.options.body).get('artist'),
+        ).toBe(expected);
+      }
+    }
+    for (const value of [
+      '',
+      '  ',
+      null,
+      {},
+      42,
+      '\u0000bad',
+      'bad\r\nartist',
+      'bad\u007fartist',
+      'a'.repeat(4097),
+    ]) {
+      for (const artistSource of ['primary', 'first-tag']) {
+        f.config.artistSource = artistSource;
+        const info =
+          artistSource === 'primary'
+            ? { ...song, artist: value, tags: [] }
+            : { ...song, tags: [value] };
+        const before = f.calls.length;
+        for (const action of ['setNowPlaying', 'addScrobble'])
+          expect(
+            await service[action](info, f.config, owner).catch(() => 'escaped'),
+          ).toBe(false);
+        expect(f.calls).toHaveLength(before);
+      }
+    }
+    f.config.artistSource = 'primary';
+    const before = f.calls.length;
+    for (const artist of [null, {}, 'bad\nartist', 'a'.repeat(4097)])
+      expect(
+        await service.setNowPlaying({ ...song, artist }, f.config, owner),
+      ).toBe(false);
+    expect(f.calls).toHaveLength(before);
+    service.stop();
+  });
+}
 test('late error9 cannot clear a newer session; current decoded error9 clears nullable own leaves once', async () => {
   const f = await fixture();
   expect(typeof f.module.createLastFmService).toBe('function');
@@ -396,7 +567,7 @@ test('ListenBrainz uses owned abortable requests and preserves its existing payl
     payload: [
       {
         track_metadata: {
-          artist_name: 'Alt Artist',
+          artist_name: 'Original Artist',
           track_name: 'Alt',
           release_name: 'Album',
           additional_info: { origin_url: song.url, duration: 200 },

@@ -980,7 +980,7 @@
         "listenbrainz": {
           "token": "Введите токен пользователя ListenBrainz"
         },
-        "scrobble-alternative-artist": "Использовать альтернативных исполнителей",
+        "scrobble-alternative-artist": "Предпочитать первый тег как исполнителя (старый режим)",
         "scrobble-alternative-title": "Использовать альтернативные названия",
         "scrobble-other-media": "Скробблинг других медиа"
       },

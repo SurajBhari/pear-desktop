@@ -13,7 +13,9 @@ export interface ScrobblerPluginConfig {
   enabled: boolean;
   scrobbleOtherMedia: boolean;
   alternativeTitles: boolean;
+  /** Deprecated saved preference; use artistSource for an explicit choice. */
   alternativeArtist: boolean;
+  artistSource?: 'primary' | 'first-tag';
   scrobblers: {
     lastfm: CompatibleAccountConfig;
     librefm: CompatibleAccountConfig;
@@ -40,7 +42,8 @@ export const defaultConfig: ScrobblerPluginConfig = {
   enabled: false,
   scrobbleOtherMedia: true,
   alternativeTitles: true,
-  alternativeArtist: true,
+  alternativeArtist: false,
+  artistSource: 'primary',
   scrobblers: {
     lastfm: {
       enabled: false,

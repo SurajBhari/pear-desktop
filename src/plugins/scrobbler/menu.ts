@@ -175,8 +175,9 @@ export const onMenu = async ({
     {
       label: t('plugins.scrobbler.menu.scrobble-alternative-artist'),
       type: 'checkbox',
-      checked: config.alternativeArtist,
-      click: (item) => write({ alternativeArtist: item.checked }),
+      checked: config.artistSource === 'first-tag',
+      click: (item) =>
+        write({ artistSource: item.checked ? 'first-tag' : 'primary' }),
     },
     compatible('lastfm'),
     compatible('librefm'),
