@@ -6,6 +6,7 @@ import {
   isMusicOrVideoTrack,
   isPlayerMenu,
 } from '@/plugins/utils/renderer/check';
+import { createPlaybackPitchOwner } from '@/plugins/utils/renderer/playback-pitch-owner';
 import {
   claimPlaybackRate,
   getPlaybackRateOwner,
@@ -16,6 +17,10 @@ import {
 import { getSongMenu } from '@/providers/dom-elements';
 
 import { PlaybackSpeedSlider } from './components/slider';
+
+import type { PlaybackSpeedConfig } from './index';
+import type { RendererContext } from '@/types/contexts';
+import type { MusicPlayer } from '@/types/music-player';
 
 const MIN_PLAYBACK_SPEED = 0.07;
 const MAX_PLAYBACK_SPEED = 16;
@@ -31,6 +36,9 @@ let replacementObserver: MutationObserver | null = null;
 let popup: Element | null = null;
 let video: HTMLVideoElement | null = null;
 let dataHandler: (() => void) | null = null;
+let preservesPitch = true;
+let configRevision = 0;
+const pitchOwner = createPlaybackPitchOwner(PLUGIN_ID);
 
 const forcePlaybackRate = (event: Event) => {
   if (
@@ -44,6 +52,7 @@ const forcePlaybackRate = (event: Event) => {
 };
 
 function detachVideo(): void {
+  pitchOwner.release();
   video?.removeEventListener('ratechange', forcePlaybackRate);
   video?.removeEventListener('peard:src-changed', forcePlaybackRate);
   video?.removeEventListener(PLAYBACK_RATE_OWNER_CHANGED, forcePlaybackRate);
@@ -55,6 +64,7 @@ function refreshVideo(): void {
   if (current === video) return;
   detachVideo();
   video = current;
+  if (video) pitchOwner.set(video, preservesPitch);
   video?.addEventListener('ratechange', forcePlaybackRate);
   video?.addEventListener('peard:src-changed', forcePlaybackRate);
   video?.addEventListener(PLAYBACK_RATE_OWNER_CHANGED, forcePlaybackRate);
@@ -89,7 +99,16 @@ function observePopup(): void {
   placeSlider();
 }
 
-export const onPlayerApiReady = () => {
+export const onConfigChange = (config: PlaybackSpeedConfig) => {
+  configRevision += 1;
+  preservesPitch = config.preservesPitch !== false;
+  if (active && video) pitchOwner.set(video, preservesPitch);
+};
+
+export const onPlayerApiReady = (
+  _player?: MusicPlayer,
+  context?: RendererContext<PlaybackSpeedConfig>,
+) => {
   if (active) return;
   active = true;
   const currentGeneration = ++generation;
@@ -123,13 +142,14 @@ export const onPlayerApiReady = () => {
           if (!active || currentGeneration !== generation) return;
           event.preventDefault();
           if (isNaN(speed())) setSpeed(1);
-          setSpeed((previous) =>
-            roundToTwo(
-              event.deltaY < 0
-                ? Math.min(previous + 0.01, MAX_PLAYBACK_SPEED)
-                : Math.max(previous - 0.01, MIN_PLAYBACK_SPEED),
-            ),
+          const previous = speed();
+          const target = roundToTwo(
+            event.deltaY < 0
+              ? Math.min(previous + 0.01, MAX_PLAYBACK_SPEED)
+              : Math.max(previous - 0.01, MIN_PLAYBACK_SPEED),
           );
+          if (target === previous) return;
+          setSpeed(target);
           updatePlaybackSpeed();
         }}
         speed={speed()}
@@ -160,6 +180,17 @@ export const onPlayerApiReady = () => {
   document.addEventListener('videodatachange', dataHandler);
   observePopup();
   refreshVideo();
+  const revision = configRevision;
+  if (context)
+    return Promise.resolve(context.getConfig()).then((config) => {
+      if (
+        active &&
+        currentGeneration === generation &&
+        revision === configRevision
+      )
+        onConfigChange(config);
+    });
+  return;
 };
 
 export const onUnload = () => {
@@ -179,4 +210,5 @@ export const onUnload = () => {
   dispose = null;
   sliderContainer.replaceChildren();
   sliderContainer.remove();
+  preservesPitch = true;
 };

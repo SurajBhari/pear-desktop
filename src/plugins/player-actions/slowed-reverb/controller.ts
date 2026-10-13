@@ -1,4 +1,5 @@
 import { t } from '@/i18n';
+import { createPlaybackPitchOwner } from '@/plugins/utils/renderer/playback-pitch-owner';
 import {
   claimPlaybackRate,
   getUnforcedPlaybackRate,
@@ -43,20 +44,6 @@ interface FeatureContext<Slice> {
   setConfig: (patch: Partial<Slice>) => void | Promise<void>;
 }
 
-type PitchKey = 'preservesPitch' | 'mozPreservesPitch' | 'webkitPreservesPitch';
-
-interface SavedPitch {
-  preservesPitch?: boolean;
-  mozPreservesPitch?: boolean;
-  webkitPreservesPitch?: boolean;
-}
-
-const PITCH_KEYS: PitchKey[] = [
-  'preservesPitch',
-  'mozPreservesPitch',
-  'webkitPreservesPitch',
-];
-
 const PLUGIN_ID = 'slowed-reverb';
 // Native registration survives node teardown; weak keys do not retain old graphs.
 const registeredWorklets = new WeakSet<AudioContext>();
@@ -66,48 +53,6 @@ const DEFAULT_CONFIG: SlowedReverbConfig = {
   reverbIntensity: 0,
   active: true,
 };
-
-function readPitch(video: HTMLVideoElement): SavedPitch {
-  const record = video as unknown as Record<PitchKey, unknown>;
-  const saved: SavedPitch = {};
-  if (typeof record.preservesPitch === 'boolean') {
-    saved.preservesPitch = record.preservesPitch;
-  }
-  if (typeof record.mozPreservesPitch === 'boolean') {
-    saved.mozPreservesPitch = record.mozPreservesPitch;
-  }
-  if (typeof record.webkitPreservesPitch === 'boolean') {
-    saved.webkitPreservesPitch = record.webkitPreservesPitch;
-  }
-  return saved;
-}
-
-function writePitchValue(
-  video: HTMLVideoElement,
-  key: PitchKey,
-  value: boolean,
-): void {
-  if (!(key in video)) return;
-  (video as unknown as Record<PitchKey, unknown>)[key] = value;
-}
-
-function clearPitch(video: HTMLVideoElement): void {
-  for (const key of PITCH_KEYS) {
-    writePitchValue(video, key, false);
-  }
-}
-
-function restorePitch(video: HTMLVideoElement, saved: SavedPitch): void {
-  if (saved.preservesPitch !== undefined) {
-    writePitchValue(video, 'preservesPitch', saved.preservesPitch);
-  }
-  if (saved.mozPreservesPitch !== undefined) {
-    writePitchValue(video, 'mozPreservesPitch', saved.mozPreservesPitch);
-  }
-  if (saved.webkitPreservesPitch !== undefined) {
-    writePitchValue(video, 'webkitPreservesPitch', saved.webkitPreservesPitch);
-  }
-}
 
 function retireWorklet(node: AudioWorkletNode): void {
   try {
@@ -143,7 +88,7 @@ export interface SlowedReverbController {
   wiredSource: MediaElementAudioSourceNode | null;
   video: HTMLVideoElement | null;
   originalRate: number;
-  savedPitch: SavedPitch | null;
+  pitchOwner: ReturnType<typeof createPlaybackPitchOwner>;
   watchdog: ReturnType<typeof setInterval> | null;
   section: SlowedReverbSectionHandle | null;
   audioHandler: ((event: Event) => void) | null;
@@ -196,7 +141,7 @@ export function createSlowedReverbController(): SlowedReverbController {
     wiredSource: null,
     video: null,
     originalRate: 1,
-    savedPitch: null,
+    pitchOwner: createPlaybackPitchOwner(PLUGIN_ID),
     watchdog: null,
     section: null,
     audioHandler: null,
@@ -655,14 +600,13 @@ export function createSlowedReverbController(): SlowedReverbController {
           video,
           Number.isFinite(video.playbackRate) ? video.playbackRate : 1,
         );
-        this.savedPitch = readPitch(video);
         // pitchOverridden described the previous element; a replacement
         // element carries its own default pitch flags.
         this.pitchOverridden = false;
       }
       if (isPlaybackRateControlledByOther(PLUGIN_ID, video)) {
         // Another plugin owns the rate: yield instead of fighting, but undo
-        // our pitch override so its playback stays pitch-preserved.
+        // our pitch lease so the current owner's preference can apply.
         this.releasePitchOverride(video);
         this.attachRateListeners();
         return;
@@ -670,13 +614,11 @@ export function createSlowedReverbController(): SlowedReverbController {
       const target = slow !== 1 ? slow : this.originalRate;
       // No-op writes fire no ratechange: never write when already at target.
       if (Math.abs(video.playbackRate - target) <= 0.001) {
-        // Rate is already right, but pitch handling still belongs to this
-        // branch: clearPitch()/releasePitchOverride() otherwise only run on
-        // the rate-write path, leaving a matching rate pitch-preserved.
+        // Same-rate playback still needs the current owner's pitch preference.
         if (slow !== 1) {
           try {
             if (!this.pitchOverridden) {
-              clearPitch(video);
+              this.pitchOwner.set(video, false);
               this.pitchOverridden = true;
             }
           } catch {}
@@ -690,7 +632,7 @@ export function createSlowedReverbController(): SlowedReverbController {
       }
       try {
         if (slow !== 1) {
-          clearPitch(video);
+          this.pitchOwner.set(video, false);
           this.pitchOverridden = true;
           video.playbackRate = slow;
         } else {
@@ -707,9 +649,7 @@ export function createSlowedReverbController(): SlowedReverbController {
       if (!this.pitchOverridden) return;
       // Only restore flags we set on this element; after a <video> swap the
       // new element carries its own defaults.
-      if (video === this.video && this.savedPitch) {
-        restorePitch(video, this.savedPitch);
-      }
+      if (video === this.video) this.pitchOwner.release();
       this.pitchOverridden = false;
     },
 
@@ -836,7 +776,7 @@ export function createSlowedReverbController(): SlowedReverbController {
         return;
       }
       try {
-        if (this.savedPitch) restorePitch(video, this.savedPitch);
+        this.pitchOwner.release();
         // Don't stomp a rate another plugin took over while we were loaded
         // (only relevant when we never held the rate in the first place).
         if (!isPlaybackRateControlledByOther(PLUGIN_ID, video)) {
