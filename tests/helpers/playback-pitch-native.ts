@@ -35,12 +35,18 @@ export async function playbackPitchNative<T>(
           enforce: 'pre',
           async resolveId(id, importer) {
             if (id === 'solid-js')
-              return requireRoot.resolve('solid-js/dist/solid.js');
+              return requireRoot
+                .resolve('solid-js/dist/solid.js')
+                .replaceAll('\\', '/');
             if (id === 'solid-js/web')
-              return requireRoot.resolve('solid-js/web/dist/web.js');
+              return requireRoot
+                .resolve('solid-js/web/dist/web.js')
+                .replaceAll('\\', '/');
             if (
               id === './components/slider' &&
-              importer?.endsWith('/playback-speed/renderer.tsx')
+              importer
+                ?.replaceAll('\\', '/')
+                .endsWith('/playback-speed/renderer.tsx')
             )
               return '\0pitch-slider';
             if (
@@ -58,7 +64,7 @@ export async function playbackPitchNative<T>(
               for (const suffix of ['.ts', '.tsx', '/index.ts']) {
                 try {
                   await access(target + suffix);
-                  return target + suffix;
+                  return (target + suffix).replaceAll('\\', '/');
                 } catch {
                   /* next */
                 }
@@ -78,6 +84,15 @@ export async function playbackPitchNative<T>(
               return 'export const isMusicOrVideoTrack=()=>true;export const isPlayerMenu=()=>true;';
             if (id === '\0pitch-css') return 'export default "";';
             return undefined;
+          },
+          generateBundle() {
+            const identities = [...this.getModuleIds()].filter((id) =>
+              id.replaceAll('\\', '/').endsWith('/playback-rate-owner.ts'),
+            );
+            if (identities.length !== 1)
+              this.error(
+                `Expected one playback rate owner, found ${identities.length}`,
+              );
           },
         },
       ],

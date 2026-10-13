@@ -181,9 +181,13 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
         enforce: 'pre',
         async resolveId(id: string, importer?: string) {
           if (id === 'solid-js')
-            return requireRoot.resolve('solid-js/dist/solid.js');
+            return requireRoot
+              .resolve('solid-js/dist/solid.js')
+              .replaceAll('\\', '/');
           if (id === 'solid-js/web')
-            return requireRoot.resolve('solid-js/web/dist/web.js');
+            return requireRoot
+              .resolve('solid-js/web/dist/web.js')
+              .replaceAll('\\', '/');
           if (
             id === './components/slider' &&
             importer
@@ -201,7 +205,7 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
             for (const suffix of ['.ts', '.tsx', '/index.ts']) {
               try {
                 await access(target + suffix);
-                return target + suffix;
+                return (target + suffix).replaceAll('\\', '/');
               } catch {
                 /* next */
               }
@@ -232,6 +236,15 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
             return 'export const getSongInfo=()=>({});';
           if (id === '\0css') return 'export default "";';
           return undefined;
+        },
+        generateBundle() {
+          const identities = [...this.getModuleIds()].filter((id) =>
+            id.replaceAll('\\', '/').endsWith('/playback-rate-owner.ts'),
+          );
+          if (identities.length !== 1)
+            this.error(
+              `Expected one playback rate owner, found ${identities.length}`,
+            );
         },
       },
     ],
