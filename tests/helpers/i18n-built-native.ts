@@ -11,10 +11,11 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { _electron as electron, test } from '@playwright/test';
 import { normalizePath } from 'vite';
+import { nativeStartupPid } from './electron-startup.js';
 const root = path.resolve(import.meta.dirname, '../..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
 const execute = promisify(execFile);
@@ -75,16 +76,11 @@ const parentSources=${JSON.stringify(parentSources)};export default async enviro
 /** Main-process evidence independent of Playwright's startup inspector handle. */
 export async function nativeLocaleProof(f: {
   owned: string;
-  app: {
-    process(): {
-      pid?: number;
-      exitCode: number | null;
-      signalCode: string | null;
-    };
-  };
+  nativePid: number;
+  app: { process(): ChildProcess };
 }) {
-  const process = f.app.process();
-  if (process.exitCode !== null || process.signalCode !== null)
+  const child = f.app.process();
+  if (child.exitCode !== null || child.signalCode !== null)
     throw Error('Owned locale process exited before native proof');
   let value: string;
   try {
@@ -93,8 +89,9 @@ export async function nativeLocaleProof(f: {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
+  process.kill(f.nativePid, 0);
   const proof = JSON.parse(value);
-  if (proof.pid !== process.pid)
+  if (proof.pid !== f.nativePid)
     throw Error('Native locale proof PID mismatch');
   return proof;
 }
@@ -191,6 +188,16 @@ export async function nativeLocale(
     ],
     env,
   });
+  // Windows Playwright launches through cmd.exe. Resolve only its direct
+  // Electron child with the independently verified canonical executable.
+  let nativePid: number;
+  try {
+    nativePid = await nativeStartupPid(app.process());
+  } catch (error) {
+    await app.close().catch(() => {});
+    await rm(owned, { recursive: true, force: true });
+    throw error;
+  }
   let transcript = '';
   app.process().stdout?.on('data', (data) => {
     transcript += String(data);
@@ -200,6 +207,7 @@ export async function nativeLocale(
   });
   return {
     app,
+    nativePid,
     owned,
     profile,
     appRoot,

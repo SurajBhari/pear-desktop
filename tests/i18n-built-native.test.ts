@@ -176,7 +176,7 @@ test('compiled slow selection from a closed owner cannot publish; replacement re
     expect(replacementProof.windows.some((win: any) => win.id === oldId)).toBe(
       false,
     );
-    expect(replacementProof.pid).toBe(f.app.process().pid);
+    expect(replacementProof.pid).toBe(f.nativePid);
     expect(f.app.process().exitCode).toBeNull();
     expect(f.app.process().signalCode).toBeNull();
   } finally {
