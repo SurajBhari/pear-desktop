@@ -10,6 +10,7 @@ import {
 
 import { API_VERSION } from '../api-version';
 import {
+  AddPlaylistToQueueSchema,
   AddSongToQueueSchema,
   GoBackSchema,
   GoForwardScheme,
@@ -26,6 +27,7 @@ import {
 } from '../scheme';
 
 import type { APIServerConfig } from '../../config';
+import type { LegacyClockCapture } from '../legacy-clock';
 import type { HonoApp } from '../types';
 import type { SongInfo } from '@/providers/song-info';
 import type { BackendContext } from '@/types/contexts';
@@ -471,6 +473,34 @@ const routes = {
       },
     },
   }),
+  addPlaylistToQueue: createRoute({
+    method: 'post',
+    path: `/api/${API_VERSION}/queue/playlist`,
+    summary: 'Add a verified playlist batch to the queue',
+    description:
+      'One response of at most 1000 tracks; explicit continuations are rejected. Completion confirms an owned queue dispatch or empty no-op, not later playback. An absent valid starting video preserves the whole verified batch.',
+    request: {
+      body: {
+        content: { 'application/json': { schema: AddPlaylistToQueueSchema } },
+      },
+    },
+    responses: {
+      204: {
+        description:
+          'Owned renderer queue update accepted; an empty verified batch is a no-op.',
+      },
+      400: { description: 'Invalid playlist, video or insertion input.' },
+      401: { description: 'Unauthorized.' },
+      409: { description: 'Owner retired or queue busy.' },
+      502: {
+        description:
+          'Service response unavailable, malformed, oversized or continued.',
+      },
+      504: {
+        description: 'Completion timed out; the renderer request is retired.',
+      },
+    },
+  }),
   moveSongInQueue: createRoute({
     method: 'patch',
     path: `/api/${API_VERSION}/queue/{index}`,
@@ -576,6 +606,10 @@ export const register = (
   repeatModeGetter: () => PromiseOrValue<RepeatMode | undefined>,
   likeTypeGetter: () => PromiseOrValue<LikeType | undefined>,
   volumeStateGetter: () => PromiseOrValue<VolumeState | undefined>,
+  preciseClock?: (
+    info: SongInfo,
+    ctx: Context,
+  ) => Promise<number | LegacyClockCapture | undefined>,
 ) => {
   const controller = getSongControls(window);
 
@@ -736,8 +770,25 @@ export const register = (
       return ctx.body(null);
     }
 
-    const body = { ...info };
+    const body: SongInfo & { elapsedMilliseconds?: number } = { ...info };
     delete body.image;
+    try {
+      const captured = await preciseClock?.(info, ctx);
+      const milliseconds =
+        typeof captured === 'number'
+          ? captured
+          : captured?.isCurrent()
+            ? captured.elapsedMilliseconds
+            : undefined;
+      if (
+        typeof milliseconds === 'number' &&
+        Number.isFinite(milliseconds) &&
+        milliseconds >= 0
+      )
+        body.elapsedMilliseconds = milliseconds;
+    } catch {
+      // Optional native precision cannot turn compatible metadata into an error.
+    }
 
     ctx.status(200);
     return ctx.json(body satisfies ResponseSongInfo);
@@ -831,6 +882,31 @@ export const register = (
 
     ctx.status(204);
     return ctx.body(null);
+  });
+  app.openapi(routes.addPlaylistToQueue, async (ctx) => {
+    const { playlistId, videoId, insertPosition } = ctx.req.valid('json');
+    const scope = ctx.get('playlistQueueSignal');
+    const signal = scope
+      ? AbortSignal.any([scope, ctx.req.raw.signal])
+      : ctx.req.raw.signal;
+    const result = await controller.addPlaylistToQueue(
+      playlistId,
+      videoId,
+      insertPosition,
+      signal,
+    );
+    if (result.ok) {
+      ctx.status(204);
+      return ctx.body(null);
+    }
+    const statuses = {
+      invalid: 400,
+      retired: 409,
+      busy: 409,
+      service: 502,
+      timeout: 504,
+    } as const;
+    return ctx.json({ error: result.reason }, statuses[result.reason]);
   });
   app.openapi(routes.moveSongInQueue, (ctx) => {
     const index = Number(ctx.req.param('index'));

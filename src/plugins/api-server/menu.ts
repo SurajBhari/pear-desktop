@@ -1,14 +1,16 @@
 import prompt from 'custom-electron-prompt';
-import { dialog } from 'electron';
+import { clipboard, dialog } from 'electron';
 
 import { t } from '@/i18n';
 import promptOptions from '@/providers/prompt-options';
 
+import { getMusicService } from './backend/music-service';
 import {
   type APIServerConfig,
   AuthStrategy,
   defaultAPIServerConfig,
 } from './config';
+import { createMusicGrantMenu } from './music-menu';
 
 import type { MenuTemplate } from '@/menu';
 import type { MenuContext } from '@/types/contexts';
@@ -20,7 +22,27 @@ export const onMenu = async ({
 }: MenuContext<APIServerConfig>): Promise<MenuTemplate> => {
   const config = await getConfig();
 
+  const musicMenu = await createMusicGrantMenu(
+    { getConfig, setConfig, window, refresh: () => {} },
+    () => getMusicService(window),
+    {
+      prompt: async () =>
+        (await prompt(
+          {
+            title: 'Music API client name',
+            label: 'Client name',
+            type: 'input',
+            width: 380,
+            ...promptOptions(),
+          },
+          window,
+        )) ?? null,
+      show: (options) => dialog.showMessageBox(window, options),
+      copy: (token) => clipboard.writeText(token),
+    },
+  );
   return [
+    { label: 'Expanded music API', type: 'submenu', submenu: musicMenu },
     {
       label: t('plugins.api-server.menu.hostname.label'),
       type: 'normal',

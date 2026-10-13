@@ -190,6 +190,20 @@ export const TitleBar = (props: TitleBarProps) => {
   const [openTarget, setOpenTarget] = createSignal<HTMLElement | null>(null);
   const [menu, setMenu] = createSignal<Menu | null>(null);
   const [mouseY, setMouseY] = createSignal(0);
+  let scrollFrame: number | undefined;
+  let scrollLayout: HTMLElement | null = null;
+  let wasScrolled = false;
+  const onScroll = () => {
+    if (scrollFrame !== undefined) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = undefined;
+      if (!scrollLayout) return;
+      const scrolled = scrollLayout.scrollTop > 20;
+      if (scrolled === wasScrolled) return;
+      wasScrolled = scrolled;
+      scrollLayout.classList.toggle('content-scrolled', scrolled);
+    });
+  };
 
   const [data, { refetch }] = createResource(
     async () => (await props.ipc.invoke('get-menu')) as Promise<Menu | null>,
@@ -302,15 +316,10 @@ export const TitleBar = (props: TitleBarProps) => {
 
     // tracking mouse position
     window.addEventListener('mousemove', listener);
-    const ytmusicAppLayout = document.querySelector<HTMLElement>('#layout');
-    ytmusicAppLayout?.addEventListener('scroll', () => {
-      const scrollValue = ytmusicAppLayout.scrollTop;
-      if (scrollValue > 20) {
-        ytmusicAppLayout.classList.add('content-scrolled');
-      } else {
-        ytmusicAppLayout.classList.remove('content-scrolled');
-      }
-    });
+    scrollLayout = document.querySelector<HTMLElement>('#layout');
+    wasScrolled = scrollLayout?.classList.contains('content-scrolled') ?? false;
+    scrollLayout?.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
   });
 
   createEffect(() => {
@@ -321,6 +330,10 @@ export const TitleBar = (props: TitleBarProps) => {
 
   onCleanup(() => {
     window.removeEventListener('mousemove', listener);
+    if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
+    scrollFrame = undefined;
+    scrollLayout?.removeEventListener('scroll', onScroll);
+    scrollLayout = null;
   });
 
   return (
@@ -382,6 +395,7 @@ export const TitleBar = (props: TitleBarProps) => {
           const index = Number(element.getAttribute('data-index') ?? 0);
           const length = Number(element.getAttribute('data-length') ?? 1);
 
+          // oxfmt-ignore
           (element as HTMLElement).style.setProperty(
             'transition-delay',
             `${(length * 0.025) - (index * 0.025)}s`,

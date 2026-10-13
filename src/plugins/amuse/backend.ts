@@ -3,31 +3,61 @@ import { type Context, Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { t } from 'i18next';
 
-import { registerCallback, type SongInfo } from '@/providers/song-info';
+import {
+  MediaType,
+  registerCallback,
+  type SongInfo,
+} from '@/providers/song-info';
 import { createBackend } from '@/utils';
 
 import type { AmuseSongInfo } from './types';
 
 const amusePort = 9863;
 
-const formatSongInfo = (info: SongInfo) => {
-  const formattedSongInfo: AmuseSongInfo = {
+const seconds = (value: number | undefined) =>
+  Number.isFinite(value) ? Math.max(0, Math.floor(value!)) : 0;
+const humanTime = (value: number) =>
+  `${Math.floor(value / 60)}:${(value % 60).toString().padStart(2, '0')}`;
+
+// Complete 6K Labs contract adapted from upstream #4721 (@aashish254).
+const formatSongInfo = (info: SongInfo): AmuseSongInfo => {
+  const hasSong = !!(info.artist && info.title);
+  const elapsed = hasSong ? seconds(info.elapsedSeconds) : 0;
+  const duration = hasSong ? seconds(info.songDuration) : 0;
+  return {
     player: {
-      hasSong: !!(info.artist && info.title),
-      isPaused: info.isPaused ?? false,
-      seekbarCurrentPosition: info.elapsedSeconds ?? 0,
+      hasSong,
+      isPaused: hasSong ? (info.isPaused ?? false) : true,
+      volumePercent: 0,
+      seekbarCurrentPosition: elapsed,
+      seekbarCurrentPositionHuman: humanTime(elapsed),
+      statePercent:
+        duration > 0
+          ? Math.min(100, Math.round((elapsed / duration) * 100))
+          : 0,
+      likeStatus: 'INDIFFERENT',
+      repeatType: 'NONE',
     },
     track: {
-      duration: info.songDuration,
-      title: info.title,
-      author: info.artist,
-      cover: info.imageSrc ?? '',
-      url: info.url ?? '',
-      id: info.videoId,
+      duration,
+      durationHuman: humanTime(duration),
+      title: hasSong ? info.title : '',
+      author: hasSong ? info.artist : '',
+      album: hasSong ? (info.album ?? '') : '',
+      cover: hasSong ? (info.imageSrc ?? '') : '',
+      url: hasSong ? (info.url ?? '') : '',
+      id: hasSong ? (info.videoId ?? '') : '',
+      isVideo:
+        hasSong &&
+        [
+          MediaType.OriginalMusicVideo,
+          MediaType.UserGeneratedContent,
+          MediaType.OtherVideo,
+        ].includes(info.mediaType),
       isAdvertisement: false,
+      inLibrary: false,
     },
   };
-  return formattedSongInfo;
 };
 
 export default createBackend({

@@ -3,6 +3,7 @@ import path from 'node:path';
 import url from 'node:url';
 
 import ErrorHtmlAsset from '@assets/error.html?asset';
+import musicPlayerIcon from '@assets/icon.png?asset&asarUnpack';
 import {
   enhanceWebRequest,
   type BetterSession,
@@ -26,7 +27,7 @@ import unhandled from 'electron-unhandled';
 import electronUpdater from 'electron-updater';
 import { deepEqual } from 'fast-equals';
 import { parse } from 'node-html-parser';
-import { languageResources } from 'virtual:i18n';
+import { availableLanguages } from 'virtual:i18n';
 import { allPlugins, mainPlugins } from 'virtual:plugins';
 
 import * as config from '@/config';
@@ -49,10 +50,12 @@ import {
   setupProtocolHandler,
 } from '@/providers/protocol-handler';
 import { setupSongInfo } from '@/providers/song-info';
+import { setupInitialWindowVisibility } from '@/providers/window-visibility';
 import { setUpTray } from '@/tray';
 import { LoggerPrefix } from '@/utils';
 import { isTesting } from '@/utils/testing';
 
+import type { ShortcutsPluginConfig } from '@/plugins/shortcuts';
 import type { PluginConfig } from '@/types/plugins';
 
 // Catch errors and log them
@@ -143,6 +146,15 @@ if (is.linux()) {
   );
 }
 
+// Release hardware keys to globalShortcut before Chromium becomes ready.
+if (!is.linux()) {
+  const shortcuts =
+    config.plugins.getOptions<ShortcutsPluginConfig>('shortcuts');
+  if (shortcuts?.enabled && shortcuts.overrideMediaKeys) {
+    disabledFeatures.push('HardwareMediaKeyHandling');
+  }
+}
+
 if (disableHardwareAcceleration) {
   if (is.dev()) console.log('Disabling hardware acceleration');
   app.disableHardwareAcceleration();
@@ -184,6 +196,15 @@ if (process.platform === 'win32') {
   icon = 'assets/generated/icons/mac/icon.icns';
 }
 
+app.setAboutPanelOptions({
+  applicationName: APPLICATION_NAME,
+  applicationVersion: app.getVersion(),
+  version: app.getVersion(),
+  iconPath: musicPlayerIcon,
+  copyright: 'Pear Desktop contributors; fork maintained by deruta74',
+  website: 'https://github.com/deruta74/pear-desktop',
+});
+
 function onClosed() {
   // Dereference the window
   // For multiple Windows store them in an array
@@ -194,8 +215,17 @@ ipcMain.handle('peard:get-main-plugin-names', async () =>
   Object.keys(await mainPlugins()),
 );
 
+let configIpcRegistered = false;
+let configWatcherRegistered = false;
+let configWindow: BrowserWindow | undefined;
+
 const initHook = async (win: BrowserWindow) => {
   const allPluginStubs = await allPlugins();
+  if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+  configWindow = win;
+  win.once('closed', () => {
+    if (configWindow === win) configWindow = undefined;
+  });
 
   const apiServerConfig = allPluginStubs['api-server']?.config as
     | (PluginConfig & { secret?: string })
@@ -208,68 +238,98 @@ const initHook = async (win: BrowserWindow) => {
     config.setPartial('plugins.api-server', newConfig, apiServerConfig);
   }
 
-  ipcMain.handle(
-    'peard:get-config',
-    (_, id: string) =>
-      deepmerge(
-        allPluginStubs[id].config ?? { enabled: false },
-        config.get(`plugins.${id}`) ?? {},
-      ) as PluginConfig,
-  );
-  ipcMain.handle('peard:set-config', (_, name: string, obj: object) =>
-    config.setPartial(`plugins.${name}`, obj, allPluginStubs[name].config),
-  );
-
-  config.watch((newValue, oldValue) => {
-    const newPluginConfigList = (newValue?.plugins ?? {}) as Record<
-      string,
-      unknown
-    >;
-    const oldPluginConfigList = (oldValue?.plugins ?? {}) as Record<
-      string,
-      unknown
-    >;
-
-    Object.entries(newPluginConfigList).forEach(([id, newPluginConfig]) => {
-      const isEqual = deepEqual(oldPluginConfigList[id], newPluginConfig);
-
-      if (!isEqual) {
-        const oldConfig = oldPluginConfigList[id] as PluginConfig;
-        const config = deepmerge(
+  if (!configIpcRegistered) {
+    ipcMain.handle(
+      'peard:get-config',
+      (_, id: string) =>
+        deepmerge(
           allPluginStubs[id].config ?? { enabled: false },
-          newPluginConfig ?? {},
-        ) as PluginConfig;
+          config.get(`plugins.${id}`) ?? {},
+        ) as PluginConfig,
+    );
+    ipcMain.handle('peard:set-config', (_, name: string, obj: object) =>
+      config.setPartial(`plugins.${name}`, obj, allPluginStubs[name].config),
+    );
+    configIpcRegistered = true;
+  }
 
-        if (config.enabled !== oldConfig?.enabled) {
-          if (config.enabled) {
-            win.webContents.send('plugin:enable', id);
-            ipcMain.emit('plugin:enable', id);
-            forceLoadMainPlugin(id, win);
-          } else {
-            win.webContents.send('plugin:unload', id);
-            ipcMain.emit('plugin:unload', id);
-            forceUnloadMainPlugin(id, win);
-          }
-
-          if (allPluginStubs[id]?.restartNeeded) {
-            showNeedToRestartDialog(id);
-          }
-        }
-
-        const mainPlugin = getAllLoadedMainPlugins()[id];
-        if (mainPlugin) {
-          if (config.enabled && typeof mainPlugin.backend !== 'function') {
-            mainPlugin.backend?.onConfigChange?.call(
-              mainPlugin.backend,
-              config,
-            );
-          }
-        }
-
-        win.webContents.send('config-changed', id, config);
-      }
+  if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+    let shareLinksAlive = true;
+    let shareLinksEnabled =
+      config.get('options.stripMusicFromSharedLinks') === true;
+    const releaseShareLinksWatch = config.watch(() => {
+      if (
+        !shareLinksAlive ||
+        win.isDestroyed() ||
+        win.webContents.isDestroyed()
+      )
+        return;
+      const enabled = config.get('options.stripMusicFromSharedLinks') === true;
+      if (enabled === shareLinksEnabled) return;
+      shareLinksEnabled = enabled;
+      win.webContents.send('peard:strip-music-from-shared-links', enabled);
     });
-  });
+    win.once('closed', () => {
+      shareLinksAlive = false;
+      releaseShareLinksWatch();
+    });
+  }
+
+  if (!configWatcherRegistered) {
+    config.watch((newValue, oldValue) => {
+      const win = configWindow;
+      if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+      const newPluginConfigList = (newValue?.plugins ?? {}) as Record<
+        string,
+        unknown
+      >;
+      const oldPluginConfigList = (oldValue?.plugins ?? {}) as Record<
+        string,
+        unknown
+      >;
+
+      Object.entries(newPluginConfigList).forEach(([id, newPluginConfig]) => {
+        const isEqual = deepEqual(oldPluginConfigList[id], newPluginConfig);
+
+        if (!isEqual) {
+          const oldConfig = oldPluginConfigList[id] as PluginConfig;
+          const config = deepmerge(
+            allPluginStubs[id].config ?? { enabled: false },
+            newPluginConfig ?? {},
+          ) as PluginConfig;
+
+          if (config.enabled !== oldConfig?.enabled) {
+            if (config.enabled) {
+              win.webContents.send('plugin:enable', id);
+              ipcMain.emit('plugin:enable', id);
+              forceLoadMainPlugin(id, win);
+            } else {
+              win.webContents.send('plugin:unload', id);
+              ipcMain.emit('plugin:unload', id);
+              forceUnloadMainPlugin(id, win);
+            }
+
+            if (allPluginStubs[id]?.restartNeeded) {
+              showNeedToRestartDialog(id);
+            }
+          }
+
+          const mainPlugin = getAllLoadedMainPlugins()[id];
+          if (mainPlugin) {
+            if (config.enabled && typeof mainPlugin.backend !== 'function') {
+              mainPlugin.backend?.onConfigChange?.call(
+                mainPlugin.backend,
+                config,
+              );
+            }
+          }
+
+          win.webContents.send('config-changed', id, config);
+        }
+      });
+    });
+    configWatcherRegistered = true;
+  }
 };
 
 const showNeedToRestartDialog = async (id: string) => {
@@ -395,6 +455,13 @@ async function createMainWindow() {
   };
 
   const win = new BrowserWindow(electronWindowSettings);
+  win.on('closed', onClosed);
+
+  await setLanguage(
+    config.get('options.language') ?? 'en',
+    () => !win.isDestroyed() && !win.webContents.isDestroyed(),
+  );
+  if (win.isDestroyed() || win.webContents.isDestroyed()) return win;
 
   await initHook(win);
   initTheme(win);
@@ -416,6 +483,8 @@ async function createMainWindow() {
     const scaledX = windowX;
     const scaledY = windowY;
 
+    // Keep arithmetic grouping required by no-mixed-operators.
+    // oxfmt-ignore
     if (
       scaledX + (scaledWidth / 2) < display.bounds.x - 8 || // Left
       scaledX + (scaledWidth / 2) > display.bounds.x + display.bounds.width || // Right
@@ -450,7 +519,6 @@ async function createMainWindow() {
   const urlToLoad = config.get('options.resumeOnStart')
     ? config.get('url')
     : config.defaultConfig.url;
-  win.on('closed', onClosed);
 
   win.on('move', () => {
     if (win.isMaximized()) {
@@ -503,11 +571,9 @@ async function createMainWindow() {
     showUnresponsiveDialog(win, details);
   });
 
-  win.once('ready-to-show', () => {
-    if (config.get('options.appVisible')) {
-      win.show();
-    }
-  });
+  setupInitialWindowVisibility(win, () =>
+    Boolean(config.get('options.appVisible')),
+  );
 
   removeContentSecurityPolicy();
 
@@ -648,18 +714,21 @@ app.on('activate', async () => {
   // On OS X it's common to re-create a window in the app when the
   // dock icon is clicked and there are no other windows open.
   if (mainWindow === null) {
-    mainWindow = await createMainWindow();
+    const win = await createMainWindow();
+    if (win.isDestroyed()) return;
+    mainWindow = win;
+    await refreshMenu(win, () => mainWindow === win && !win.isDestroyed());
   } else if (!mainWindow.isVisible()) {
     mainWindow.show();
   }
 });
 
-const getDefaultLocale = async (locale: string) =>
-  Object.keys(await languageResources()).includes(locale) ? locale : null;
+const getDefaultLocale = (locale: string) =>
+  availableLanguages.includes(locale) ? locale : null;
 
 app.whenReady().then(async () => {
   if (!config.get('options.language')) {
-    const locale = await getDefaultLocale(app.getLocale());
+    const locale = getDefaultLocale(app.getLocale());
     if (locale) {
       config.set('options.language', locale);
     }
@@ -780,6 +849,10 @@ app.whenReady().then(async () => {
   });
 
   mainWindow = await createMainWindow();
+  if (mainWindow.isDestroyed()) {
+    mainWindow = null;
+    return;
+  }
   await setApplicationMenu(mainWindow);
   await refreshMenu(mainWindow);
   setUpTray(app, mainWindow);

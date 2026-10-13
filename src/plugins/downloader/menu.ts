@@ -6,7 +6,7 @@ import { t } from '@/i18n';
 import promptOptions from '@/providers/prompt-options';
 
 import { type DownloaderPluginConfig, defaultConfig } from './index';
-import { downloadPlaylist } from './main';
+import { downloadPlaylist, openDownloaderSettings } from './main';
 import { getFolder } from './main/utils';
 import { DefaultPresetList } from './types';
 
@@ -20,6 +20,10 @@ export const onMenu = async ({
   const config = await getConfig();
 
   return [
+    {
+      label: t('plugins.downloader.quality.open'),
+      click: openDownloaderSettings,
+    },
     {
       label: t('plugins.downloader.menu.download-finish-settings.label'),
       type: 'submenu',

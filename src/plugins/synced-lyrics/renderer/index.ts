@@ -3,10 +3,17 @@ import { createRenderer } from '@/utils';
 
 import { resetLyricsPickerSelection } from './components/LyricsPicker';
 import { disposeReactiveRoot } from './reactive-root';
-import { setConfig, setCurrentTime, startLyricsEffects } from './renderer';
 import {
+  config as currentConfig,
+  setConfig,
+  setCurrentTime,
+  startLyricsEffects,
+} from './renderer';
+import {
+  currentLyrics,
   fetchLyrics,
   invalidateLyricsTrack,
+  retrySearch,
   startLyricsSession,
   stopLyricsSession,
 } from './store';
@@ -17,6 +24,8 @@ import {
   tabStates,
   waitForLyricsElement,
 } from './utils';
+
+import { ProviderNames } from '../providers';
 
 import type { SyncedLyricsPluginConfig } from '../types';
 import type { SongInfo } from '@/providers/song-info';
@@ -31,6 +40,12 @@ export let netFetch: (
   url: string,
   init?: RequestInit,
 ) => Promise<[number, string, Record<string, string>]> = unavailableFetch;
+
+export type LyricsExportStatus = 'saved' | 'cancelled' | 'invalid' | 'error';
+const unavailableExport = (): Promise<LyricsExportStatus> =>
+  Promise.resolve('cancelled');
+export let exportCurrentLyrics: () => Promise<LyricsExportStatus> =
+  unavailableExport;
 
 const verifiedApiVideoId = (api: MusicPlayer): string | null => {
   try {
@@ -65,7 +80,18 @@ export const renderer = createRenderer<
   generation: 0,
   active: false,
   onConfigChange(newConfig) {
-    if (this.active) setConfig(newConfig);
+    if (!this.active) return;
+    const changed =
+      (currentConfig()?.useYTMLyricsWithoutProxy === true) !==
+      (newConfig.useYTMLyricsWithoutProxy === true);
+    setConfig(newConfig);
+    if (!changed || !_ytAPI) return;
+    const song = getSongInfo();
+    if (
+      verifiedApiVideoId(_ytAPI) === song.videoId &&
+      (this.nativeVideoId === undefined || this.nativeVideoId === song.videoId)
+    )
+      retrySearch(ProviderNames.YTMusic, song);
   },
   observerCallback(mutations) {
     for (const mutation of mutations) {
@@ -179,6 +205,31 @@ export const renderer = createRenderer<
       if (!ctx.ipc.subscribe)
         throw new Error('Lyrics renderer requires owned IPC subscriptions');
       netFetch = ctx.ipc.invoke.bind(ctx.ipc, 'synced-lyrics:fetch');
+      exportCurrentLyrics = async () => {
+        const song = getSongInfo();
+        const selected = currentLyrics();
+        if (
+          !this.active ||
+          this.generation !== generation ||
+          !_ytAPI ||
+          verifiedApiVideoId(_ytAPI) !== song.videoId ||
+          (this.nativeVideoId !== undefined &&
+            this.nativeVideoId !== song.videoId) ||
+          selected.state !== 'done' ||
+          !selected.data
+        )
+          return 'cancelled';
+        try {
+          return (await ctx.ipc.invoke('synced-lyrics:export', {
+            videoId: song.videoId,
+            result: JSON.parse(JSON.stringify(selected.data)),
+            offsetMs: currentConfig()?.timingOffsetMs,
+            enhanced: currentConfig()?.enhancedLrc === true,
+          })) as LyricsExportStatus;
+        } catch {
+          return 'error';
+        }
+      };
       setConfig(config);
       startLyricsSession();
       startLyricsEffects();
@@ -213,5 +264,6 @@ export const renderer = createRenderer<
     setCurrentTime(-1);
     disposeReactiveRoot();
     netFetch = unavailableFetch;
+    exportCurrentLyrics = unavailableExport;
   },
 });

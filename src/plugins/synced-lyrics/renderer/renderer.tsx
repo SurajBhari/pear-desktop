@@ -1,5 +1,6 @@
 import {
   createEffect,
+  createMemo,
   createSignal,
   onCleanup,
   onMount,
@@ -18,8 +19,12 @@ import {
 } from './components';
 import { LyricsPicker } from './components/LyricsPicker';
 import { ensureReactiveRoot } from './reactive-root';
+import { createLyricsScrollController } from './scroll-motion';
 import { currentLyrics } from './store';
 import { selectors } from './utils';
+import { withInstrumentalGaps } from './word-timing';
+
+import { lyricsDisplayTime, romanizationRatio } from '../tools';
 
 import type { LineLyrics, SyncedLyricsPluginConfig } from '../types';
 
@@ -33,98 +38,32 @@ export const startLyricsEffects = () =>
       if (!config()?.enabled) return;
       const root = document.documentElement;
 
-      // Set the line effect
-      switch (config()?.lineEffect) {
-        case 'fancy':
-          root.style.setProperty('--lyrics-font-size', '3rem');
-          root.style.setProperty('--lyrics-line-height', '1.333');
-          root.style.setProperty('--lyrics-width', '100%');
-          root.style.setProperty('--lyrics-padding', '2rem');
-          root.style.setProperty(
-            '--lyrics-animations',
-            'lyrics-glow var(--lyrics-glow-duration) forwards, lyrics-wobble var(--lyrics-wobble-duration) forwards',
-          );
-
-          root.style.setProperty('--lyrics-inactive-font-weight', '700');
-          root.style.setProperty('--lyrics-inactive-opacity', '0.33');
-          root.style.setProperty('--lyrics-inactive-scale', '0.95');
-          root.style.setProperty('--lyrics-inactive-offset', '0');
-
-          root.style.setProperty('--lyrics-active-font-weight', '700');
-          root.style.setProperty('--lyrics-active-opacity', '1');
-          root.style.setProperty('--lyrics-active-scale', '1');
-          root.style.setProperty('--lyrics-active-offset', '0');
-          break;
-        case 'scale':
-          root.style.setProperty(
-            '--lyrics-font-size',
-            'clamp(1.4rem, 1.1vmax, 3rem)',
-          );
-          root.style.setProperty(
-            '--lyrics-line-height',
-            'var(--ytmusic-body-line-height)',
-          );
-          root.style.setProperty('--lyrics-width', '83%');
-          root.style.setProperty('--lyrics-padding', '0');
-          root.style.setProperty('--lyrics-animations', 'none');
-
-          root.style.setProperty('--lyrics-inactive-font-weight', '400');
-          root.style.setProperty('--lyrics-inactive-opacity', '0.33');
-          root.style.setProperty('--lyrics-inactive-scale', '1');
-          root.style.setProperty('--lyrics-inactive-offset', '0');
-
-          root.style.setProperty('--lyrics-active-font-weight', '700');
-          root.style.setProperty('--lyrics-active-opacity', '1');
-          root.style.setProperty('--lyrics-active-scale', '1.2');
-          root.style.setProperty('--lyrics-active-offset', '0');
-          break;
-        case 'offset':
-          root.style.setProperty(
-            '--lyrics-font-size',
-            'clamp(1.4rem, 1.1vmax, 3rem)',
-          );
-          root.style.setProperty(
-            '--lyrics-line-height',
-            'var(--ytmusic-body-line-height)',
-          );
-          root.style.setProperty('--lyrics-width', '100%');
-          root.style.setProperty('--lyrics-padding', '0');
-          root.style.setProperty('--lyrics-animations', 'none');
-
-          root.style.setProperty('--lyrics-inactive-font-weight', '400');
-          root.style.setProperty('--lyrics-inactive-opacity', '0.33');
-          root.style.setProperty('--lyrics-inactive-scale', '1');
-          root.style.setProperty('--lyrics-inactive-offset', '0');
-
-          root.style.setProperty('--lyrics-active-font-weight', '700');
-          root.style.setProperty('--lyrics-active-opacity', '1');
-          root.style.setProperty('--lyrics-active-scale', '1');
-          root.style.setProperty('--lyrics-active-offset', '5%');
-          break;
-        case 'focus':
-          root.style.setProperty(
-            '--lyrics-font-size',
-            'clamp(1.4rem, 1.1vmax, 3rem)',
-          );
-          root.style.setProperty(
-            '--lyrics-line-height',
-            'var(--ytmusic-body-line-height)',
-          );
-          root.style.setProperty('--lyrics-width', '100%');
-          root.style.setProperty('--lyrics-padding', '0');
-          root.style.setProperty('--lyrics-animations', 'none');
-
-          root.style.setProperty('--lyrics-inactive-font-weight', '400');
-          root.style.setProperty('--lyrics-inactive-opacity', '0.33');
-          root.style.setProperty('--lyrics-inactive-scale', '1');
-          root.style.setProperty('--lyrics-inactive-offset', '0');
-
-          root.style.setProperty('--lyrics-active-font-weight', '700');
-          root.style.setProperty('--lyrics-active-opacity', '1');
-          root.style.setProperty('--lyrics-active-scale', '1');
-          root.style.setProperty('--lyrics-active-offset', '0');
-          break;
-      }
+      // Saved effect names remain readable; emphasis never changes glyph metrics.
+      const fancy = config()?.lineEffect === 'fancy';
+      const styles = {
+        '--lyrics-font-size': fancy ? '3rem' : 'clamp(1.4rem, 1.1vmax, 3rem)',
+        '--lyrics-line-height': fancy
+          ? '1.333'
+          : 'var(--ytmusic-body-line-height)',
+        '--lyrics-width': config()?.lineEffect === 'scale' ? '83%' : '100%',
+        '--lyrics-padding': fancy ? '2rem' : '0',
+        '--lyrics-romanization-ratio': String(
+          romanizationRatio(config()?.romanizationSizePercent),
+        ),
+      };
+      const previous = Object.keys(styles).map((key) => [
+        key,
+        root.style.getPropertyValue(key),
+        root.style.getPropertyPriority(key),
+      ]);
+      for (const [key, value] of Object.entries(styles))
+        root.style.setProperty(key, value);
+      onCleanup(() => {
+        for (const [key, value, priority] of previous) {
+          if (value) root.style.setProperty(key, value, priority);
+          else root.style.removeProperty(key);
+        }
+      });
     });
   });
 
@@ -148,6 +87,33 @@ export const [currentTime, setCurrentTime] = createSignal<number>(-1);
 export const LyricsRenderer = () => {
   const [scroller, setScroller] = createSignal<VirtualizerHandle>();
   const [stickyRef, setStickRef] = createSignal<HTMLElement | null>(null);
+  const [pageVisible, setPageVisible] = createSignal(!document.hidden);
+  const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const [reducedMotion, setReducedMotion] = createSignal(preference.matches);
+  const motion = createLyricsScrollController(scroller);
+  let centerFrame: number | undefined;
+  let centerEpoch = 0;
+  let mounted = true;
+  const cancelCenter = () => {
+    centerEpoch++;
+    if (centerFrame !== undefined) cancelAnimationFrame(centerFrame);
+    centerFrame = undefined;
+    motion.cancel();
+  };
+  const center = (index: number, immediate: boolean) => {
+    cancelCenter();
+    const owner = centerEpoch;
+    // Data/visibility changes precede the virtual list's new measurements.
+    centerFrame = requestAnimationFrame(() => {
+      if (owner !== centerEpoch || !mounted) return;
+      centerFrame = undefined;
+      if (isVisible() && !document.hidden) motion.move(index, immediate);
+    });
+  };
+  onCleanup(() => {
+    mounted = false;
+    cancelCenter();
+  });
 
   const tab = document.querySelector<HTMLElement>(selectors.body.tabRenderer)!;
 
@@ -158,7 +124,7 @@ export const LyricsRenderer = () => {
     }
 
     const { top } = tab.getBoundingClientRect();
-    const { clientHeight: height } = stickyRef()!;
+    const height = stickyRef()?.clientHeight ?? 0;
     const scrollOffset = scroller()?.scrollOffset ?? -1;
 
     const isInView = scrollOffset <= height;
@@ -168,22 +134,44 @@ export const LyricsRenderer = () => {
 
     if (showPicker) {
       // picker visible
-      stickyRef()!.style.setProperty('--lyrics-picker-top', '0');
+      stickyRef()?.style.setProperty('--lyrics-picker-top', '0');
     } else {
       // picker hidden
-      stickyRef()!.style.setProperty('--lyrics-picker-top', `-${height}px`);
+      stickyRef()?.style.setProperty('--lyrics-picker-top', `-${height}px`);
     }
   };
 
   onMount(() => {
-    const vList = document.querySelector<HTMLElement>('.synced-lyrics-vlist');
-
     tab.addEventListener('mousemove', mousemoveListener);
-    vList?.addEventListener('scroll', mousemoveListener);
-    vList?.addEventListener('scrollend', mousemoveListener);
+    const visibility = () => setPageVisible(!document.hidden);
+    const reduce = () => setReducedMotion(preference.matches);
+    document.addEventListener('visibilitychange', visibility);
+    preference.addEventListener('change', reduce);
+    const interrupt = cancelCenter;
+    for (const event of ['wheel', 'touchstart', 'pointerdown', 'keydown'])
+      tab.addEventListener(event, interrupt, { passive: true });
+    const resize = new ResizeObserver(() => {
+      if (isVisible() && !document.hidden && currentIndex() >= 0)
+        center(currentIndex() + 1, true);
+    });
+    resize.observe(tab);
 
     onCleanup(() => {
       tab.removeEventListener('mousemove', mousemoveListener);
+      document.removeEventListener('visibilitychange', visibility);
+      preference.removeEventListener('change', reduce);
+      for (const event of ['wheel', 'touchstart', 'pointerdown', 'keydown'])
+        tab.removeEventListener(event, interrupt);
+      resize.disconnect();
+      cancelCenter();
+    });
+  });
+  createEffect(() => {
+    if (!isVisible() || !scroller()) return;
+    const vList = tab.querySelector<HTMLElement>('.synced-lyrics-vlist');
+    vList?.addEventListener('scroll', mousemoveListener);
+    vList?.addEventListener('scrollend', mousemoveListener);
+    onCleanup(() => {
       vList?.removeEventListener('scroll', mousemoveListener);
       vList?.removeEventListener('scrollend', mousemoveListener);
     });
@@ -192,6 +180,10 @@ export const LyricsRenderer = () => {
   const [children, setChildren] = createSignal<LyricsRendererChild[]>([
     { kind: 'LoadingKaomoji' },
   ]);
+  const displayLines = createMemo(() => {
+    const lines = currentLyrics()?.data?.lines;
+    return lines ? withInstrumentalGaps(lines) : undefined;
+  });
 
   createEffect(() => {
     const current = currentLyrics();
@@ -212,7 +204,7 @@ export const LyricsRenderer = () => {
       }
 
       if (data?.lines) {
-        return data.lines.map((line) => ({
+        return displayLines()!.map((line) => ({
           kind: 'SyncedLine' as const,
           line,
         }));
@@ -234,14 +226,13 @@ export const LyricsRenderer = () => {
     ('previous' | 'current' | 'upcoming')[]
   >([]);
   createEffect(() => {
-    const time = currentTime();
-    const data = currentLyrics()?.data;
-
-    if (!data || !data.lines) return setStatuses([]);
+    const time = lyricsDisplayTime(currentTime(), config()?.timingOffsetMs);
+    const lines = displayLines();
+    if (!lines) return setStatuses([]);
 
     const previous = untrack(statuses);
-    const current = data.lines.map((line) => {
-      if (line.timeInMs >= time) return 'upcoming';
+    const current = lines.map((line) => {
+      if (line.timeInMs > time) return 'upcoming';
       if (time - line.timeInMs >= line.duration) return 'previous';
       return 'current';
     });
@@ -253,27 +244,25 @@ export const LyricsRenderer = () => {
     return;
   });
 
-  const [currentIndex, setCurrentIndex] = createSignal(0);
+  const [currentIndex, setCurrentIndex] = createSignal(-1);
   createEffect(() => {
     const index = statuses().findIndex((status) => status === 'current');
-    if (index === -1) return;
     setCurrentIndex(index);
   });
 
   createEffect(() => {
     const current = currentLyrics();
     const idx = currentIndex();
-    const maxIdx = untrack(statuses).length - 1;
-
-    if (!scroller() || !current.data?.lines) return;
-
-    // hacky way to make the "current" line scroll to the center of the screen
-    const scrollIndex = Math.min(idx + 1, maxIdx);
-
-    scroller()!.scrollToIndex(scrollIndex, {
-      smooth: true,
-      align: 'center',
-    });
+    if (
+      !isVisible() ||
+      !pageVisible() ||
+      !scroller() ||
+      !current?.data?.lines ||
+      idx < 0
+    )
+      return cancelCenter();
+    // Index 0 is the provider picker; retarget from the actual current scroll offset.
+    center(idx + 1, reducedMotion());
   });
 
   return (

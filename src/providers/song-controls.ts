@@ -3,14 +3,17 @@ import { type BrowserWindow, ipcMain } from 'electron';
 
 import { LikeType } from '@/types/datahost-get-state';
 
+import { requestPlaylistQueue } from './queue-playlist-request';
+
 // see protocol-handler.ts
 type ArgsType<T> = T | string[] | undefined;
 
 const parseNumberFromArgsType = (args: ArgsType<number>) => {
   if (typeof args === 'number') {
-    return args;
+    return Number.isFinite(args) ? args : null;
   } else if (Array.isArray(args)) {
-    return Number(args[0]);
+    const value = Number(args[0]);
+    return Number.isFinite(value) ? value : null;
   } else {
     return null;
   }
@@ -61,7 +64,7 @@ export const getSongControls = (win: BrowserWindow) => {
     goForward: (seconds: ArgsType<number>) => {
       const secondsNumber = parseNumberFromArgsType(seconds);
       if (secondsNumber !== null) {
-        win.webContents.send('peard:seek-by', seconds);
+        win.webContents.send('peard:seek-by', secondsNumber);
       }
     },
     requestShuffleInformation: () => {
@@ -115,6 +118,24 @@ export const getSongControls = (win: BrowserWindow) => {
         queueInsertPosition,
       );
     },
+    addPlaylistToQueue: (
+      playlistId: ArgsType<string>,
+      videoId?: ArgsType<string>,
+      queueInsertPosition: ArgsType<string> = 'INSERT_AT_END',
+      signal?: AbortSignal,
+    ) =>
+      requestPlaylistQueue(
+        win,
+        {
+          playlistId: parseStringFromArgsType(playlistId),
+          videoId:
+            videoId === undefined
+              ? undefined
+              : parseStringFromArgsType(videoId),
+          insertPosition: parseStringFromArgsType(queueInsertPosition),
+        },
+        signal,
+      ),
     moveSongInQueue: (
       fromIndex: ArgsType<number>,
       toIndex: ArgsType<number>,

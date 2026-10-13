@@ -3,9 +3,11 @@ import { createPlugin } from '@/utils';
 
 import { onConfigChange, onMainLoad, onMainStop } from './main';
 import { onMenu } from './menu';
-import { onPlayerApiReady, onRendererLoad } from './renderer';
+import { onPlayerApiReady, onRendererLoad, onRendererStop } from './renderer';
 import style from './style.css?inline';
 import { DefaultPresetList, type Preset } from './types';
+
+import type { AudioPreference, DuplicatePolicy } from './audio';
 
 export type DownloaderPluginConfig = {
   enabled: boolean;
@@ -21,6 +23,9 @@ export type DownloaderPluginConfig = {
   customPresetSetting: Preset;
   skipExisting: boolean;
   playlistMaxItems?: number;
+  sourceAudio?: AudioPreference;
+  sourceFallback?: boolean;
+  duplicatePolicy?: DuplicatePolicy;
 };
 
 export const defaultConfig: DownloaderPluginConfig = {
@@ -37,6 +42,9 @@ export const defaultConfig: DownloaderPluginConfig = {
   customPresetSetting: DefaultPresetList['mp3 (256kbps)'], // Presets
   skipExisting: false,
   playlistMaxItems: undefined,
+  sourceAudio: { mode: 'best', language: 'original', drc: false },
+  sourceFallback: false,
+  duplicatePolicy: 'legacy',
 };
 
 export default createPlugin({
@@ -53,6 +61,7 @@ export default createPlugin({
   },
   renderer: {
     start: onRendererLoad,
+    stop: onRendererStop,
     onPlayerApiReady,
   },
 });

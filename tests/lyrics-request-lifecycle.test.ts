@@ -19,7 +19,7 @@ test.beforeAll(async () => {
   const entry = path.join(scratch, 'entry.tsx');
   await writeFile(
     entry,
-    `import{renderer,_ytAPI}from ${JSON.stringify(path.join(directory, 'index.ts'))};import{fetchLyrics,retrySearch,lyricsStore,setLyricsStore,currentLyrics}from ${JSON.stringify(path.join(directory, 'store.ts'))};import{config,currentTime}from ${JSON.stringify(path.join(directory, 'renderer.tsx'))};import{providerIdx}from ${JSON.stringify(path.join(directory, 'components/LyricsPicker.tsx'))};import{tabStates}from ${JSON.stringify(path.join(directory, 'utils.tsx'))};import{pending,setSong}from'fixture-lyrics-state';window.lyricsFixture={renderer,fetchLyrics,retrySearch,lyricsStore,setLyricsStore,currentLyrics,config,currentTime,providerIdx,tabStates,pending,setSong,api:()=>_ytAPI};`,
+    `import{renderer,_ytAPI,exportCurrentLyrics}from ${JSON.stringify(path.join(directory, 'index.ts'))};import{fetchLyrics,retrySearch,lyricsStore,setLyricsStore,currentLyrics}from ${JSON.stringify(path.join(directory, 'store.ts'))};import{config,currentTime}from ${JSON.stringify(path.join(directory, 'renderer.tsx'))};import{providerIdx}from ${JSON.stringify(path.join(directory, 'components/LyricsPicker.tsx'))};import{tabStates}from ${JSON.stringify(path.join(directory, 'utils.tsx'))};import{pending,setSong}from'fixture-lyrics-state';window.lyricsFixture={exporter:()=>exportCurrentLyrics,renderer,fetchLyrics,retrySearch,lyricsStore,setLyricsStore,currentLyrics,config,currentTime,providerIdx,tabStates,pending,setSong,api:()=>_ytAPI};`,
   );
   const result = await build({
     root,
@@ -76,7 +76,7 @@ test.beforeAll(async () => {
           if (id === '\0fixture-lyrics-providers')
             return "import{search}from'fixture-lyrics-state';export const providers=Object.fromEntries(['YTMusic','LRCLib','MusixMatch','LyricsGenius'].map(name=>[name,{search:info=>search(name,info)}]));";
           if (id === '\0fixture-lyrics-i18n')
-            return 'export const t=value=>value;';
+            return `export const t=value=>({'plugins.synced-lyrics.tools.export':'Export lyrics…','plugins.synced-lyrics.tools.saved':'Lyrics saved'}[value]??value);`;
           if (id === '\0fixture-lyrics-lit')
             return 'export const LitElementWrapper=args=>{const element=document.createElement("button");element.onclick=args.props?.onClick;return element};';
           if (id === '\0fixture-lyrics-icon')
@@ -424,6 +424,11 @@ test('stopped DOM wait cannot attach a header observer or mount delayed lyrics',
     await settle();
     f.state.renderer.stop();
     expect(f.activeObservers.size).toBe(0);
+    expect(
+      f.window.document.documentElement.style.getPropertyValue(
+        '--lyrics-font-size',
+      ),
+    ).toBe('');
     expect(f.intervals.size).toBe(0);
     f.mountDom(true);
     f.tick();
@@ -540,9 +545,9 @@ test('reenabling recreates config effects and a stopped lyrics-body wait cannot 
     await settle();
     expect(
       f.window.document.documentElement.style.getPropertyValue(
-        '--lyrics-active-offset',
+        '--lyrics-font-size',
       ),
-    ).toBe('5%');
+    ).toBe('clamp(1.4rem, 1.1vmax, 3rem)');
   } finally {
     await f.close();
   }
@@ -833,3 +838,133 @@ for (const lifecycle of ['remount', 'stop/re-enable']) {
     }
   });
 }
+
+test('export bridge rejects wrong native identity and retires captured calls on stop', async () => {
+  const f = fixture();
+  try {
+    const calls: any[] = [];
+    (f.context.ipc as any).invoke = async (...args: any[]) => {
+      calls.push(args);
+      return 'saved';
+    };
+    await f.state.renderer.start(f.context);
+    const api = f.api();
+    f.mountDom();
+    let id = 'A';
+    (api as any).getVideoData = () => ({ video_id: id });
+    (api as any).getPlayerResponse = () => ({ videoDetails: { videoId: id } });
+    await f.state.renderer.onPlayerApiReady(api);
+    await f.track('A');
+    f.state.setLyricsStore('lyrics', 'YTMusic', {
+      state: 'done',
+      data: result('Hello'),
+      error: null,
+    });
+    const retained = f.state.exporter();
+    expect(await retained()).toBe('saved');
+    expect(calls[0][0]).toBe('synced-lyrics:export');
+    expect(calls[0][1].videoId).toBe('A');
+    id = 'B';
+    expect(await retained()).toBe('cancelled');
+    expect(calls).toHaveLength(1);
+    f.state.renderer.stop();
+    expect(await retained()).toBe('cancelled');
+    expect(await f.state.exporter()()).toBe('cancelled');
+    expect(calls).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test('current provider export works through the actual keyboard-accessible picker button', async ({
+  page,
+}) => {
+  await page.setContent(
+    '<style>html{font-size:16px;background:#151515;color:#fff}#tab-renderer{width:600px;height:420px}</style><div id="tabsContent"><div class="tab-header"></div><div class="tab-header" aria-selected="true"></div></div><div id="tab-renderer" page-type="MUSIC_PAGE_TYPE_TRACK_LYRICS"></div>',
+  );
+  await page.addStyleTag({
+    content: await (await import('node:fs/promises')).readFile(
+      path.join(directory, '../style.css'),
+      'utf8',
+    ),
+  });
+  await page.evaluate(() => {
+    Object.assign(window, {
+      mainConfig: { get: () => undefined, plugins: { getPlugins: () => ({}) } },
+      ipcRenderer: {
+        invoke: async () => undefined,
+        on() {},
+        send() {},
+        removeAllListeners() {},
+      },
+      electronIs: {
+        linux: () => false,
+        windows: () => false,
+        osx: () => true,
+        macOS: () => true,
+      },
+    });
+    (window as any).exportCalls = [];
+  });
+  await page.addScriptTag({ content: code });
+  await page.evaluate(async () => {
+    const f = (window as any).lyricsFixture;
+    f.setSong({
+      videoId: 'A',
+      title: 'Song',
+      artist: 'Artist',
+      songDuration: 10,
+      tags: [],
+    });
+    await f.renderer.start({
+      getConfig: async () => ({
+        enabled: true,
+        lineEffect: 'fancy',
+        romanization: false,
+        defaultTextString: '',
+        showTimeCodes: false,
+      }),
+      ipc: {
+        subscribe: () => () => {},
+        invoke: async (...args: any[]) => {
+          (window as any).exportCalls.push(args);
+          return 'saved';
+        },
+      },
+    });
+    const events = new EventTarget();
+    await f.renderer.onPlayerApiReady({
+      getCurrentTime: () => 2,
+      getVideoData: () => ({ video_id: 'A' }),
+      getPlayerResponse: () => ({ videoDetails: { videoId: 'A' } }),
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+    });
+    f.setLyricsStore('lyrics', 'YTMusic', {
+      state: 'done',
+      data: { title: 'Song', artists: ['Artist'], lyrics: 'Hello' },
+      error: null,
+    });
+  });
+  const button = page.locator('.lyrics-export');
+  await expect(button).toBeEnabled();
+  await button.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.lyrics-export-status')).toHaveText(
+    'Lyrics saved',
+  );
+  expect(await page.evaluate(() => (window as any).exportCalls)).toHaveLength(
+    1,
+  );
+  expect(
+    await button.evaluate((node) => getComputedStyle(node).outlineStyle),
+  ).not.toBe('none');
+  if (process.env.PEAR_LYRICS_TOOLS_EVIDENCE_DIR)
+    await page.locator('#tab-renderer').screenshot({
+      path: path.join(
+        process.env.PEAR_LYRICS_TOOLS_EVIDENCE_DIR,
+        'lyrics-export-picker.png',
+      ),
+    });
+  await page.evaluate(() => (window as any).lyricsFixture.renderer.stop());
+});

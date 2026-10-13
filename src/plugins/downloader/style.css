@@ -19,3 +19,85 @@
   height: var(--iron-icon-height, 24px);
   animation: var(--iron-icon_-_animation);
 }
+dialog.pear-downloader-settings {
+  color: var(--ytmusic-text-primary, #eee);
+  background: var(--ytmusic-background, #212121);
+  border: 1px solid #777;
+  border-radius: 12px;
+  width: min(640px, calc(100vw - 48px));
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+  padding: 24px;
+  font: 14px/1.5 sans-serif;
+}
+dialog.pear-downloader-settings::backdrop {
+  background: rgb(0 0 0 / 65%);
+}
+.pear-downloader-settings header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.pear-downloader-settings h2 {
+  margin: 0;
+  font-size: 20px;
+}
+.pear-downloader-settings fieldset {
+  min-width: 0;
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid #777;
+  border-radius: 8px;
+}
+.pear-downloader-settings legend {
+  padding: 0 8px;
+  font-weight: 600;
+}
+.pear-downloader-settings label {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+}
+.pear-downloader-settings label.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pear-downloader-settings select,
+.pear-downloader-settings input:not([type='checkbox']),
+.pear-downloader-settings button {
+  color: inherit;
+  background: var(--ytmusic-background, #303030);
+  border: 1px solid #999;
+  border-radius: 6px;
+  padding: 10px;
+  min-height: 44px;
+  max-width: 100%;
+}
+.pear-downloader-settings button {
+  cursor: pointer;
+  margin: 4px;
+}
+.pear-downloader-settings :focus-visible {
+  outline: 2px solid #8ab4f8;
+  outline-offset: 2px;
+}
+.pear-downloader-settings button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+.pear-downloader-settings select {
+  width: 100%;
+}
+.pear-downloader-settings p {
+  overflow-wrap: anywhere;
+}
+.pear-downloader-settings [role='alert'] {
+  color: #ffb4ab;
+}
+.pear-downloader-settings ul {
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}

@@ -10,6 +10,7 @@ import {
 import { getSongMenu } from '@/providers/dom-elements';
 import { getSongInfo } from '@/providers/song-info-front';
 
+import { DownloaderSettings } from './settings';
 import { DownloadButton } from './templates/download';
 
 import type { DownloaderPluginConfig } from './index';
@@ -20,6 +21,12 @@ let download: () => void;
 const [downloadButtonText, setDownloadButtonText] = createSignal<string>('');
 
 let buttonContainer: HTMLDivElement | null = null;
+let disposeButton: (() => void) | undefined;
+let disposeSettings: (() => void) | undefined;
+let settingsDialog: HTMLDialogElement | undefined;
+let rendererLoaded = false;
+let rendererGeneration = 0;
+let subscriptions: (() => void)[] = [];
 
 const menuObserver = new MutationObserver(() => {
   const menu = getSongMenu();
@@ -39,6 +46,65 @@ const menuObserver = new MutationObserver(() => {
 export const onRendererLoad = ({
   ipc,
 }: RendererContext<DownloaderPluginConfig>) => {
+  if (rendererLoaded) onRendererStop();
+  rendererLoaded = true;
+  const generation = ++rendererGeneration;
+  let opening = false;
+  const subscribe = (event: string, listener: CallableFunction) => {
+    if (ipc.subscribe) subscriptions.push(ipc.subscribe(event, listener));
+    else {
+      ipc.on(event, listener);
+      subscriptions.push(() => ipc.removeAllListeners(event));
+    }
+  };
+  subscribe('downloader-open-settings', async () => {
+    if (opening) return;
+    if (settingsDialog?.isConnected) {
+      settingsDialog.focus();
+      return;
+    }
+    const previousFocus = document.activeElement as HTMLElement | null;
+    opening = true;
+    try {
+      const initial = (await ipc.invoke('downloader-settings')) as {
+        config: DownloaderPluginConfig;
+        library?: import('./library').LibraryReport;
+        review?: { id: string; title: string; reason: string }[];
+      };
+      if (!rendererLoaded || generation !== rendererGeneration) return;
+      const dialog = document.createElement('dialog');
+      dialog.className = 'pear-downloader-settings';
+      dialog.setAttribute('aria-labelledby', 'pear-downloader-heading');
+      const close = () => {
+        disposeSettings?.();
+        disposeSettings = undefined;
+        dialog.remove();
+        if (settingsDialog === dialog) settingsDialog = undefined;
+        previousFocus?.focus();
+      };
+      dialog.addEventListener('close', close, { once: true });
+      disposeSettings = render(
+        () => (
+          <DownloaderSettings
+            api={{
+              invoke: (event, ...args) => ipc.invoke(event, ...args),
+              currentUrl: () => getSongInfo().url || window.location.href,
+              close: () => dialog.close(),
+            }}
+            initial={initial}
+          />
+        ),
+        dialog,
+      );
+      document.body.append(dialog);
+      settingsDialog = dialog;
+      dialog.showModal();
+    } catch (error) {
+      console.error('Downloader settings unavailable', error);
+    } finally {
+      opening = false;
+    }
+  });
   download = () => {
     const songMenu = getSongMenu();
 
@@ -80,13 +146,14 @@ export const onRendererLoad = ({
     ipc.invoke('download-song', videoUrl);
   };
 
-  ipc.on('downloader-feedback', (feedback: string) => {
+  subscribe('downloader-feedback', (feedback: string) => {
     const targetHtml = feedback || t('plugins.downloader.templates.button');
     setDownloadButtonText(targetHtml);
   });
 };
 
 export const onPlayerApiReady = () => {
+  buttonContainer?.remove();
   setDownloadButtonText(t('plugins.downloader.templates.button'));
 
   buttonContainer = document.createElement('div');
@@ -100,7 +167,8 @@ export const onPlayerApiReady = () => {
   buttonContainer.setAttribute('role', 'option');
   buttonContainer.setAttribute('tabindex', '-1');
 
-  render(
+  disposeButton?.();
+  disposeButton = render(
     () => <DownloadButton onClick={download} text={downloadButtonText()} />,
     buttonContainer,
   );
@@ -109,4 +177,20 @@ export const onPlayerApiReady = () => {
     childList: true,
     subtree: true,
   });
+};
+export const onRendererStop = () => {
+  rendererGeneration++;
+  rendererLoaded = false;
+  menuObserver.disconnect();
+  for (const unsubscribe of subscriptions) unsubscribe();
+  subscriptions = [];
+  settingsDialog?.close();
+  settingsDialog?.remove();
+  settingsDialog = undefined;
+  disposeSettings?.();
+  disposeSettings = undefined;
+  disposeButton?.();
+  disposeButton = undefined;
+  buttonContainer?.remove();
+  buttonContainer = null;
 };

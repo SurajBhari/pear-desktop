@@ -1,28 +1,40 @@
+import { Show } from 'solid-js';
+
 export interface VideoSwitchButtonProps {
-  onClick?: (event: MouseEvent) => void;
-  onChange?: (event: Event) => void;
+  videoVisible: boolean;
+  onVideoToggle: (showVideo: boolean) => void;
   songButtonText: string;
   videoButtonText: string;
 }
 
 export const VideoSwitchButton = (props: VideoSwitchButtonProps) => (
-  <div
+  <button
+    aria-label={props.videoButtonText}
+    aria-pressed={props.videoVisible}
     class="video-switch-button"
-    data-video-button-text={props.videoButtonText}
-    on:click={(e) => props.onClick?.(e)}
-    onChange={(e) => props.onChange?.(e)}
+    on:click={(event) => {
+      event.stopPropagation();
+      props.onVideoToggle(!props.videoVisible);
+    }}
+    title={props.videoVisible ? props.songButtonText : props.videoButtonText}
+    type="button"
   >
-    <input
-      checked={true}
-      class="video-switch-button-checkbox"
-      id="video-toggle-video-switch-button-checkbox"
-      type="checkbox"
-    />
-    <label
-      class="video-switch-button-label"
-      for="video-toggle-video-switch-button-checkbox"
+    <svg
+      aria-hidden="true"
+      fill="none"
+      height="24"
+      stroke="currentColor"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      stroke-width="2"
+      viewBox="0 0 24 24"
+      width="24"
     >
-      <span class="video-switch-button-label-span">{props.songButtonText}</span>
-    </label>
-  </div>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+      <circle cx="12" cy="12" r="3" />
+      <Show when={!props.videoVisible}>
+        <path d="m3 3 18 18" />
+      </Show>
+    </svg>
+  </button>
 );

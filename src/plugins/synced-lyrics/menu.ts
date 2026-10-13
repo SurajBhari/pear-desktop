@@ -1,4 +1,7 @@
+import prompt from 'custom-electron-prompt';
+
 import { t } from '@/i18n';
+import promptOptions from '@/providers/prompt-options';
 
 import { providerNames } from './providers';
 
@@ -12,6 +15,68 @@ export const menu = async (
   const config = await ctx.getConfig();
 
   return [
+    {
+      label: t('plugins.synced-lyrics.menu.direct-ytmusic.label'),
+      toolTip: t('plugins.synced-lyrics.menu.direct-ytmusic.tooltip'),
+      type: 'checkbox',
+      checked: config.useYTMLyricsWithoutProxy === true,
+      click(item) {
+        if (ctx.window.isDestroyed()) return;
+        return ctx.setConfig({
+          useYTMLyricsWithoutProxy: item.checked === true,
+        });
+      },
+    },
+    {
+      label: t('plugins.synced-lyrics.tools.offset'),
+      async click() {
+        const current = await ctx.getConfig();
+        if (ctx.window.isDestroyed()) return;
+        const output: unknown = await prompt(
+          {
+            title: t('plugins.synced-lyrics.tools.offset'),
+            label: t('plugins.synced-lyrics.tools.offset-help'),
+            type: 'counter',
+            value: String(current.timingOffsetMs ?? 0),
+            counterOptions: {
+              minimum: -30000,
+              maximum: 30000,
+              multiFire: true,
+            },
+            ...promptOptions(),
+          },
+          ctx.window,
+        );
+        if (
+          ctx.window.isDestroyed() ||
+          output === null ||
+          output === undefined ||
+          (typeof output !== 'number' && typeof output !== 'string') ||
+          (typeof output === 'string' && !output.trim())
+        )
+          return;
+        const value = Number(output);
+        if (Number.isFinite(value) && Math.abs(value) <= 30000)
+          await ctx.setConfig({ timingOffsetMs: value });
+      },
+    },
+    {
+      label: t('plugins.synced-lyrics.tools.romanization-size'),
+      type: 'submenu',
+      submenu: [50, 70, 100, 125].map((size) => ({
+        label: `${size}%`,
+        type: 'radio' as const,
+        checked: (config.romanizationSizePercent ?? 70) === size,
+        click: () => ctx.setConfig({ romanizationSizePercent: size }),
+      })),
+    },
+    {
+      label: t('plugins.synced-lyrics.tools.enhanced-lrc'),
+      toolTip: t('plugins.synced-lyrics.tools.enhanced-lrc-help'),
+      type: 'checkbox',
+      checked: config.enhancedLrc === true,
+      click: (item) => ctx.setConfig({ enhancedLrc: item.checked }),
+    },
     {
       label: t('plugins.synced-lyrics.menu.preferred-provider.label'),
       toolTip: t('plugins.synced-lyrics.menu.preferred-provider.tooltip'),

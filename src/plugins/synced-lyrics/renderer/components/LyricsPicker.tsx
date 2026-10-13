@@ -20,6 +20,7 @@ import {
 } from 'solid-js';
 import * as z from 'zod';
 
+import { t } from '@/i18n';
 import { LitElementWrapper } from '@/solit';
 
 import {
@@ -29,7 +30,7 @@ import {
   ProviderNameSchema,
   type ProviderState,
 } from '../../providers';
-import { _ytAPI } from '../index';
+import { _ytAPI, exportCurrentLyrics } from '../index';
 import { config } from '../renderer';
 import { currentLyrics, lyricsStore, setLyricsStore } from '../store';
 
@@ -82,6 +83,22 @@ export const resetLyricsPickerSelection = () =>
 export const LyricsPicker = (props: {
   setStickRef: Setter<HTMLElement | null>;
 }) => {
+  const [exporting, setExporting] = createSignal(false);
+  const [exportStatus, setExportStatus] = createSignal('');
+  let mounted = true;
+  onCleanup(() => {
+    mounted = false;
+  });
+  const exportLyrics = async () => {
+    if (exporting()) return;
+    setExporting(true);
+    setExportStatus('');
+    const status = await exportCurrentLyrics();
+    if (!mounted) return;
+    setExporting(false);
+    if (status !== 'cancelled')
+      setExportStatus(t(`plugins.synced-lyrics.tools.${status}`));
+  };
   const [videoId, setVideoId] = createSignal<string | null>(null);
   const [starredProvider, setStarredProvider] =
     createSignal<ProviderName | null>(null);
@@ -205,6 +222,20 @@ export const LyricsPicker = (props: {
         </mdui-button-icon>
       </div>
 
+      <button
+        aria-busy={exporting()}
+        aria-disabled={exporting()}
+        class="lyrics-export"
+        disabled={currentLyrics().state !== 'done' || !currentLyrics().data}
+        onClick={exportLyrics}
+        title={t('plugins.synced-lyrics.tools.export')}
+        type="button"
+      >
+        {t('plugins.synced-lyrics.tools.export')}
+      </button>
+      <span class="lyrics-export-status" role="status">
+        {exportStatus()}
+      </span>
       <div class="lyrics-picker-content">
         <div class="lyrics-picker-content-label">
           <Index each={providerNames}>

@@ -21,7 +21,7 @@ const tagRegex = /^\[(?<tag>\w+):\s*(?<value>.+?)\s*\]$/;
 const timestampRegex = /^\[(?<minutes>\d+):(?<seconds>\d+)\.(?<centiseconds>\d+)\]/m;
 
 // prettier-ignore
-const wordRegex = /<(?<minutes>\d+):(?<seconds>\d+)\.(?<centiseconds>\d+)> *(?<word>\w+)/g;
+const wordRegex = /<(?<minutes>\d+):(?<seconds>\d+)\.(?<centiseconds>\d+)>/g;
 
 export const LRC = {
   parse: (text: string): LRC => {
@@ -32,8 +32,8 @@ export const LRC = {
 
     let offset = 0;
 
-    for (let line of text.split('\n')) {
-      line = line.trim();
+    for (let line of text.split(/\r?\n/)) {
+      line = line.trimStart();
       if (!line.startsWith('[')) continue;
 
       const timestamps = [];
@@ -41,10 +41,9 @@ export const LRC = {
       while ((match = line.match(timestampRegex)?.groups)) {
         const { minutes, seconds, centiseconds } = match;
         const milliseconds = match.centiseconds.padEnd(3, '0');
-        const timeInMs =
-          ((parseInt(minutes) * 60) * 1000) +
-          (parseInt(seconds) * 1000) +
-          parseInt(milliseconds);
+        const minutesInMs = parseInt(minutes) * 60000;
+        const secondsInMs = parseInt(seconds) * 1000;
+        const timeInMs = minutesInMs + secondsInMs + parseInt(milliseconds);
 
         timestamps.push({
           time: `${minutes}:${seconds}:${centiseconds}`,
@@ -55,7 +54,7 @@ export const LRC = {
       }
 
       if (!timestamps.length) {
-        const tag = line.match(tagRegex)?.groups;
+        const tag = line.trim().match(tagRegex)?.groups;
         if (tag) {
           if (tag.tag === 'offset') {
             offset = parseInt(tag.value);
@@ -70,28 +69,28 @@ export const LRC = {
         continue;
       }
 
-      let text = line.trim();
-      const words = Array.from(text.matchAll(wordRegex), ({ groups }) => {
-        const { minutes, seconds, centiseconds, word } = groups!;
+      const markers = Array.from(line.matchAll(wordRegex));
+      const text = line.replace(wordRegex, '');
+      const words = markers.map(({ groups, index, 0: marker }, idx) => {
+        const { minutes, seconds, centiseconds } = groups!;
         const milliseconds = centiseconds.padEnd(3, '0');
-        const timeInMs =
-          ((parseInt(minutes) * 60) * 1000) +
-          (parseInt(seconds) * 1000) +
-          parseInt(milliseconds);
+        const minutesInMs = parseInt(minutes) * 60000;
+        const secondsInMs = parseInt(seconds) * 1000;
+        const timeInMs = minutesInMs + secondsInMs + parseInt(milliseconds);
 
+        const prefix = idx === 0 ? line.slice(0, index) : '';
+        const word =
+          (prefix.trim() ? '' : prefix) +
+          line.slice(index + marker.length, markers[idx + 1]?.index);
         return { timeInMs, word };
       });
-
-      if (words.length) {
-        text = words.map(({ word }) => word).join(' ');
-      }
 
       for (const { time, timeInMs } of timestamps) {
         lrc.lines.push({
           time,
           timeInMs,
           text,
-          words,
+          words: words.map((word) => ({ ...word })),
           duration: Infinity,
         });
       }
@@ -102,11 +101,14 @@ export const LRC = {
       const current = lrc.lines[i];
       const next = lrc.lines[i + 1];
 
-      current.timeInMs += offset;
-
       if (next) {
         current.duration = next.timeInMs - current.timeInMs;
       }
+      current.timeInMs += offset;
+      current.words = current.words.map((word) => ({
+        ...word,
+        timeInMs: word.timeInMs + offset,
+      }));
     }
 
     const first = lrc.lines.at(0);

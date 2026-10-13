@@ -63,7 +63,7 @@ interface VolumeFade {
 
 // Main class
 export class VolumeFader {
-  private readonly media: HTMLMediaElement;
+  private readonly media: Pick<HTMLMediaElement, 'volume'>;
   private readonly logger: VolumeLogger | null;
   private scale: {
     internalToVolume: (level: number) => number;
@@ -81,9 +81,12 @@ export class VolumeFader {
    * @throws {TypeError} if options.initialVolume or options.fadeDuration are invalid
    *
    */
-  constructor(media: HTMLMediaElement, options: VolumeFaderOptions) {
-    // Passed media element of correct type?
-    if (media instanceof HTMLMediaElement) {
+  constructor(
+    media: Pick<HTMLMediaElement, 'volume'>,
+    options: VolumeFaderOptions,
+  ) {
+    // Native media or an owned AudioParam envelope target; never a user-volume proxy.
+    if (media && typeof media.volume === 'number') {
       // Save reference to media element
       this.media = media;
     } else {
@@ -309,8 +312,9 @@ export class VolumeFader {
           (this.fade.time.end - this.fade.time.start);
 
         // Compute current level on internal scale
-        const level =
-          (progress * (this.fade.volume.end - this.fade.volume.start)) + this.fade.volume.start;
+        const span = this.fade.volume.end - this.fade.volume.start;
+        const movement = progress * span;
+        const level = movement + this.fade.volume.start;
 
         // Map fade level to volume level and apply it to media element
         this.media.volume = this.scale.internalToVolume(level);
@@ -377,7 +381,8 @@ export class VolumeFader {
     input = Math.log10(input);
 
     // Scale minus something × 10 dB to 0…1 (clipping at 0)
-    return Math.max(1 + (input / dynamicRange), 0);
+    const normalized = input / dynamicRange;
+    return Math.max(1 + normalized, 0);
   }
 }
 

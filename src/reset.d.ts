@@ -2,6 +2,7 @@ import '@total-typescript/ts-reset';
 
 import type * as config from './config';
 import type { t } from '@/i18n';
+import type { RendererAudioGraph } from '@/providers/renderer-audio';
 import type { VideoDataChanged } from '@/types/video-data-changed';
 import type { ipcRenderer as electronIpcRenderer } from 'electron';
 import type is from 'electron-is';
@@ -11,6 +12,7 @@ declare global {
   interface Compressor {
     audioSource: MediaElementAudioSourceNode;
     audioContext: AudioContext;
+    audioGraph?: RendererAudioGraph;
   }
 
   interface DocumentEventMap {
@@ -37,17 +39,5 @@ declare global {
     i18n: {
       t: typeof t;
     };
-  }
-}
-
-// import { Howl as _Howl } from 'howler';
-declare module 'howler' {
-  interface Howl {
-    _sounds: {
-      _paused: boolean;
-      _ended: boolean;
-      _id: string;
-      _node: HTMLMediaElement;
-    }[];
   }
 }

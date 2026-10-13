@@ -9,13 +9,20 @@ import { renderer } from './renderer';
 export interface CustomOutputPluginConfig {
   enabled: boolean;
   output: string;
-  devices: Record<string, string>;
+  devices: Record<string, string> | null;
+  deviceStatus?: DeviceStatus | null;
 }
+export type DeviceStatus =
+  | 'unsupported'
+  | 'permission'
+  | 'limited'
+  | 'unavailable'
+  | 'failed';
 
 export default createPlugin({
   name: () => t('plugins.custom-output-device.name'),
   description: () => t('plugins.custom-output-device.description'),
-  restartNeeded: true,
+  restartNeeded: false,
   config: {
     enabled: false,
     output: 'default',
@@ -28,10 +35,22 @@ export default createPlugin({
       const response = await prompt(
         {
           title: t('plugins.custom-output-device.prompt.device-selector.title'),
-          label: t('plugins.custom-output-device.prompt.device-selector.label'),
-          value: options.output || 'default',
+          label: [
+            t('plugins.custom-output-device.prompt.device-selector.label'),
+            options.deviceStatus
+              ? t(`plugins.custom-output-device.status.${options.deviceStatus}`)
+              : '',
+          ]
+            .filter(Boolean)
+            .join('\n\n'),
+          value: Object.hasOwn(options.devices ?? {}, options.output)
+            ? options.output
+            : 'default',
           type: 'select',
-          selectOptions: options.devices,
+          selectOptions: {
+            default: t('plugins.custom-output-device.system-default'),
+            ...options.devices,
+          },
           width: 500,
           ...promptOptions(),
         },
@@ -39,8 +58,7 @@ export default createPlugin({
       ).catch(console.error);
 
       if (!response) return;
-      options.output = response;
-      setConfig(options);
+      await setConfig({ output: response });
     };
 
     return [

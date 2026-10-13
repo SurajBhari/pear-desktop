@@ -46,7 +46,7 @@ export {fixtureState,fixtureWindow,ipcMain} from 'electron';
 import {EventEmitter} from 'node:events';
 export const fixtureState={focused:false,destroyed:false,dialogs:[],progress:[],badges:[],feedback:[],focus:[],deadCalls:[],logs:[],network:[],requests:[],notifications:[],dialogMode:'supported',notificationMode:'supported',infoMode:'reject',rejection:new Error('fixture media failed',{cause:new Error('fixture cause')}),errorHandled:undefined};
 class FixtureWindow extends EventEmitter {
- webContents={isDestroyed:()=>fixtureState.destroyed,send:(name,...args)=>{if(fixtureState.destroyed){fixtureState.deadCalls.push('feedback');throw new Error('Object has been destroyed');}fixtureState.feedback.push({name,args});},executeJavaScript:async()=>undefined,session:{cookies:{get:async()=>[]}}};
+ webContents=Object.assign(new EventEmitter(),{isDestroyed:()=>fixtureState.destroyed,mainFrame:{},send:(name,...args)=>{if(fixtureState.destroyed){fixtureState.deadCalls.push('feedback');throw new Error('Object has been destroyed');}fixtureState.feedback.push({name,args});},executeJavaScript:async()=>undefined,session:{cookies:{get:async()=>[]}}});
  isDestroyed(){return fixtureState.destroyed;} isFocused(){if(fixtureState.destroyed){fixtureState.deadCalls.push('focus-read');throw new Error('Object has been destroyed');}return fixtureState.focused;}
  focus(){fixtureState.focus.push('focus');} show(){fixtureState.focus.push('show');} getSize(){return [800,600];}
  setProgressBar(value){if(fixtureState.destroyed){fixtureState.deadCalls.push('progress');throw new Error('Object has been destroyed');}fixtureState.progress.push(value);if(value===-1)queueMicrotask(()=>fixtureState.errorHandled?.());}
@@ -64,6 +64,7 @@ export const net={fetch:async(...args)=>{fixtureState.network.push(args);throw n
 `;
   const youtube = `
 import {fixtureState} from 'electron';
+export {FormatUtils} from 'owned-real-sdk';
 export const Platform={shim:{}};export class UniversalCache{};export const Utils={};export const YTNodes={MusicResponsiveListItem:class{constructor(id){this.id=id;this.author={name:'fixture author'};this.title='fixture title';}}};
 export const Innertube={create:async()=>({session:{context:{client:{}}},music:{getPlaylist:async()=>({header:{title:{text:'Owned fixture playlist'}},items:[new YTNodes.MusicResponsiveListItem('first'),new YTNodes.MusicResponsiveListItem('second')],has_continuation:false}),getInfo:(id)=>{fixtureState.requests.push(id);if(fixtureState.infoMode==='deferred'||(fixtureState.playlistMode&&id==='second'))return new Promise((resolve,reject)=>{fixtureState.resolveInfo=resolve;fixtureState.rejectInfo=reject;fixtureState.infoReady?.();});return Promise.reject(fixtureState.rejection);}}})};
 `;
@@ -77,6 +78,11 @@ export const Innertube={create:async()=>({session:{context:{client:{}}},music:{g
       {
         name: 'controlled-download-native-boundaries',
         async resolveId(id: string) {
+          if (id === 'owned-real-sdk')
+            return {
+              id: requireRoot.resolve('youtubei.js').replaceAll('\\', '/'),
+              external: true,
+            };
           if (id === 'electron-is' && badgePlatform)
             return '\0fixture-platform';
           if (id === 'filenamify') return '\0fixture-filenamify';
@@ -177,7 +183,13 @@ export const Innertube={create:async()=>({session:{context:{client:{}}},music:{g
         .at(-1)?.args[0],
     emit: async (event: string, ...args: unknown[]) => {
       for (const listener of ipcMain.listeners(event))
-        await listener({}, ...args);
+        await listener(
+          {
+            sender: window.webContents,
+            senderFrame: window.webContents.mainFrame,
+          },
+          ...args,
+        );
     },
     close: async () => {
       delete requireRoot.cache[output];
@@ -500,7 +512,19 @@ test('a mixed playlist retains its first error through a later successful track 
         duration: 100,
       },
       playability_status: { status: 'OK' },
-      chooseFormat: () => ({ itag: 140, content_length: 0 }),
+      streaming_data: {
+        formats: [],
+        adaptive_formats: [
+          {
+            itag: 140,
+            mime_type: 'audio/mp4; codecs="mp4a.40.2"',
+            has_audio: true,
+            has_video: false,
+            is_original: true,
+            content_length: 3,
+          },
+        ],
+      },
     });
     await pending;
     expect(f.state.requests).toEqual(['first', 'second']);

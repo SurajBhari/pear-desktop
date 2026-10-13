@@ -75,7 +75,7 @@ test('a wet-node connection failure rolls back the local source edge and closes 
     f.loads[0].resolve();
     await f.settle();
     expect(graph.audioSource.connections).toEqual(
-      new Set([graph.audioContext.destination, graph.unrelated]),
+      new Set([graph.audioGraph.dryInput, graph.unrelated]),
     );
     const node = f.nodes.find((n) => n.kind === 'worklet');
     expect(node.portClosed).toBe(true);
@@ -108,7 +108,7 @@ test('normal disable retires processor/port and leaves existing dry and unrelate
     expect(node.messages.some((m: any) => m.type === 'dispose')).toBe(true);
     expect(node.connections.size).toBe(0);
     expect(graph.audioSource.connections).toEqual(
-      new Set([graph.audioContext.destination, graph.unrelated]),
+      new Set([graph.audioGraph.dryInput, graph.unrelated]),
     );
   } finally {
     await f.close();

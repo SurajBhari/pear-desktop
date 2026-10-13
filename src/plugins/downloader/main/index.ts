@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
+import { join, relative, resolve, isAbsolute, sep } from 'node:path';
 
 import { Mutex } from 'async-mutex';
 import { BG, type BgConfig } from 'bgutils-js';
@@ -18,7 +18,6 @@ import NodeID3 from 'node-id3';
 import {
   Innertube,
   UniversalCache,
-  Utils,
   YTNodes,
   Platform,
   type YT,
@@ -50,7 +49,23 @@ import {
   setBadge,
 } from './utils';
 
-import { DefaultPresetList, type Preset, VideoFormatList } from '../types';
+import {
+  describeAudioFormats,
+  selectAudioFormat,
+  sourceContainer,
+  validateAudioPreference,
+  type AudioDescriptor,
+} from '../audio';
+import {
+  checkDuplicate,
+  publishCompleted,
+  hasVerifiedTrack,
+  scanLibrary,
+  type CompletedInput,
+  type LibraryReport,
+} from '../library';
+import { downloadSelectedAudio } from '../transfer';
+import { DefaultPresetList, type Preset } from '../types';
 
 import type { DownloaderPluginConfig } from '../index';
 import type { BackendContext } from '@/types/contexts';
@@ -212,6 +227,9 @@ interface DownloaderBinding {
   disposed: boolean;
   ready: boolean;
   cleanup: (() => void)[];
+  scan?: AbortController;
+  library?: LibraryReport;
+  review: { id: string; title: string; reason: string }[];
 }
 let backend: DownloaderBinding | undefined;
 const botguardMutex = new Mutex();
@@ -234,6 +252,7 @@ const assertCurrentBinding = (owner: DownloaderBinding) => {
 const disposeBinding = (owner: DownloaderBinding | undefined) => {
   if (!owner || owner.disposed) return;
   owner.disposed = true;
+  owner.scan?.abort();
   owner.initialization.dispose();
   for (const dispose of owner.cleanup) dispose();
   owner.cleanup = [];
@@ -370,6 +389,7 @@ export const onMainLoad = async (
     disposed: false,
     ready: false,
     cleanup: [],
+    review: [],
   };
   backend = owner;
   const closed = () => disposeBinding(owner);
@@ -402,6 +422,130 @@ export const onMainLoad = async (
       isCurrentBinding(owner) ? downloadPlaylist(url) : undefined,
     );
     owner.cleanup.push(() => ipc.removeHandler('download-playlist-request'));
+    const handlers: Record<string, (...args: never[]) => unknown> = {
+      'downloader-settings': () => ({
+        config,
+        library: owner.library,
+        review: owner.review,
+      }),
+      'downloader-save-settings': async (value: unknown) => {
+        const settings = value as Partial<DownloaderPluginConfig>;
+        const sourceAudio = validateAudioPreference(settings?.sourceAudio);
+        if (
+          ![
+            'legacy',
+            'skip-any',
+            'keep-better',
+            'save-variant',
+            'ask',
+          ].includes(settings.duplicatePolicy ?? '') ||
+          typeof settings.sourceFallback !== 'boolean'
+        )
+          throw new Error('Invalid duplicate/fallback settings');
+        if (
+          settings.selectedPreset !== undefined &&
+          !Object.hasOwn(DefaultPresetList, settings.selectedPreset)
+        )
+          throw new Error('Unknown output preset');
+        const patch = {
+          sourceAudio,
+          sourceFallback: settings.sourceFallback,
+          duplicatePolicy: settings.duplicatePolicy,
+          selectedPreset: settings.selectedPreset ?? config.selectedPreset,
+        };
+        assertCurrentBinding(owner);
+        await context.setConfig(patch);
+        assertCurrentBinding(owner);
+        config = { ...config, ...patch };
+        return config;
+      },
+      'downloader-formats': async (url?: string) => {
+        const id = getVideoId(url ?? playingUrl);
+        if (!id)
+          throw new Error('Select a track before inspecting source audio');
+        const yt = await owner.initialization.get();
+        assertCurrentBinding(owner);
+        let info: YTMusic.TrackInfo | YT.VideoInfo = await yt.music.getInfo(id);
+        let client: 'YTMUSIC' | 'TV_EMBEDDED' = 'YTMUSIC';
+        assertCurrentBinding(owner);
+        if (info.playability_status?.status === 'LOGIN_REQUIRED') {
+          info = await getAndroidTvInfo(id, yt);
+          client = 'TV_EMBEDDED';
+          assertCurrentBinding(owner);
+        }
+        const rows = describeAudioFormats(
+          [
+            ...(info.streaming_data?.formats ?? []),
+            ...(info.streaming_data?.adaptive_formats ?? []),
+          ],
+          client === 'TV_EMBEDDED',
+        );
+        for (const row of rows) row.client = client;
+        const live =
+          info.page[0].video_details?.is_live ||
+          info.page[0].video_details?.is_post_live_dvr;
+        if (
+          live ||
+          ['LOGIN_REQUIRED', 'UNPLAYABLE'].includes(
+            info.playability_status?.status ?? '',
+          )
+        )
+          for (const row of rows) {
+            row.supported = false;
+            row.reason = live
+              ? 'Live/Post-Live-DVR unsupported'
+              : 'Track not playable in current session';
+          }
+        const premiumHint = await isPremium(owner.context.window).catch(
+          () => undefined,
+        );
+        assertCurrentBinding(owner);
+        return { id, title: info.basic_info.title, formats: rows, premiumHint };
+      },
+      'downloader-selected': async (id: string, key: string) => {
+        if (
+          typeof id !== 'string' ||
+          !/^[\w-]{1,128}$/.test(id) ||
+          typeof key !== 'string' ||
+          key.length > 4096
+        )
+          throw new Error('Invalid track/source selection');
+        return downloadSongFromIdInOperation(
+          id,
+          undefined,
+          undefined,
+          undefined,
+          true,
+          key,
+        );
+      },
+      'downloader-scan': async () => {
+        owner.scan?.abort();
+        const scan = new AbortController();
+        owner.scan = scan;
+        const result = await scanLibrary(getFolder(config.downloadFolder), {
+          signal: scan.signal,
+          onProgress: (visited) => {
+            if (isCurrentBinding(owner))
+              context.ipc.send('downloader-scan-progress', visited);
+          },
+        });
+        assertCurrentBinding(owner);
+        if (owner.scan !== scan) throw new Error('Scan superseded');
+        owner.library = result;
+        return result;
+      },
+      'downloader-scan-cancel': () => {
+        owner.scan?.abort();
+      },
+    };
+    for (const [event, handler] of Object.entries(handlers)) {
+      ipc.handle(event, (...args: never[]) => {
+        assertCurrentBinding(owner);
+        return handler(...args);
+      });
+      owner.cleanup.push(() => ipc.removeHandler(event));
+    }
     owner.cleanup.push(downloadSongOnFinishSetup(context, owner));
   } catch (error) {
     disposeBinding(owner);
@@ -418,6 +562,10 @@ export const onMainStop = ({
 export const onConfigChange = (newConfig: DownloaderPluginConfig) => {
   if (isCurrentBinding(backend)) config = newConfig;
 };
+export const openDownloaderSettings = () => {
+  if (isCurrentBinding(backend))
+    backend.context.ipc.send('downloader-open-settings');
+};
 
 const resolvePreset = (selected: string | undefined): Preset => {
   const name = selected ?? 'mp3 (256kbps)';
@@ -433,6 +581,7 @@ export async function downloadSong(
   playlistFolder?: string,
   trackId?: string,
   increasePlaylistProgress: (value: number) => void = () => {},
+  interactive = true,
 ) {
   const owner = backend;
   if (!isCurrentBinding(owner)) return;
@@ -447,6 +596,8 @@ export async function downloadSong(
       playlistFolder,
       trackId,
       increasePlaylistProgress,
+      undefined,
+      interactive,
     );
   } catch (error: unknown) {
     if (backend === owner && !owner.disposed)
@@ -460,7 +611,7 @@ export async function downloadSongFromId(
   trackId?: string,
   increasePlaylistProgress: (value: number) => void = () => {},
 ) {
-  return downloadSongFromIdInOperation(
+  await downloadSongFromIdInOperation(
     id,
     playlistFolder,
     trackId,
@@ -475,13 +626,14 @@ async function downloadSongFromIdInOperation(
   trackId?: string,
   increasePlaylistProgress: (value: number) => void = () => {},
   startOperation = false,
+  selectedKey?: string,
 ) {
   const owner = backend;
   if (!isCurrentBinding(owner)) return;
   let resolvedName;
   try {
     if (startOperation) clearErrorFeedback(win);
-    await downloadSongUnsafe(
+    return await downloadSongUnsafe(
       owner,
       true,
       id,
@@ -489,10 +641,16 @@ async function downloadSongFromIdInOperation(
       playlistFolder,
       trackId,
       increasePlaylistProgress,
+      selectedKey,
+      startOperation,
     );
   } catch (error: unknown) {
     if (backend === owner && !owner.disposed)
       sendError(error as Error, resolvedName || id);
+    return {
+      status: 'failed' as const,
+      error: error instanceof Error ? error.message : 'Download failed',
+    };
   }
 }
 
@@ -528,6 +686,9 @@ function downloadSongOnFinishSetup(
             config.downloadOnFinish.folder ??
               config.downloadFolder ??
               defaultDownloadFolder,
+            undefined,
+            undefined,
+            false,
           );
         } else if (
           config.downloadOnFinish.mode === 'percent' &&
@@ -538,6 +699,9 @@ function downloadSongOnFinishSetup(
             config.downloadOnFinish.folder ??
               config.downloadFolder ??
               defaultDownloadFolder,
+            undefined,
+            undefined,
+            false,
           );
         }
       }
@@ -566,6 +730,8 @@ async function downloadSongUnsafe(
   playlistFolder?: string,
   trackId?: string,
   increasePlaylistProgress: (value: number) => void = () => {},
+  selectedKey?: string,
+  interactive = false,
 ) {
   const sendFeedback = (message: unknown, progress?: number) => {
     if (!isCurrentBinding(owner)) return;
@@ -590,9 +756,21 @@ async function downloadSongUnsafe(
       );
   }
 
+  if (
+    config.duplicatePolicy === 'skip-any' &&
+    (await hasVerifiedTrack(
+      getFolder(playlistFolder || config.downloadFolder),
+      id,
+      () => assertCurrentBinding(owner),
+    ))
+  ) {
+    sendFeedback('Already downloaded (verified track)', -1);
+    return { status: 'skipped' as const };
+  }
   const yt = await owner.initialization.get();
   assertCurrentBinding(owner);
   let info: YTMusic.TrackInfo | YT.VideoInfo = await yt.music.getInfo(id);
+  let infoClient: 'YTMUSIC' | 'TV_EMBEDDED' = 'YTMUSIC';
   assertCurrentBinding(owner);
 
   if (!info) {
@@ -629,6 +807,7 @@ async function downloadSongUnsafe(
     }
 
     info = bypassedResult;
+    infoClient = 'TV_EMBEDDED';
   }
 
   if (playabilityStatus?.status === 'UNPLAYABLE') {
@@ -640,21 +819,35 @@ async function downloadSongUnsafe(
   }
 
   const presetSetting = resolvePreset(config.selectedPreset);
-  const premium = await isPremium(owner.context.window);
-  assertCurrentBinding(owner);
-
-  const downloadOptions: Types.FormatOptions = {
-    type: premium ? 'audio' : 'video+audio', // Audio, video or video+audio
-    quality: 'best', // Best, bestefficiency, 144p, 240p, 480p, 720p and so on.
-    format: 'any', // Media container format
-  };
-
-  const format = info.chooseFormat(downloadOptions);
+  const formats = [
+    ...(info.streaming_data?.formats ?? []),
+    ...(info.streaming_data?.adaptive_formats ?? []),
+  ];
+  if (
+    !/^[\w-]{1,128}$/.test(metadata.videoId) ||
+    (info.basic_info.id && info.basic_info.id !== metadata.videoId)
+  )
+    throw new Error(
+      'Streaming response track identity does not match metadata',
+    );
+  const rows = describeAudioFormats(formats, infoClient === 'TV_EMBEDDED');
+  for (const row of rows) row.client = infoClient;
+  let selected: AudioDescriptor;
+  const preference = validateAudioPreference(
+    config.sourceAudio ?? { mode: 'best' },
+  );
+  try {
+    selected = selectAudioFormat(rows, preference, selectedKey);
+  } catch (error) {
+    if (!config.sourceFallback || selectedKey) throw error;
+    selected = selectAudioFormat(rows, { ...preference, mode: 'best' });
+    sendFeedback('Requested source unavailable; using best offered source');
+  }
+  const format = formats[rows.indexOf(selected)];
 
   let targetFileExtension: string;
   if (!presetSetting?.extension) {
-    targetFileExtension =
-      VideoFormatList.find((it) => it.itag === format.itag)?.container ?? 'mp3';
+    targetFileExtension = sourceContainer(selected);
   } else {
     targetFileExtension = presetSetting?.extension ?? 'mp3';
   }
@@ -668,13 +861,77 @@ async function downloadSongUnsafe(
   }
   const filePath = join(dir, filename);
 
-  if (config.skipExisting && existsSync(filePath)) {
+  if (!/^[\w]{1,12}$/.test(targetFileExtension))
+    throw new Error('Invalid output extension');
+  const policy = config.duplicatePolicy ?? 'legacy';
+  if (policy === 'legacy' && config.skipExisting && existsSync(filePath)) {
     sendFeedback(null, -1);
     return;
   }
 
-  const stream = await info.download(downloadOptions);
-  assertCurrentBinding(owner);
+  const root = getFolder(config.downloadFolder);
+  // Explicit alternate folders outside the configured library own their index.
+  const within = relative(resolve(root), resolve(dir));
+  const libraryRoot =
+    within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)
+      ? dir
+      : root;
+  const completed: CompletedInput = {
+    videoId: metadata.videoId,
+    source: selected,
+    output: {
+      extension: targetFileExtension,
+      args: [...(presetSetting?.ffmpegArgs ?? []), '-vn'],
+    },
+    policy,
+    preference,
+  };
+  let stopped: 'skipped' | 'needs-choice' = 'skipped';
+  const decide = async () => {
+    const decision = await checkDuplicate(libraryRoot, completed, () =>
+      assertCurrentBinding(owner),
+    );
+    if (decision === 'skip') {
+      sendFeedback('Already downloaded (verified source/output policy)', -1);
+      return false;
+    }
+    if (decision === 'ask') {
+      stopped = 'needs-choice';
+      if (!interactive) {
+        if (!owner.review.some((row) => row.id === id))
+          owner.review.push({
+            id,
+            title: name,
+            reason: 'Existing source quality requires manual choice',
+          });
+        owner.review = owner.review.slice(-100);
+        sendFeedback(
+          'Existing track requires a source-quality choice; queued for manual review',
+          -1,
+        );
+        return false;
+      }
+      const result = await dialog.showMessageBox(owner.context.window, {
+        type: 'question',
+        message:
+          'This track already has a verified download. Source qualities cannot be safely ordered, or your policy asks each time.',
+        buttons: ['Keep existing', 'Save selected variant'],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      assertCurrentBinding(owner);
+      if (result.response !== 1) {
+        stopped = 'skipped';
+        return false;
+      }
+      completed.approved = true;
+    }
+    return true;
+  };
+  if (!(await decide())) return { status: stopped };
+  const iterableStream = await downloadSelectedAudio(info, format, () =>
+    assertCurrentBinding(owner),
+  );
 
   console.info(
     t('plugins.downloader.backend.feedback.download-info', {
@@ -684,8 +941,6 @@ async function downloadSongUnsafe(
     }),
   );
 
-  const iterableStream = Utils.streamToIterable(stream);
-
   if (!existsSync(dir)) {
     mkdirSync(dir);
   }
@@ -694,7 +949,7 @@ async function downloadSongUnsafe(
     iterableStream,
     targetFileExtension,
     metadata,
-    presetSetting?.ffmpegArgs ?? [],
+    completed.output.args,
     format.content_length ?? 0,
     sendFeedback,
     increasePlaylistProgress,
@@ -713,15 +968,39 @@ async function downloadSongUnsafe(
   }
 
   if (fileBuffer) {
-    writeFileSync(filePath, fileBuffer);
+    const saved = await publishCompleted(
+      libraryRoot,
+      dir,
+      filename,
+      fileBuffer,
+      completed,
+      () => assertCurrentBinding(owner),
+    );
+    assertCurrentBinding(owner);
+    if (saved.status === 'needs-choice') {
+      sendFeedback('Concurrent download requires manual source choice', -1);
+      return { status: 'needs-choice' as const };
+    }
+    if (saved.status === 'skipped') {
+      sendFeedback('Already downloaded (verified)', -1);
+      return { status: 'skipped' as const };
+    }
+    sendFeedback(
+      `Saved ${selected.codec} (${Math.round((selected.averageBitrate ?? selected.bitrate ?? 0) / 1000) || 'unknown'} kbps source) → ${targetFileExtension}`,
+      -1,
+    );
+    owner.review = owner.review.filter((row) => row.id !== id);
+    return {
+      status: 'saved' as const,
+      path: saved.path,
+      source: selected,
+      extension: targetFileExtension,
+    };
+  } else {
+    throw new Error(
+      'Audio processing/tagging failed; no file or completion record saved',
+    );
   }
-
-  sendFeedback(null, -1);
-  console.info(
-    t('plugins.downloader.backend.feedback.done', {
-      filePath,
-    }),
-  );
 }
 
 async function downloadChunks(
@@ -844,6 +1123,9 @@ async function writeID3(
     // Create the metadata tags
     tags.title = metadata.title;
     tags.artist = metadata.artist;
+    tags.userDefinedText = [
+      { description: 'pear-desktop:youtube-video-id', value: metadata.videoId },
+    ];
 
     if (metadata.album) {
       tags.album = metadata.album;
@@ -997,7 +1279,10 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
   const folder = getFolder(config.downloadFolder ?? '');
   const playlistFolder = join(folder, safePlaylistTitle);
   if (existsSync(playlistFolder)) {
-    if (!config.skipExisting) {
+    if (
+      !config.skipExisting &&
+      (config.duplicatePolicy ?? 'legacy') === 'legacy'
+    ) {
       sendError(
         new Error(
           t('plugins.downloader.backend.feedback.folder-already-exists', {
@@ -1109,6 +1394,12 @@ function getFFmpegMetadataArgs(metadata: CustomSongInfo) {
     ...(metadata.title ? ['-metadata', `title=${metadata.title}`] : []),
     ...(metadata.artist ? ['-metadata', `artist=${metadata.artist}`] : []),
     ...(metadata.album ? ['-metadata', `album=${metadata.album}`] : []),
+    ...(metadata.videoId
+      ? [
+          '-metadata',
+          `comment=https://music.youtube.com/watch?v=${metadata.videoId}`,
+        ]
+      : []),
     ...(metadata.trackId ? ['-metadata', `track=${metadata.trackId}`] : []),
   ];
 }

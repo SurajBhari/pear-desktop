@@ -2,7 +2,10 @@ import { createStore } from 'solid-js/store';
 
 import { getSongInfo } from '@/providers/song-info-front';
 
+import { config } from './renderer';
+
 import {
+  ProviderNames,
   type ProviderName,
   providerNames,
   type ProviderState,
@@ -19,7 +22,9 @@ type LyricsStore = {
 interface SearchCache {
   state: 'loading' | 'done';
   data: LyricsStore['lyrics'];
+  ytMusicWithoutProxy: boolean;
 }
+const ytMusicWithoutProxy = () => config()?.useYTMLyricsWithoutProxy === true;
 const initialData = () =>
   providerNames.reduce(
     (data, name) => {
@@ -118,17 +123,32 @@ export const fetchLyrics = (info: SongInfo) => {
   }
   const previous = searchCache.get(info.videoId);
   if (previous?.state === 'done') {
-    if (getSongInfo().videoId === info.videoId)
-      setLyricsStore(
-        'lyrics',
-        () =>
-          JSON.parse(JSON.stringify(previous.data)) as LyricsStore['lyrics'],
-      );
+    if (getSongInfo().videoId !== info.videoId) return;
+    const changed = previous.ytMusicWithoutProxy !== ytMusicWithoutProxy();
+    if (changed) {
+      previous.ytMusicWithoutProxy = ytMusicWithoutProxy();
+      previous.state = 'loading';
+      previous.data[ProviderNames.YTMusic] = {
+        state: 'fetching',
+        data: null,
+        error: null,
+      };
+    }
+    setLyricsStore(
+      'lyrics',
+      () => JSON.parse(JSON.stringify(previous.data)) as LyricsStore['lyrics'],
+    );
+    if (changed)
+      search(ProviderNames.YTMusic, info, previous).catch(console.error);
     return;
   }
   // A pending old observation (including A -> B -> A or same-ID refresh) is
   // not a completed cache hit. Replace its ownership instead of timer polling.
-  const cache: SearchCache = { state: 'loading', data: initialData() };
+  const cache: SearchCache = {
+    state: 'loading',
+    data: initialData(),
+    ytMusicWithoutProxy: ytMusicWithoutProxy(),
+  };
   searchCache.set(info.videoId, cache);
   if (getSongInfo().videoId === info.videoId)
     setLyricsStore('lyrics', initialData());
@@ -155,6 +175,8 @@ export const retrySearch = (provider: ProviderName, info: SongInfo) => {
   const cache = searchCache.get(info.videoId);
   if (!cache) return;
   const state: ProviderState = { state: 'fetching', data: null, error: null };
+  if (provider === ProviderNames.YTMusic)
+    cache.ytMusicWithoutProxy = ytMusicWithoutProxy();
   cache.state = 'loading';
   cache.data[provider] = state;
   setLyricsStore('lyrics', provider, state);

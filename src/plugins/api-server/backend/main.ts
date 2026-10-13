@@ -1,10 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
+import path from 'node:path';
 
 import { serve, upgradeWebSocket } from '@hono/node-server';
 import { swaggerUI } from '@hono/swagger-ui';
 import { OpenAPIHono as Hono } from '@hono/zod-openapi';
+import { app as electronApp } from 'electron';
 import { cors } from 'hono/cors';
 import { jwt } from 'hono/jwt';
 import { WebSocketServer } from 'ws';
@@ -14,7 +16,16 @@ import { registerCallback } from '@/providers/song-info';
 import { createBackend } from '@/utils';
 
 import { API_VERSION } from './api-version';
+import {
+  captureLegacyClock,
+  captureLegacyRequestScope,
+  configureLegacyClock,
+  stopLegacyClock,
+} from './legacy-clock';
+import { MusicGrantStore } from './music-grant-store';
+import { createMusicService } from './music-service';
 import { registerAuth, registerControl, registerWebsocket } from './routes';
+import { registerMusicRoutes } from './routes/music';
 import { JWTPayloadSchema } from './scheme';
 
 import { type APIServerConfig, AuthStrategy } from '../config';
@@ -29,13 +40,22 @@ import type { MiddlewareHandler } from 'hono';
 
 export const backend = createBackend<BackendType, APIServerConfig>({
   async start(ctx) {
+    if (this.musicWindow) stopLegacyClock(this.musicWindow);
+    this.musicService?.stop();
+    this.musicService = undefined;
+    this.musicWindow = undefined;
+    this.queueRequestScope?.abort();
+    this.queueRequestScope = undefined;
     const revision = (this.startRevision = (this.startRevision ?? 0) + 1);
     this.unsubscribeSongInfo?.();
     this.unsubscribeSongInfo = undefined;
     this.songInfo = undefined;
     this.currentRepeatMode = undefined;
-    const config = await ctx.getConfig();
+    const configRevision = this.musicConfigRevision ?? 0;
+    let config = await ctx.getConfig();
     if (revision !== this.startRevision) return;
+    if (configRevision !== (this.musicConfigRevision ?? 0) && this.musicConfig)
+      config = this.musicConfig;
 
     this.init(ctx);
     this.unsubscribeSongInfo = registerCallback(
@@ -80,6 +100,11 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     this.end();
   },
   onConfigChange(config) {
+    this.musicConfigRevision = (this.musicConfigRevision ?? 0) + 1;
+    // Reconfiguration, including authorization changes, retires admitted playlist work.
+    this.queueRequestScope?.abort();
+    this.queueRequestScope = new AbortController();
+    this.configureMusic(config);
     const old = this.oldConfig;
     if (
       old?.hostname === config.hostname &&
@@ -99,7 +124,26 @@ export const backend = createBackend<BackendType, APIServerConfig>({
 
   // Custom
   init(backendCtx) {
-    this.app = new Hono();
+    this.musicWindow = backendCtx.window;
+    this.app = new Hono<{ Variables: { playlistQueueSignal?: AbortSignal } }>();
+    const owningApp = this.app;
+
+    registerMusicRoutes(
+      this.app,
+      () => (this.app === owningApp ? this.musicService : undefined),
+      () => {
+        const service = this.app === owningApp ? this.musicService : undefined;
+        if (!service) return;
+        const config = this.musicConfig;
+        return {
+          resource: service.resource,
+          current: () =>
+            this.app === owningApp &&
+            this.musicService === service &&
+            this.musicConfig === config,
+        };
+      },
+    );
 
     this.app.use('*', cors());
 
@@ -109,6 +153,21 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       await next();
     });
 
+    // Capture scope before asynchronous authentication so stop/reconfigure cannot admit old work later.
+    this.app.use(`/api/${API_VERSION}/queue/playlist`, async (ctx, next) => {
+      ctx.set(
+        'playlistQueueSignal',
+        this.app === owningApp
+          ? (this.queueRequestScope?.signal ?? AbortSignal.abort())
+          : AbortSignal.abort(),
+      );
+      await next();
+    });
+    for (const alias of ['song', 'song-info'])
+      this.app.use(`/api/${API_VERSION}/${alias}`, async (ctx, next) => {
+        captureLegacyRequestScope(ctx.req.raw, backendCtx.window);
+        await next();
+      });
     // middlewares
     const jwtGuard: MiddlewareHandler = async (ctx, next) => {
       if (ctx.req.path.endsWith(`${API_VERSION}/ws`)) {
@@ -156,6 +215,23 @@ export const backend = createBackend<BackendType, APIServerConfig>({
           'document.querySelector("#like-button-renderer")?.likeStatus',
         ) as Promise<LikeType>,
       () => this.volumeState,
+      (info, ctx) => {
+        const payload: unknown = ctx.get('jwtPayload');
+        const principal =
+          payload &&
+          typeof payload === 'object' &&
+          'id' in payload &&
+          typeof payload.id === 'string'
+            ? payload.id
+            : 'legacy-anonymous';
+        return captureLegacyClock(
+          backendCtx.window,
+          info,
+          principal,
+          ctx.req.raw,
+          () => this.app === owningApp && this.songInfo === info,
+        );
+      },
     );
     registerAuth(this.app, backendCtx);
     registerWebsocket(this.app, backendCtx, upgradeWebSocket);
@@ -189,6 +265,9 @@ export const backend = createBackend<BackendType, APIServerConfig>({
   },
   run(config) {
     if (!this.app) return;
+    this.configureMusic(config);
+    if (!this.queueRequestScope || this.queueRequestScope.signal.aborted)
+      this.queueRequestScope = new AbortController();
 
     try {
       const wss = new WebSocketServer({ noServer: true });
@@ -219,7 +298,29 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     }
   },
   end() {
+    if (this.musicWindow) stopLegacyClock(this.musicWindow);
+    this.musicService?.stop();
+    this.musicService = undefined;
+    this.queueRequestScope?.abort();
+    this.queueRequestScope = undefined;
     this.server?.close();
     this.server = undefined;
+  },
+  configureMusic(config) {
+    if (this.musicWindow) configureLegacyClock(this.musicWindow, config);
+    this.musicConfig = { ...config };
+    if (this.musicService) {
+      this.musicService.configure(config);
+      return;
+    }
+    if (!config.musicApiEnabled || !this.musicWindow) return;
+    this.musicGrants ??= new MusicGrantStore(
+      path.join(electronApp.getPath('userData'), 'music-client-grants'),
+    );
+    this.musicService = createMusicService({
+      window: this.musicWindow,
+      config,
+      grants: this.musicGrants,
+    });
   },
 });

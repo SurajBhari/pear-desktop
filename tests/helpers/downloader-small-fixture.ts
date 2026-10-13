@@ -52,6 +52,11 @@ interface FixtureState {
   dialogMode: 'resolve' | 'defer';
   pendingDialogs: { reject: (error: Error) => void }[];
   lastFormat?: { type: string };
+  mediaBytes?: number;
+  sourceLength?: number | null;
+  live?: boolean;
+  loginRequired?: boolean;
+  basicInfoCalls?: { id: string; client: string }[];
 }
 interface FixtureSource {
   downloader: {
@@ -139,16 +144,19 @@ export const app={getPath:()=>${JSON.stringify(downloads)},setBadgeCount(value){
 export const dialog={showMessageBox:async(_window,options)=>{state.dialogs.push(options);if(state.dialogMode==='defer')return new Promise((_resolve,reject)=>state.pendingDialogs.push({reject}));return {response:0};}};
 export class Notification extends EventEmitter {static isSupported(){return false;}show(){}close(){}}
 export const nativeImage={createFromBuffer:()=>({isEmpty:()=>true,getSize:()=>({width:0,height:0})})};
-export const net={fetch:async(input,init)=>{state.network.push({url:String(input.url??input),init});if(state.networkMode==='defer')return new Promise((_resolve,reject)=>{const signal=init?.signal??input.signal;const abort=()=>reject(new DOMException('Owned request aborted','AbortError'));if(signal?.aborted)abort();else signal?.addEventListener('abort',abort,{once:true});});return new Response(new Uint8Array([0]));}};
+export const net={fetch:async(input,init)=>{const url=String(input.url??input);state.network.push({url,init});if(state.networkMode==='defer')return new Promise((_resolve,reject)=>{const signal=init?.signal??input.signal;const abort=()=>reject(new DOMException('Owned request aborted','AbortError'));if(signal?.aborted)abort();else signal?.addEventListener('abort',abort,{once:true});});return new Response(new Uint8Array(url.includes('/media?')?(state.mediaBytes??3):1));}};
 `;
   const youtube = `
 import {state} from 'electron';
+import {FormatUtils as actualFormatUtils} from 'owned-real-sdk';
+export const FormatUtils={download:(options,...args)=>{state.lastFormat=options;return actualFormatUtils.download(options,...args);}};
 export const Platform={shim:{}};export class UniversalCache{};
 class MusicResponsiveListItem {constructor(id){this.id=id;this.title='Track '+id;this.author={name:'Fixture artist'};}}
 export const YTNodes={MusicResponsiveListItem};
 export const Utils={streamToIterable:async function*(stream){const reader=stream.getReader();try{while(true){const chunk=await reader.read();if(chunk.done)return;yield chunk.value;}}finally{reader.releaseLock();}}};
 const playlist=(page)=>({header:state.album?undefined:{title:{text:'Fixture playlist'}},page:{contents_memo:{get:()=>[null,null,{as:()=>({title:{text:'Fixture album'}})}]}},items:(state.pages[page]??[]).map(id=>new MusicResponsiveListItem(id)),has_continuation:page+1<state.pages.length,getContinuation:async()=>{state.continuations++;return playlist(page+1);}});
-const client=(options,index)=>({options,session:{context:{client:{visitorData:state.visitor?'fixture-visitor':undefined}}},music:{getPlaylist:async()=>playlist(0),getInfo:async(id)=>{state.infoCalls.push({id,cookie:options.cookie,index});if(state.infoMode==='reject')throw Error(state.mediaError);if(state.infoMode==='defer')return new Promise((_resolve,reject)=>state.pendingInfo.push({reject}));return {basic_info:{id,title:'Track '+id,author:'Fixture artist',duration:30,thumbnail:[{url:'https://fixture.test/cover.png'}]},playability_status:{status:'OK'},chooseFormat:(format)=>{state.lastFormat=format;return {itag:140,content_length:3};},download:async()=>new ReadableStream({start(c){c.enqueue(new Uint8Array([1,2,3]));c.close();}})};}}});
+const makeInfo=(id,options,muxed=false)=>{const format={itag:muxed?18:140,mime_type:muxed?'video/mp4; codecs="avc1.42001E, mp4a.40.2"':'audio/mp4; codecs="mp4a.40.2"',has_audio:true,has_video:muxed,is_original:true,bitrate:muxed?3000000:128000,content_length:state.sourceLength===null?undefined:(state.sourceLength??3),decipher:async()=> 'https://fixture.test/media?x=1'};return {basic_info:{id,title:'Track '+id,author:'Fixture artist',duration:30,thumbnail:[{url:'https://fixture.test/cover.png'}]},playability_status:{status:'OK'},streaming_data:{formats:[],adaptive_formats:[format]},actions:{session:{http:{fetch_function:options.fetch}}},cpn:'fixture',page:[{video_details:{is_live:!!state.live}}]};};
+const client=(options,index)=>({options,session:{context:{client:{visitorData:state.visitor?'fixture-visitor':undefined}}},getBasicInfo:async(id,args)=>{state.basicInfoCalls??=[];state.basicInfoCalls.push({id,client:args.client});return makeInfo(id,options,true);},music:{getPlaylist:async()=>playlist(0),getInfo:async(id)=>{state.infoCalls.push({id,cookie:options.cookie,index});if(state.infoMode==='reject')throw Error(state.mediaError);if(state.infoMode==='defer')return new Promise((_resolve,reject)=>state.pendingInfo.push({reject}));const info=makeInfo(id,options);if(state.loginRequired)info.playability_status.status='LOGIN_REQUIRED';return info;}}});
 export const Innertube={create:(options)=>{const index=state.creates.length;state.creates.push(options);const value=client(options,index);state.clients.push(value);if(state.initMode==='reject')return Promise.reject(Error('Owned fixture initialization failure'));if(state.initMode==='defer')return new Promise((resolve,reject)=>state.pending.push({resolve:()=>resolve(value),reject}));return Promise.resolve(value);}};
 `;
   const ffmpeg = `
@@ -173,6 +181,13 @@ export const BG={Challenge:{create:async()=>({program:'owned-program',globalName
       {
         name: 'owned-downloader-network-ffmpeg-native',
         async resolveId(id: string, importer: string | undefined) {
+          if (id === 'owned-real-sdk')
+            return {
+              id: normalizeDownloaderFixtureId(
+                requireRoot.resolve('youtubei.js'),
+              ),
+              external: true,
+            };
           if (id === 'electron') return '\0owned-native';
           if (id === 'youtubei.js') return '\0owned-youtube';
           if (id === '@ffmpeg.wasm/main') return '\0owned-ffmpeg';
@@ -221,7 +236,7 @@ export const BG={Challenge:{create:async()=>({program:'owned-program',globalName
           if (id === '\0unused-plugins')
             return 'export const allPlugins=async()=>({});';
           if (id === '\0owned-languages')
-            return `import en from ${JSON.stringify(path.join(root, 'src/i18n/resources/en.json'))};export const languageResources=async()=>({en:{translation:en}});`;
+            return `import en from ${JSON.stringify(path.join(root, 'src/i18n/resources/en.json'))};export const availableLanguages=["en"];export const loadLanguageResource=async(name)=>name==="en"?en:undefined;export const languageResources=async()=>({en:{translation:en}});`;
         },
         transform(code: string, id: string) {
           if (policy.isSongInfo(id))
@@ -268,6 +283,10 @@ export const BG={Challenge:{create:async()=>({program:'owned-program',globalName
   const previousCwd = process.cwd();
   process.chdir(directory);
   const contexts: BackendContext<DownloaderPluginConfig>[] = [];
+  const bridges = new WeakMap<
+    BackendContext<DownloaderPluginConfig>,
+    Map<string, (...args: unknown[]) => unknown>
+  >();
   const config: DownloaderPluginConfig = {
     enabled: true,
     downloadFolder: downloads,
@@ -287,7 +306,9 @@ export const BG={Challenge:{create:async()=>({program:'owned-program',globalName
     const context: BackendContext<DownloaderPluginConfig> = {
       window,
       getConfig: () => ({ ...config }),
-      setConfig() {},
+      setConfig(patch) {
+        Object.assign(config, patch);
+      },
       ipc: {
         handle: (key, fn) =>
           handlers.set(key, fn as (...args: unknown[]) => unknown),
@@ -299,6 +320,7 @@ export const BG={Challenge:{create:async()=>({program:'owned-program',globalName
       },
     };
     contexts.push(context);
+    bridges.set(context, handlers);
     return context;
   };
   return {
@@ -311,6 +333,15 @@ export const BG={Challenge:{create:async()=>({program:'owned-program',globalName
     aliasResolutions,
     downloads,
     createContext,
+    invoke: async (
+      context: BackendContext<DownloaderPluginConfig>,
+      event: string,
+      ...args: unknown[]
+    ) => {
+      const handler = bridges.get(context)?.get(event);
+      if (!handler) throw new Error('Handler unavailable');
+      return await handler(...args);
+    },
     flush: () => new Promise<void>((resolve) => setImmediate(resolve)),
     close: async () => {
       for (const context of contexts) source.downloader.onMainStop?.(context);

@@ -8,9 +8,11 @@ import {
 } from 'solid-js';
 import { type VirtualizerHandle } from 'virtua/solid';
 
+import { t } from '@/i18n';
 import { type LineLyrics } from '@/plugins/synced-lyrics/types';
 
 import { _ytAPI } from '..';
+import { lyricsDisplayTime, lyricsSeekTime } from '../../tools';
 import { config, currentTime } from '../renderer';
 import {
   canonicalize,
@@ -18,72 +20,76 @@ import {
   romanize,
   simplifyUnicode,
 } from '../utils';
+import { renderedWords } from '../word-timing';
 
 interface SyncedLineProps {
   scroller: VirtualizerHandle;
   index: number;
-
   line: LineLyrics;
   status: 'upcoming' | 'current' | 'previous';
 }
 
+const displayTime = () =>
+  lyricsDisplayTime(currentTime(), config()?.timingOffsetMs);
+const seek = (line: LineLyrics) =>
+  _ytAPI?.seekTo(lyricsSeekTime(line.timeInMs, config()?.timingOffsetMs));
+const keySeek = (event: KeyboardEvent, line: LineLyrics) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  seek(line);
+};
+const convertText = (text: string) => {
+  const conversion = config()?.convertChineseCharacter;
+  return conversion && conversion !== 'disabled'
+    ? convertChineseCharacter(text, conversion)
+    : text;
+};
+
 const EmptyLine = (props: SyncedLineProps) => {
   const states = createMemo(() => {
-    const defaultText = config()?.defaultTextString ?? '';
-    return Array.isArray(defaultText) ? defaultText : [defaultText];
+    const text = config()?.defaultTextString ?? '';
+    return Array.isArray(text) ? text : [text];
   });
-
-  const index = createMemo(() => {
-    const progress = currentTime() - props.line.timeInMs;
-    const total = props.line.duration;
-
-    const percentage = Math.min(1, progress / total);
-    return Math.max(0, Math.floor((states().length - 1) * percentage));
+  const text = createMemo(() => {
+    const progress = Math.max(
+      0,
+      Math.min(1, (displayTime() - props.line.timeInMs) / props.line.duration),
+    );
+    const index = Number.isFinite(progress)
+      ? Math.floor((states().length - 1) * progress)
+      : 0;
+    return states()[props.status === 'current' ? index : 0] ?? '';
   });
-
+  const knownGap = () =>
+    Number.isFinite(props.line.duration) && props.line.duration >= 2000;
   return (
     <div
+      aria-label={t('plugins.synced-lyrics.instrumental-break')}
       class={`synced-line ${props.status}`}
-      onClick={() => {
-        _ytAPI?.seekTo((props.line.timeInMs + 10) / 1000);
-      }}
+      onClick={() => seek(props.line)}
+      onKeyDown={(event) => keySeek(event, props.line)}
+      role="button"
+      tabIndex={0}
     >
       <div class="description ytmusic-description-shelf-renderer" dir="auto">
-        <yt-formatted-string
-          text={{
-            runs: [
-              {
-                text: config()?.showTimeCodes ? `[${props.line.time}] ` : '',
-              },
-            ],
-          }}
-        />
-
         <div class="text-lyrics">
-          <span>
-            <span>
-              <Show
-                fallback={
-                  <yt-formatted-string
-                    text={{ runs: [{ text: states()[0] }] }}
-                  />
-                }
-                when={states().length > 1}
-              >
-                <yt-formatted-string
-                  text={{
-                    runs: [
-                      {
-                        text: states().at(
-                          props.status === 'current' ? index() : -1,
-                        )!,
-                      },
-                    ],
-                  }}
-                />
-              </Show>
+          <Show when={config()?.showTimeCodes}>
+            <span class="lyrics-time">[{props.line.time}] </span>
+          </Show>
+          <Show when={knownGap()}>
+            <span
+              aria-label={t('plugins.synced-lyrics.instrumental-break')}
+              class="instrumental-indicator"
+              role="img"
+            >
+              <span aria-hidden="true">
+                <i />
+                <i />
+                <i />
+              </span>
             </span>
-          </span>
+          </Show>
+          <span class="lyrics-placeholder">{text()}</span>
         </div>
       </div>
     </div>
@@ -91,15 +97,19 @@ const EmptyLine = (props: SyncedLineProps) => {
 };
 
 export const SyncedLine = (props: SyncedLineProps) => {
-  const text = createMemo(() => {
-    let line = props.line.text;
-    const convertChineseText = config()?.convertChineseCharacter;
-    if (convertChineseText && convertChineseText !== 'disabled') {
-      line = convertChineseCharacter(line, convertChineseText);
-    }
-    return line.trim();
+  const text = createMemo(() => convertText(props.line.text));
+  const words = createMemo(() => {
+    const timed = renderedWords(props.line);
+    if (!timed) return null;
+    const converted = timed.map((word) => ({
+      ...word,
+      word: convertText(word.word),
+    }));
+    // Context-sensitive conversion/romanization cannot borrow guessed alignment.
+    return converted.map((word) => word.word).join('') === text()
+      ? converted
+      : null;
   });
-
   const [romanization, setRomanization] = createSignal('');
   createEffect(() => {
     const input = canonicalize(text());
@@ -109,7 +119,6 @@ export const SyncedLine = (props: SyncedLineProps) => {
       active = false;
     });
     if (!enabled) return;
-
     romanize(input)
       .then((result) => {
         if (active) setRomanization(canonicalize(result));
@@ -118,59 +127,34 @@ export const SyncedLine = (props: SyncedLineProps) => {
         if (active) setRomanization(input);
       });
   });
-
   return (
-    <Show fallback={<EmptyLine {...props} />} when={text()}>
+    <Show fallback={<EmptyLine {...props} />} when={text().trim()}>
       <div
+        aria-label={text()}
         class={`synced-line ${props.status}`}
-        onClick={() => {
-          _ytAPI?.seekTo((props.line.timeInMs + 10) / 1000);
-        }}
+        onClick={() => seek(props.line)}
+        onKeyDown={(event) => keySeek(event, props.line)}
+        role="button"
+        tabIndex={0}
       >
         <div class="description ytmusic-description-shelf-renderer" dir="auto">
-          <yt-formatted-string
-            text={{
-              runs: [
-                {
-                  text: config()?.showTimeCodes ? `[${props.line.time}] ` : '',
-                },
-              ],
-            }}
-          />
-
-          <div
-            class="text-lyrics"
-            ref={(div: HTMLDivElement) => {
-              // TODO: Investigate the animation, even though the duration is properly set, all lines have the same animation duration
-              div.style.setProperty(
-                '--lyrics-duration',
-                `${props.line.duration / 1000}s`,
-                'important',
-              );
-            }}
-            style={{ 'display': 'flex', 'flex-direction': 'column' }}
-          >
-            <span>
-              <For each={text().split(' ')}>
-                {(word, index) => {
-                  return (
+          <div class="text-lyrics">
+            <Show when={config()?.showTimeCodes}>
+              <span class="lyrics-time">[{props.line.time}] </span>
+            </Show>
+            <span class="lyrics-original" dir="auto">
+              <Show fallback={text()} when={words()}>
+                <For each={words()}>
+                  {(word) => (
                     <span
-                      style={{
-                        'transition-delay': `${index() * 0.05}s`,
-                        'animation-delay': `${index() * 0.05}s`,
-                      }}
+                      class={`lyrics-word ${props.status === 'current' && displayTime() >= word.timeInMs ? 'sung' : 'upcoming'}`}
                     >
-                      <yt-formatted-string
-                        text={{
-                          runs: [{ text: `${word} ` }],
-                        }}
-                      />
+                      {word.word}
                     </span>
-                  );
-                }}
-              </For>
+                  )}
+                </For>
+              </Show>
             </span>
-
             <Show
               when={
                 config()?.romanization &&
@@ -178,24 +162,9 @@ export const SyncedLine = (props: SyncedLineProps) => {
               }
             >
               <span class="romaji">
-                <For each={romanization().split(' ')}>
-                  {(word, index) => {
-                    return (
-                      <span
-                        style={{
-                          'transition-delay': `${index() * 0.05}s`,
-                          'animation-delay': `${index() * 0.05}s`,
-                        }}
-                      >
-                        <yt-formatted-string
-                          text={{
-                            runs: [{ text: `${word} ` }],
-                          }}
-                        />
-                      </span>
-                    );
-                  }}
-                </For>
+                <yt-formatted-string
+                  text={{ runs: [{ text: romanization() }] }}
+                />
               </span>
             </Show>
           </div>

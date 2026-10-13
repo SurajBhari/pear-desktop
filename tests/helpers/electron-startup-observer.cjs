@@ -18,6 +18,7 @@ if (process.type !== 'browser' || !factsPath) {
 }
 
 let published = false;
+let visibilityPoll;
 
 function capture(refresh = false) {
   if ((!refresh && published) || !app.isReady()) return;
@@ -34,14 +35,22 @@ function capture(refresh = false) {
   writeFileSync(temporary, JSON.stringify(facts), { flag: 'wx' });
   renameSync(temporary, factsPath);
   published = true;
+  clearInterval(visibilityPoll);
   return true;
 }
 
 app.on('browser-window-created', (_event, window) => {
-  window.on('show', () => capture());
-  capture();
+  // Native visibility settles after window creation/show listeners return.
+  // Keep the witness native, but sample on the next main-process turn.
+  window.on('show', () => setImmediate(capture));
+  setImmediate(capture);
 });
 app.whenReady().then(() => capture());
+
+// Some native backends settle visibility without a usable show event. Poll the
+// public native state until the first real visible window, then release it.
+visibilityPoll = setInterval(() => capture(), 20);
+app.once('will-quit', () => clearInterval(visibilityPoll));
 
 // A request after public page readiness samples current native state. Removing
 // it acknowledges that the atomic facts publication has completed.

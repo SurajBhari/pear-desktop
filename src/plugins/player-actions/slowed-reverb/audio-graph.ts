@@ -1,3 +1,7 @@
+import {
+  getCurrentAudioGraph,
+  graphFromAnnouncement,
+} from '@/providers/renderer-audio';
 export interface AudioCanPlayDetail {
   audioContext: AudioContext;
   audioSource: MediaElementAudioSourceNode;
@@ -21,12 +25,12 @@ document.addEventListener(
   (event) => {
     const detail = (event as CustomEvent<AudioCanPlayDetail>).detail;
     if (detail?.audioContext && detail?.audioSource) {
-      latestAudioDetail = detail;
+      latestAudioDetail = graphFromAnnouncement(detail);
     }
   },
   { passive: true },
 );
 
 export function getLatestAudioDetail(): AudioCanPlayDetail | null {
-  return latestAudioDetail;
+  return getCurrentAudioGraph() ?? latestAudioDetail;
 }

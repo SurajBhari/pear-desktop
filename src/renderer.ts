@@ -1,9 +1,17 @@
 import i18next from 'i18next';
 import { setTheme } from 'mdui/functions/setTheme.js';
+
+import {
+  loadI18n,
+  retireLanguageRequests,
+  setLanguage,
+  t as i18t,
+} from '@/i18n';
+
 import 'mdui/mdui.css';
 import 'mdui';
 
-import { loadI18n, setLanguage, t as i18t } from '@/i18n';
+import { initializeAudioGraph } from '@/providers/renderer-audio';
 import { LoggerPrefix } from '@/utils';
 import {
   defaultTrustedTypePolicy,
@@ -19,6 +27,9 @@ import {
   loadAllRendererPlugins,
 } from './loader/renderer';
 import { startingPages } from './providers/extracted-data';
+import { createPlaylistQueueController } from './providers/queue-playlist-renderer';
+import { createRepeatPreference } from './providers/repeat-preference';
+import { setupShareLinks } from './providers/share-links';
 import { setupSongInfo } from './providers/song-info-front';
 
 import type { MusicPlayer } from '@/types/music-player';
@@ -30,7 +41,20 @@ import type { SearchBoxElement } from '@/types/search-box-element';
 
 setTheme('dark');
 
+let languageDocumentActive = true;
+const isLanguageDocumentCurrent = () => languageDocumentActive;
+window.addEventListener(
+  'pagehide',
+  () => {
+    languageDocumentActive = false;
+    retireLanguageRequests();
+  },
+  { once: true },
+);
+
 let api: (Element & MusicPlayer) | null = null;
+let repeatPreference: ReturnType<typeof createRepeatPreference> | undefined;
+let playlistQueue: ReturnType<typeof createPlaylistQueueController> | undefined;
 let isPluginLoaded = false;
 let isApiLoaded = false;
 let firstDataLoaded = false;
@@ -77,6 +101,10 @@ async function callOnPlayerApiReady(
 }
 
 async function onApiLoaded() {
+  playlistQueue?.dispose();
+  playlistQueue = createPlaylistQueueController(api, () => api);
+  repeatPreference?.dispose();
+  repeatPreference = createRepeatPreference();
   // Workaround for macOS traffic lights
   {
     let osType = 'Unknown';
@@ -207,6 +235,7 @@ async function onApiLoaded() {
         )
         ?.onRepeatButtonClick();
     }
+    repeatPreference?.rememberUserChange();
   });
   window.ipcRenderer.on('peard:update-volume', (_, volume: number) => {
     if (!api || !Number.isFinite(volume)) return;
@@ -278,66 +307,6 @@ async function onApiLoaded() {
     } satisfies QueueResponse);
   });
 
-  window.ipcRenderer.on(
-    'peard:add-to-queue',
-    (_, videoId: string, queueInsertPosition: string) => {
-      (
-        window as unknown as {
-          blockerSceneGuard?: { cancelFromUser: () => void };
-        }
-      ).blockerSceneGuard?.cancelFromUser();
-      const queue = document.querySelector<QueueElement>('#queue');
-      const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
-      if (!app) return;
-
-      const store = queue?.queue.store.store;
-      if (!store) return;
-
-      app.networkManager
-        .fetch('/music/get_queue', {
-          queueContextParams: store.getState().queue.queueContextParams,
-          queueInsertPosition,
-          videoIds: [videoId],
-        })
-        .then((result) => {
-          if (
-            result &&
-            typeof result === 'object' &&
-            'queueDatas' in result &&
-            Array.isArray(result.queueDatas)
-          ) {
-            const queueItems = store.getState().queue.items;
-            const queueItemsLength = queueItems.length ?? 0;
-            queue?.dispatch({
-              type: 'ADD_ITEMS',
-              payload: {
-                nextQueueItemId: store.getState().queue.nextQueueItemId,
-                index:
-                  queueInsertPosition === 'INSERT_AFTER_CURRENT_VIDEO'
-                    ? queueItems.findIndex(
-                        (it) =>
-                          (
-                            it.playlistPanelVideoRenderer ||
-                            it.playlistPanelVideoWrapperRenderer
-                              ?.primaryRenderer.playlistPanelVideoRenderer
-                          )?.selected,
-                      ) + 1 || queueItemsLength
-                    : queueItemsLength,
-                items: result.queueDatas
-                  .map((it) =>
-                    typeof it === 'object' && it && 'content' in it
-                      ? it.content
-                      : null,
-                  )
-                  .filter(Boolean),
-                shuffleEnabled: false,
-                shouldAssignIds: true,
-              },
-            });
-          }
-        });
-    },
-  );
   window.ipcRenderer.on(
     'peard:move-in-queue',
     (_, fromIndex: number, toIndex: number) => {
@@ -427,7 +396,7 @@ async function onApiLoaded() {
   const video = document.querySelector('video')!;
   const audioContext = new AudioContext();
   const audioSource = audioContext.createMediaElementSource(video);
-  audioSource.connect(audioContext.destination);
+  const audioGraph = initializeAudioGraph(audioContext, audioSource);
 
   for (const [id, plugin] of Object.entries(getAllLoadedRendererPlugins())) {
     if (typeof plugin.renderer !== 'function') {
@@ -447,6 +416,7 @@ async function onApiLoaded() {
         detail: {
           audioContext,
           audioSource,
+          audioGraph,
         },
       }),
     );
@@ -556,7 +526,12 @@ const definePearTransElements = () => {
 
 const preload = async () => {
   await loadI18n();
-  await setLanguage(window.mainConfig.get('options.language') ?? 'en');
+  if (!isLanguageDocumentCurrent()) return;
+  await setLanguage(
+    window.mainConfig.get('options.language') ?? 'en',
+    isLanguageDocumentCurrent,
+  );
+  if (!isLanguageDocumentCurrent()) return;
   window.i18n = {
     t: i18t.bind(i18next),
   };
@@ -567,6 +542,30 @@ const preload = async () => {
 };
 
 const main = async () => {
+  const setSharedLinks = setupShareLinks();
+  let shareActive = true;
+  const updateSharedLinks = (_event: unknown, value: unknown) => {
+    if (shareActive) setSharedLinks(value === true);
+  };
+  window.ipcRenderer.on(
+    'peard:strip-music-from-shared-links',
+    updateSharedLinks,
+  );
+  setSharedLinks(
+    window.mainConfig.get('options.stripMusicFromSharedLinks') === true,
+  );
+  window.addEventListener(
+    'pagehide',
+    () => {
+      shareActive = false;
+      window.ipcRenderer.removeListener(
+        'peard:strip-music-from-shared-links',
+        updateSharedLinks,
+      );
+      setSharedLinks(false);
+    },
+    { once: true },
+  );
   await loadAllRendererPlugins();
   isPluginLoaded = true;
 
@@ -649,4 +648,9 @@ const initObserver = async () => {
   });
 };
 
-initObserver().then(preload).then(main);
+initObserver()
+  .then(preload)
+  .then(() => {
+    if (isLanguageDocumentCurrent()) return main();
+    return undefined;
+  });

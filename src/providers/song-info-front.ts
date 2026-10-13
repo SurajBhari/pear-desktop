@@ -1,6 +1,7 @@
 import { LikeType, type GetState } from '@/types/datahost-get-state';
 
 import { singleton } from './decorators';
+import { adoptPlaybackOwner, type PlaybackBinding } from './playback-owner';
 
 import type { SongInfo } from './song-info';
 import type { MusicPlayer } from '@/types/music-player';
@@ -204,6 +205,7 @@ export const setupAutoPlayChangedListener = singleton(() => {
 });
 
 export const setupSongInfo = (api: MusicPlayer) => {
+  const playbackOwner = adoptPlaybackOwner(api);
   window.ipcRenderer.on('peard:setup-time-changed-listener', () => {
     setupTimeChangedListener();
   });
@@ -266,6 +268,27 @@ export const setupSongInfo = (api: MusicPlayer) => {
 
   const waitingEvent = new Set<string>();
   const waitingTimeouts = new Map<string, NodeJS.Timeout>();
+  let submittedBinding: PlaybackBinding | null = null;
+
+  const refreshBinding = (
+    previous: PlaybackBinding,
+    binding: PlaybackBinding | null,
+  ) => {
+    if (submittedBinding !== previous) return;
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
+    if (binding && !playbackOwner.binding(previous.videoId, binding))
+      binding = null;
+    if (submittedBinding !== previous) return;
+    submittedBinding = binding;
+    window.ipcRenderer.send('peard:time-changed', {
+      type: 'playback-binding-refresh',
+      previous,
+      binding,
+    });
+  };
 
   const clearVideoTimeout = (videoId: string) => {
     const timeoutId = waitingTimeouts.get(videoId);
@@ -279,13 +302,26 @@ export const setupSongInfo = (api: MusicPlayer) => {
   // Name = "dataloaded" and abit later "dataupdated"
   // Sometimes "dataupdated" is not fired, so we need to fallback to "dataloaded"
   api.addEventListener('videodatachange', (name, videoData) => {
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
+    const previous = submittedBinding;
+    const binding = playbackOwner.binding(videoData.videoId);
     videoEventDispatcher(name, videoData);
+    // A synchronous document listener can publish or retire a newer lineage.
+    if (submittedBinding !== previous) return;
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
 
     if (name === 'dataupdated' && waitingEvent.has(videoData.videoId)) {
       waitingEvent.delete(videoData.videoId);
       clearVideoTimeout(videoData.videoId);
-      sendSongInfo(videoData);
+      sendSongInfo(videoData, binding);
     } else if (name === 'dataloaded') {
+      if (previous) refreshBinding(previous, null);
       const video = document.querySelector<HTMLVideoElement>('video');
       video?.dispatchEvent(srcChangedEvent);
 
@@ -301,11 +337,18 @@ export const setupSongInfo = (api: MusicPlayer) => {
         if (waitingEvent.has(videoData.videoId)) {
           waitingEvent.delete(videoData.videoId);
           waitingTimeouts.delete(videoData.videoId);
-          sendSongInfo(videoData);
+          sendSongInfo(videoData, binding);
         }
       }, DATAUPDATED_FALLBACK_TIMEOUT_MS);
 
       waitingTimeouts.set(videoData.videoId, timeoutId);
+    } else if (previous) {
+      refreshBinding(
+        previous,
+        name === 'dataupdated' && videoData.videoId === previous.videoId
+          ? binding
+          : null,
+      );
     }
   });
 
@@ -341,7 +384,13 @@ export const setupSongInfo = (api: MusicPlayer) => {
     }
   }
 
-  function sendSongInfo(videoData: VideoDataChangeValue) {
+  function sendSongInfo(
+    videoData: VideoDataChangeValue,
+    binding = playbackOwner.binding(videoData.videoId),
+  ) {
+    if (!playbackOwner.isCurrent()) return;
+    // A delayed payload cannot acquire a newer episode, including same-ID ABA.
+    if (binding && !playbackOwner.binding(videoData.videoId, binding)) return;
     const data = api.getPlayerResponse();
 
     let playerOverlay: PlayerOverlays | undefined;
@@ -363,6 +412,11 @@ export const setupSongInfo = (api: MusicPlayer) => {
     data.videoDetails.elapsedSeconds = 0;
     data.videoDetails.isPaused = false;
 
-    window.ipcRenderer.send('peard:video-src-changed', data);
+    const annotation: PlaybackBinding | null = binding
+      ? playbackOwner.binding(videoData.videoId, binding)
+      : null;
+    if (!playbackOwner.isCurrent() || (binding && !annotation)) return;
+    submittedBinding = annotation;
+    window.ipcRenderer.send('peard:video-src-changed', data, annotation);
   }
 };

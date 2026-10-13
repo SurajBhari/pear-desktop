@@ -77,13 +77,12 @@ jobs:
           sudo flatpak install -y flathub org.freedesktop.Platform/x86_64/24.08
           sudo flatpak install -y flathub org.freedesktop.Sdk/x86_64/24.08
           sudo flatpak install -y flathub org.electronjs.Electron2.BaseApp/x86_64/24.08
+          sudo flatpak install -y --system flathub org.freedesktop.Platform/aarch64/24.08 org.freedesktop.Sdk/aarch64/24.08 org.electronjs.Electron2.BaseApp/aarch64/24.08
 
       - name: Build on Linux
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           pnpm dist:linux
-          pnpm dist:linux:deb-arm64
-          pnpm dist:linux:rpm-arm64
 
       - name: Build on Windows
         if: startsWith(matrix.os, 'windows')

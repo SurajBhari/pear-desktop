@@ -1,3 +1,4 @@
+import { ipcMain } from 'electron';
 import is from 'electron-is';
 
 import { t } from '@/i18n';
@@ -5,8 +6,9 @@ import { createPlugin } from '@/utils';
 
 import { sortSegments } from './segments';
 
-import type { Segment, SkipSegment } from './types';
+import type { Segment } from './types';
 import type { GetPlayerResponse } from '@/types/get-player-response';
+import type { MusicPlayer } from '@/types/music-player';
 
 export type SponsorBlockPluginConfig = {
   enabled: boolean;
@@ -21,9 +23,75 @@ export type SponsorBlockPluginConfig = {
   )[];
 };
 
+type SegmentResponse = { videoId: string; requestId: number } & (
+  | { phase: 'begin' }
+  | { phase: 'result'; segments: Segment[] }
+);
+type RendererState = {
+  video: HTMLVideoElement | null;
+  playerApi: MusicPlayer | undefined;
+  unsubscribe: (() => void) | undefined;
+  applySegments(target: HTMLVideoElement): void;
+  timeUpdateListener(this: void, event: Event): void;
+  metadataListener(this: void, event: Event): void;
+  emptyListener(this: void, event: Event): void;
+  resetSegments(this: void): void;
+  stop(): void;
+};
+let backendEpoch = 0;
+let requestEpoch = 0;
+let requestController: AbortController | undefined;
+let removeBackendListener: (() => void) | undefined;
+let rendererEpoch = 0;
+let rendererActive = false;
 let currentSegments: Segment[] = [];
+let segmentVideoId = '';
+let observedVideoId = '';
+let currentRequestId = 0;
+let mediaReady = false;
 
-export default createPlugin({
+const stopBackend = () => {
+  backendEpoch++;
+  requestEpoch++;
+  requestController?.abort();
+  requestController = undefined;
+  removeBackendListener?.();
+  removeBackendListener = undefined;
+};
+
+const normalizeSegments = (data: unknown): Segment[] => {
+  if (!Array.isArray(data) || data.length > 10000) return [];
+  const segments: Segment[] = [];
+  for (const submission of data) {
+    if (
+      !submission ||
+      typeof submission !== 'object' ||
+      !('segment' in submission)
+    )
+      continue;
+    const segment = submission.segment;
+    if (
+      !Array.isArray(segment) ||
+      segment.length !== 2 ||
+      typeof segment[0] !== 'number' ||
+      typeof segment[1] !== 'number' ||
+      !Number.isFinite(segment[0]) ||
+      !Number.isFinite(segment[1]) ||
+      segment[0] < 0 ||
+      segment[1] <= segment[0]
+    )
+      continue;
+    segments.push([segment[0], segment[1]]);
+  }
+  return sortSegments(segments);
+};
+
+export default createPlugin<
+  unknown,
+  unknown,
+  RendererState,
+  SponsorBlockPluginConfig
+>({
   name: () => t('plugins.sponsorblock.name'),
   description: () => t('plugins.sponsorblock.description'),
   restartNeeded: true,
@@ -39,89 +107,205 @@ export default createPlugin({
       'music_offtopic',
     ],
   } as SponsorBlockPluginConfig,
-  async backend({ getConfig, ipc }) {
-    const fetchSegments = async (
-      apiURL: string,
-      categories: string[],
-      videoId: string,
-    ) => {
-      const sponsorBlockURL = `${apiURL}/api/skipSegments?videoID=${videoId}&categories=${JSON.stringify(
-        categories,
-      )}`;
-      try {
-        const resp = await fetch(sponsorBlockURL, {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          redirect: 'follow',
+  backend: {
+    async start({ getConfig, ipc, window }) {
+      stopBackend();
+      const epoch = backendEpoch;
+      const config = await getConfig();
+      if (epoch !== backendEpoch) return;
+      const listener = async (
+        event: Electron.IpcMainEvent,
+        data: GetPlayerResponse,
+      ) => {
+        if (epoch !== backendEpoch || event.sender !== window.webContents)
+          return;
+        requestController?.abort();
+        const request = ++requestEpoch;
+        const controller = new AbortController();
+        requestController = controller;
+        const videoId = data?.videoDetails?.videoId;
+        if (typeof videoId !== 'string' || !videoId || videoId.length > 128) {
+          ipc.send('sponsorblock-skip', {
+            phase: 'begin',
+            videoId: '',
+            requestId: request,
+          });
+          return;
+        }
+        // Fence the preceding video before the network result can arrive.
+        ipc.send('sponsorblock-skip', {
+          phase: 'begin',
+          videoId,
+          requestId: request,
         });
-        if (resp.status !== 200) {
-          return [];
+        let segments: Segment[] = [];
+        try {
+          const url = new URL(
+            `${config.apiURL.replace(/\/$/, '')}/api/skipSegments`,
+          );
+          url.searchParams.set('videoID', videoId);
+          url.searchParams.set('categories', JSON.stringify(config.categories));
+          const response = await fetch(url.toString(), {
+            signal: controller.signal,
+            redirect: 'follow',
+          });
+          if (response.status === 200)
+            segments = normalizeSegments(await response.json());
+        } catch (error) {
+          if (!controller.signal.aborted && is.dev())
+            console.log('error on sponsorblock request:', error);
         }
-
-        const segments = (await resp.json()) as SkipSegment[];
-        return sortSegments(segments.map((submission) => submission.segment));
-      } catch (error) {
-        if (is.dev()) {
-          console.log('error on sponsorblock request:', error);
-        }
-
-        return [];
-      }
-    };
-
-    const config = await getConfig();
-
-    const { apiURL, categories } = config;
-
-    ipc.on('peard:video-src-changed', async (data: GetPlayerResponse) => {
-      const segments = await fetchSegments(
-        apiURL,
-        categories,
-        data?.videoDetails?.videoId,
-      );
-      ipc.send('sponsorblock-skip', segments);
-    });
+        if (
+          controller.signal.aborted ||
+          epoch !== backendEpoch ||
+          request !== requestEpoch ||
+          window.isDestroyed?.()
+        )
+          return;
+        ipc.send('sponsorblock-skip', {
+          phase: 'result',
+          videoId,
+          segments,
+          requestId: request,
+        });
+      };
+      ipcMain.on('peard:video-src-changed', listener);
+      removeBackendListener = () =>
+        ipcMain.removeListener('peard:video-src-changed', listener);
+    },
+    stop: stopBackend,
   },
   renderer: {
-    timeUpdateListener: (e: Event) => {
-      if (e.target instanceof HTMLVideoElement) {
-        const target = e.target;
-
-        for (const segment of currentSegments) {
-          if (
-            target.currentTime >= segment[0] &&
-            target.currentTime < segment[1]
-          ) {
-            target.currentTime = segment[1];
-            if (window.electronIs.dev()) {
-              console.log('SponsorBlock: skipping segment', segment);
-            }
-          }
+    video: null as HTMLVideoElement | null,
+    playerApi: undefined as MusicPlayer | undefined,
+    unsubscribe: undefined as (() => void) | undefined,
+    applySegments(target: HTMLVideoElement) {
+      if (
+        !rendererActive ||
+        target !== this.video ||
+        !mediaReady ||
+        !observedVideoId ||
+        segmentVideoId !== observedVideoId
+      )
+        return;
+      try {
+        if (
+          this.playerApi?.getVideoData?.()?.video_id !== observedVideoId ||
+          this.playerApi?.getPlayerResponse?.()?.videoDetails?.videoId !==
+            observedVideoId
+        )
+          return;
+      } catch {
+        return;
+      }
+      for (const [start, end] of currentSegments) {
+        if (target.currentTime >= start && target.currentTime < end) {
+          target.currentTime = end;
+          break;
         }
       }
     },
-    resetSegments: () => (currentSegments = []),
-    start({ ipc }) {
-      ipc.on('sponsorblock-skip', (segments: Segment[]) => {
-        currentSegments = segments;
-      });
+    timeUpdateListener: (_event: Event) => {},
+    metadataListener: (_event: Event) => {},
+    emptyListener: (_event: Event) => {},
+    resetSegments: () => {
+      currentSegments = [];
+      segmentVideoId = '';
+      observedVideoId = '';
+      currentRequestId = 0;
+      mediaReady = false;
     },
-    onPlayerApiReady() {
-      const video = document.querySelector<HTMLVideoElement>('video');
-      if (!video) return;
-
-      video.addEventListener('timeupdate', this.timeUpdateListener);
-      // Reset segments on song end
-      video.addEventListener('emptied', this.resetSegments);
+    start({ ipc }) {
+      this.stop();
+      if (!ipc.subscribe)
+        throw new Error('SponsorBlock requires an owned IPC subscription');
+      rendererActive = true;
+      const epoch = rendererEpoch;
+      const receive = (packet: SegmentResponse) => {
+        if (
+          !rendererActive ||
+          epoch !== rendererEpoch ||
+          !packet ||
+          !Number.isSafeInteger(packet.requestId) ||
+          packet.requestId <= 0 ||
+          typeof packet.videoId !== 'string'
+        )
+          return;
+        if (packet.phase === 'begin') {
+          if (packet.requestId <= currentRequestId) return;
+          currentRequestId = packet.requestId;
+          observedVideoId = packet.videoId;
+          segmentVideoId = '';
+          currentSegments = [];
+          return;
+        }
+        if (
+          packet.phase !== 'result' ||
+          packet.requestId !== currentRequestId ||
+          packet.videoId !== observedVideoId ||
+          !Array.isArray(packet.segments) ||
+          packet.segments.length > 10000
+        )
+          return;
+        currentSegments = normalizeSegments(
+          packet.segments.map((segment) => ({ segment })),
+        );
+        segmentVideoId = packet.videoId;
+        if (this.video) this.applySegments(this.video);
+      };
+      this.unsubscribe = ipc.subscribe('sponsorblock-skip', receive);
+    },
+    onPlayerApiReady(playerApi: MusicPlayer, { ipc }) {
+      if (!rendererActive) return;
+      this.video?.removeEventListener('timeupdate', this.timeUpdateListener);
+      this.video?.removeEventListener('emptied', this.emptyListener);
+      this.video?.removeEventListener('loadedmetadata', this.metadataListener);
+      this.resetSegments();
+      this.playerApi = playerApi;
+      this.video = document.querySelector<HTMLVideoElement>('video');
+      const video = this.video;
+      const epoch = rendererEpoch;
+      mediaReady = (video?.readyState ?? 0) > 0;
+      this.timeUpdateListener = (event: Event) => {
+        if (event.target instanceof HTMLVideoElement)
+          this.applySegments(event.target);
+      };
+      this.emptyListener = (event: Event) => {
+        if (
+          rendererActive &&
+          epoch === rendererEpoch &&
+          event.target === this.video
+        )
+          mediaReady = false;
+      };
+      this.metadataListener = (event: Event) => {
+        if (
+          !rendererActive ||
+          epoch !== rendererEpoch ||
+          video !== this.video ||
+          event.target !== video
+        )
+          return;
+        mediaReady = (video?.readyState ?? 0) > 0;
+        if (video) this.applySegments(video);
+      };
+      this.video?.addEventListener('timeupdate', this.timeUpdateListener);
+      this.video?.addEventListener('emptied', this.emptyListener);
+      this.video?.addEventListener('loadedmetadata', this.metadataListener);
+      // Seed the current track when enabled after playback has already started (#4637).
+      ipc.send('peard:video-src-changed', playerApi.getPlayerResponse());
     },
     stop() {
-      const video = document.querySelector<HTMLVideoElement>('video');
-      if (!video) return;
-
-      video.removeEventListener('timeupdate', this.timeUpdateListener);
-      video.removeEventListener('emptied', this.resetSegments);
+      rendererActive = false;
+      rendererEpoch++;
+      this.unsubscribe?.();
+      this.unsubscribe = undefined;
+      this.video?.removeEventListener('timeupdate', this.timeUpdateListener);
+      this.video?.removeEventListener('emptied', this.emptyListener);
+      this.video?.removeEventListener('loadedmetadata', this.metadataListener);
+      this.resetSegments();
+      this.video = null;
+      this.playerApi = undefined;
     },
   },
 });

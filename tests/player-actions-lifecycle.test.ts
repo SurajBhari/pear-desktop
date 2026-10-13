@@ -51,10 +51,10 @@ test('reverb hot enable adopts a newer shared graph and detaches only owned wet 
     expect(b.audioSource.connections.size).toBe(3);
     c.stop();
     expect(b.audioSource.connections).toEqual(
-      new Set([b.audioContext.destination, b.unrelated]),
+      new Set([b.audioGraph.dryInput, b.unrelated]),
     );
     expect(a.audioSource.connections).toEqual(
-      new Set([a.audioContext.destination, a.unrelated]),
+      new Set([a.audioGraph.dryInput, a.unrelated]),
     );
   } finally {
     c.stop();
@@ -110,7 +110,7 @@ test('a pending worklet load cannot create or attach a node after plugin disable
     await f.settle();
     expect(r.slowedReverb.reverbNode).toBeNull();
     expect(graph.audioSource.connections).toEqual(
-      new Set([graph.audioContext.destination, graph.unrelated]),
+      new Set([graph.audioGraph.dryInput, graph.unrelated]),
     );
     expect(f.intervals.size).toBe(0);
   } finally {
@@ -479,7 +479,7 @@ test('failure of the second feature rolls back the first feature resources and r
     f.loads[0].resolve();
     await f.settle();
     expect(graph.audioSource.connections).toEqual(
-      new Set([graph.audioContext.destination, graph.unrelated]),
+      new Set([graph.audioGraph.dryInput, graph.unrelated]),
     );
   } finally {
     await f.close();
@@ -514,7 +514,7 @@ test('a replacement video cannot leave a wet tap on the old shared graph', async
       }),
     );
     expect(old.audioSource.connections).toEqual(
-      new Set([old.audioContext.destination, old.unrelated]),
+      new Set([old.audioGraph.dryInput, old.unrelated]),
     );
     expect(r.slowedReverb.reverbNode).toBeNull();
     const fresh = f.graph('new');

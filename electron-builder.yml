@@ -34,6 +34,11 @@ win:
         - x64
         - ia32
         - arm64
+    - target: nsis
+      arch:
+        - x64
+        - ia32
+        - arm64
     - target: portable
       arch:
         - x64
@@ -42,6 +47,21 @@ win:
   compression: maximum
 nsisWeb:
   runAfterFinish: false
+  # NSIS web inherits nsis options; retain its existing installer and updater.
+  oneClick: true
+  allowToChangeInstallationDirectory: false
+  publish:
+    provider: github
+    owner: deruta74
+    repo: pear-desktop
+    releaseType: draft
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  runAfterFinish: false
+  # The release workflow uploads this offline installer. Only NSIS web writes
+  # latest.yml, so both targets cannot overwrite each other's updater metadata.
+  publish: null
 linux:
   icon: assets/generated/icons/png
   category: AudioVideo
@@ -58,6 +78,7 @@ linux:
     - target: flatpak
       arch:
         - x64
+        - arm64
     - target: deb
       arch:
         - x64

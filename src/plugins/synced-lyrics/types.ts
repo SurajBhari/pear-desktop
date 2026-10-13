@@ -5,11 +5,15 @@ export type SyncedLyricsPluginConfig = {
   enabled: boolean;
   preferredProvider?: ProviderName;
   preciseTiming: boolean;
+  useYTMLyricsWithoutProxy?: boolean;
   showTimeCodes: boolean;
   defaultTextString: string | string[];
   showLyricsEvenIfInexact: boolean;
   lineEffect: LineEffect;
   romanization: boolean;
+  timingOffsetMs?: number;
+  romanizationSizePercent?: number;
+  enhancedLrc?: boolean;
   convertChineseCharacter?:
     | 'simplifiedToTraditional'
     | 'traditionalToSimplified'
@@ -18,12 +22,20 @@ export type SyncedLyricsPluginConfig = {
 
 export type LineLyricsStatus = 'previous' | 'current' | 'upcoming';
 
+export type LineLyricsWord = {
+  timeInMs: number;
+  word: string;
+  endTimeInMs?: number;
+};
+
 export type LineLyrics = {
   time: string;
   timeInMs: number;
   duration: number;
 
   text: string;
+  words?: LineLyricsWord[];
+  instrumental?: boolean;
   status: LineLyricsStatus;
 };
 

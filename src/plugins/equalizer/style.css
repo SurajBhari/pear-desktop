@@ -1,0 +1,112 @@
+.eq-panel {
+  box-sizing: border-box;
+  width: min(980px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  background: var(--ytmusic-general-background-a, #181818);
+  color: var(--ytmusic-primary-text-color, #f5f5f5);
+  border: 1px solid #555;
+  border-radius: 16px;
+  padding: 24px;
+  font:
+    14px/1.45 system-ui,
+    sans-serif;
+}
+.eq-panel::backdrop {
+  background: rgb(0 0 0 / 65%);
+}
+.eq-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.eq-panel h2 {
+  margin: 0;
+  font-size: 20px;
+}
+.eq-panel .eq-notice {
+  color: #bbb;
+  margin: 16px 0;
+}
+.eq-panel .eq-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  margin: 16px 0;
+}
+.eq-panel label {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.eq-panel button,
+.eq-panel input,
+.eq-panel select {
+  box-sizing: border-box;
+  font: inherit;
+  color: inherit;
+  background: #282828;
+  border: 1px solid #666;
+  border-radius: 6px;
+  min-height: 36px;
+  padding: 6px 10px;
+}
+.eq-panel button {
+  cursor: pointer;
+}
+.eq-panel input[type='number'] {
+  width: 108px;
+  font-variant-numeric: tabular-nums;
+}
+.eq-panel input[type='checkbox'] {
+  min-height: 24px;
+}
+.eq-panel input[type='range'] {
+  width: 100%;
+  accent-color: #fff;
+  padding: 0;
+}
+.eq-panel :focus-visible {
+  outline: 2px solid white;
+  outline-offset: 3px;
+}
+.eq-panel :disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.eq-panel .eq-bands {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+  margin: 20px 0;
+}
+.eq-panel .eq-custom {
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+}
+.eq-panel .eq-band {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #444;
+  border-radius: 8px;
+}
+.eq-panel .eq-presets {
+  padding-top: 16px;
+  border-top: 1px solid #444;
+}
+@media (max-width: 540px) {
+  .eq-panel {
+    padding: 16px;
+  }
+  .eq-panel .eq-bands {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .eq-panel .eq-custom {
+    grid-template-columns: 1fr;
+  }
+}

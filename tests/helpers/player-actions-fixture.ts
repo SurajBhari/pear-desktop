@@ -159,7 +159,7 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
   const entry = path.join(directory, 'entry.ts');
   await writeFile(
     entry,
-    `export {default as plugin} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/index.ts'))};export {createSectionRepeatController} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/section-repeat/controller.ts'))};export {createSlowedReverbController} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/slowed-reverb/controller.ts'))};export * from '@/plugins/utils/renderer/player-panel';export * from '@/plugins/utils/renderer/playback-rate-owner';export {createAdSpeedup} from ${JSON.stringify(path.join(root, 'src/plugins/adblocker/ad-speedup.ts'))};export * as playbackSpeed from ${JSON.stringify(path.join(root, 'src/plugins/playback-speed/renderer.tsx'))};`,
+    `export {default as plugin} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/index.ts'))};export {createSectionRepeatController} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/section-repeat/controller.ts'))};export {createSlowedReverbController} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/slowed-reverb/controller.ts'))};export * from '@/providers/renderer-audio';export * from '@/plugins/utils/renderer/player-panel';export * from '@/plugins/utils/renderer/playback-rate-owner';export {createAdSpeedup} from ${JSON.stringify(path.join(root, 'src/plugins/adblocker/ad-speedup.ts'))};export * as playbackSpeed from ${JSON.stringify(path.join(root, 'src/plugins/playback-speed/renderer.tsx'))};export {default as playbackSpeedPlugin} from ${JSON.stringify(path.join(root, 'src/plugins/playback-speed/index.ts'))};`,
   );
   const output = path.join(directory, 'actual.cjs');
   await build({
@@ -181,9 +181,13 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
         enforce: 'pre',
         async resolveId(id: string, importer?: string) {
           if (id === 'solid-js')
-            return requireRoot.resolve('solid-js/dist/solid.js');
+            return requireRoot
+              .resolve('solid-js/dist/solid.js')
+              .replaceAll('\\', '/');
           if (id === 'solid-js/web')
-            return requireRoot.resolve('solid-js/web/dist/web.js');
+            return requireRoot
+              .resolve('solid-js/web/dist/web.js')
+              .replaceAll('\\', '/');
           if (
             id === './components/slider' &&
             importer
@@ -201,7 +205,7 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
             for (const suffix of ['.ts', '.tsx', '/index.ts']) {
               try {
                 await access(target + suffix);
-                return target + suffix;
+                return (target + suffix).replaceAll('\\', '/');
               } catch {
                 /* next */
               }
@@ -232,6 +236,15 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
             return 'export const getSongInfo=()=>({});';
           if (id === '\0css') return 'export default "";';
           return undefined;
+        },
+        generateBundle() {
+          const identities = [...this.getModuleIds()].filter((id) =>
+            id.replaceAll('\\', '/').endsWith('/playback-rate-owner.ts'),
+          );
+          if (identities.length !== 1)
+            this.error(
+              `Expected one playback rate owner, found ${identities.length}`,
+            );
         },
       },
     ],
@@ -280,6 +293,8 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
       id,
       destination: { id: 'destination-' + id },
       state: 'running',
+      addEventListener() {},
+      removeEventListener() {},
       createGain: () => new Node(context, 'gain'),
       audioWorklet: {
         addModule: (url: string) => {
@@ -295,7 +310,8 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
     audioSource.connect(context.destination);
     const unrelated = new Node(context, 'unrelated');
     audioSource.connect(unrelated);
-    return { audioContext: context, audioSource, unrelated };
+    const audioGraph = source.initializeAudioGraph(context, audioSource);
+    return { audioContext: context, audioSource, unrelated, audioGraph };
   };
   return {
     dom,
