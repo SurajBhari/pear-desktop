@@ -3,8 +3,8 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { build } from 'vite';
-const root = path.resolve(import.meta.dirname, '../..');
+import { build, normalizePath } from 'vite';
+const root = normalizePath(path.resolve(import.meta.dirname, '../..'));
 export async function discordArtworkFixture({ actualProvider = false } = {}) {
   const owned = await mkdtemp(path.join(tmpdir(), 'pear-discord-artwork-'));
   const entry = path.join(owned, 'entry.ts');
@@ -48,8 +48,24 @@ export async function discordArtworkFixture({ actualProvider = false } = {}) {
             return '\0owned:' + id;
           if (id.startsWith('@/')) {
             const p = path.join(root, 'src', id.slice(2));
-            return [p, p + '.ts', path.join(p, 'index.ts')].find(existsSync);
+            const resolved = [p, p + '.ts', path.join(p, 'index.ts')].find(
+              existsSync,
+            );
+            return resolved && normalizePath(resolved);
           }
+        },
+        generateBundle() {
+          if (!actualProvider) return;
+          const expected = normalizePath(
+            path.join(root, 'src/providers/song-info.ts'),
+          );
+          const ids = [...this.getModuleIds()].filter(
+            (id) => normalizePath(id).split('?')[0] === expected,
+          );
+          if (ids.length !== 1 || ids[0] !== expected)
+            this.error(
+              `Owned Discord provider singleton identity: ${JSON.stringify(ids)}`,
+            );
         },
         load(id) {
           if (id === '\0owned:owned-discord')
@@ -80,7 +96,7 @@ export async function discordArtworkFixture({ actualProvider = false } = {}) {
       },
     ],
     build: {
-      ssr: entry,
+      ssr: normalizePath(entry),
       outDir: owned,
       emptyOutDir: false,
       minify: false,

@@ -87,6 +87,25 @@ app.on('browser-window-created',(_event,win)=>{created.push(win);globalThis.Auth
   const env = { ...process.env, PEAR_TEST_STARTUP_FACTS: facts };
   delete env.ELECTRON_RUN_AS_NODE;
   let app: Awaited<ReturnType<typeof electron.launch>> | undefined;
+  let processClosed: Promise<void> | undefined;
+  const waitForProcessClose = async () => {
+    if (!processClosed) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        processClosed,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(Error('Owned auth fixture process close budget expired')),
+            3000,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
   try {
     app = await electron.launch({
       cwd: directory,
@@ -106,6 +125,9 @@ app.on('browser-window-created',(_event,win)=>{created.push(win);globalThis.Auth
       }),
     );
     const child = app.process();
+    processClosed = new Promise((resolve) =>
+      child.once('close', () => resolve()),
+    );
     const startup = await waitForStartupFacts(child, facts);
     await assertStartupFacts(child, startup, profile);
     let closed = false;
@@ -172,7 +194,13 @@ app.on('browser-window-created',(_event,win)=>{created.push(win);globalThis.Auth
             }
           }
         } finally {
-          await rm(directory, { recursive: true, force: true });
+          await waitForProcessClose();
+          await rm(directory, {
+            recursive: true,
+            force: true,
+            maxRetries: 5,
+            retryDelay: 100,
+          });
         }
       },
     };
@@ -183,7 +211,13 @@ app.on('browser-window-created',(_event,win)=>{created.push(win);globalThis.Auth
       app.process().signalCode === null
     )
       await terminateStartupProcess(app.process());
-    await rm(directory, { recursive: true, force: true });
+    await waitForProcessClose();
+    await rm(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
     throw error;
   }
 }
