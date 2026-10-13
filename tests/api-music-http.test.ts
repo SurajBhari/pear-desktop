@@ -194,3 +194,75 @@ test('queue GET rejects duplicate and coercing query fields without native work'
     expect(f.calls).toHaveLength(0);
   } finally { await f.close(); }
 });
+// C1: exact-scope GET collections, canonical inputs and no legacy elevation.
+test('real collection sockets require independent scopes and canonical GET inputs before native work', async () => {
+  const f = await musicHttpFixture();
+  try {
+    for (const [path, scope] of [
+      ['/home', 'personalized.read'],
+      ['/library/playlists', 'library.read'],
+    ] as const) {
+      const grant = await f.store.issue(
+        'Collection socket',
+        'rest',
+        f.service.resource,
+        [scope],
+        () => true,
+      );
+      const auth = { authorization: 'Bearer ' + grant.token };
+      const start = f.calls.length;
+      expect(
+        (
+          await f.http(
+            '/api/v1/music' + path + '?limit=100',
+            'GET',
+            undefined,
+            auth,
+          )
+        ).status,
+      ).toBe(200);
+      expect(f.calls.length).toBe(start + 1);
+      for (const query of [
+        '?limit=01',
+        '?limit=1&limit=2',
+        '?%6cimit=1',
+        '?limit=1.0',
+        '?cursor=native-token',
+        '?params=x',
+      ])
+        expect(
+          (await f.http('/api/v1/music' + path + query, 'GET', undefined, auth))
+            .status,
+        ).toBe(400);
+      expect(
+        (await f.http('/api/v1/music' + path, 'POST', '{}', auth)).status,
+      ).toBe(405);
+      expect(
+        (
+          await f.http('/api/v1/music' + path, 'GET', '{}', {
+            ...auth,
+            'content-length': '2',
+          })
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await f.http('/api/v1/music' + path, 'GET', undefined, {
+            authorization: 'Bearer ' + f.grant.token,
+          })
+        ).status,
+      ).toBe(403);
+      for (const token of ['legacy-client-id', 'eyJ.synthetic.jwt'])
+        expect(
+          (
+            await f.http('/api/v1/music' + path, 'GET', undefined, {
+              authorization: 'Bearer ' + token,
+            })
+          ).status,
+        ).toBe(401);
+      expect(f.calls.length).toBe(start + 1);
+    }
+  } finally {
+    await f.close();
+  }
+});

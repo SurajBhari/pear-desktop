@@ -6,7 +6,10 @@ import {
   type MusicFailure,
 } from '../../music-types';
 import { parseMusicBearer, type MusicGrantRecord } from '../music-grants';
-import { parseMusicQueueQuery } from '../scheme/music';
+import {
+  parseMusicQueueQuery,
+  parseMusicCollectionQuery,
+} from '../scheme/music';
 
 import type { MusicService } from '../music-service';
 import type { Env, Hono } from 'hono';
@@ -236,14 +239,17 @@ export function registerMusicRoutes<E extends Env>(
         return reject(400);
       const route = rawTarget.split('?')[0].slice(prefix.length);
       const current = route === '/current',
-        queue = route === '/queue';
-      if (rawTarget.includes('?') && !queue) return reject(400);
-      if (!current && !queue && route !== '/search' && route !== '/browse')
+        queue = route === '/queue',
+        home = route === '/home',
+        library = route === '/library/playlists',
+        collection = home || library,
+        get = current || queue || collection;
+      if (rawTarget.includes('?') && !queue && !collection) return reject(400);
+      if (!get && route !== '/search' && route !== '/browse')
         return reject(404, 'not_found');
-      if (context.req.method !== (current || queue ? 'GET' : 'POST'))
-        return reject(405);
+      if (context.req.method !== (get ? 'GET' : 'POST')) return reject(405);
       if (
-        (current || queue) &&
+        get &&
         (incoming.headers['transfer-encoding'] !== undefined ||
           Number(incoming.headers['content-length'] ?? '0') > 0)
       )
@@ -270,7 +276,14 @@ export function registerMusicRoutes<E extends Env>(
         current || queue ? 5000 : 15000,
       );
       timer.unref?.();
-      const scope = current || queue ? 'playback.read' : 'catalog.read';
+      const scope =
+        current || queue
+          ? 'playback.read'
+          : home
+            ? 'personalized.read'
+            : library
+              ? 'library.read'
+              : 'catalog.read';
       let principal: MusicGrantRecord | undefined;
       const live = () =>
         !signal.aborted &&
@@ -289,12 +302,14 @@ export function registerMusicRoutes<E extends Env>(
       const query = rawTarget.includes('?')
         ? rawTarget.slice(rawTarget.indexOf('?') + 1)
         : '';
-      if (queue && /[%#\\]/.test(query)) return reject(400);
+      if ((queue || collection) && /[%#\\]/.test(query)) return reject(400);
       const input = current
         ? undefined
         : queue
           ? parseMusicQueueQuery(new URLSearchParams(query))
-          : await jsonBody(context.req.raw, incoming, signal);
+          : collection
+            ? parseMusicCollectionQuery(new URLSearchParams(query))
+            : await jsonBody(context.req.raw, incoming, signal);
       if (!live()) return reject(409, 'retired');
       const result = await wait<
         | Awaited<ReturnType<MusicService['current']>>
@@ -305,9 +320,13 @@ export function registerMusicRoutes<E extends Env>(
           ? service.current(token, signal)
           : queue
             ? service.queue(token, input, signal)
-            : route === '/search'
-              ? service.search(token, input, signal)
-              : service.browse(token, input, signal),
+            : home
+              ? service.home(token, input, signal)
+              : library
+                ? service.library(token, input, signal)
+                : route === '/search'
+                  ? service.search(token, input, signal)
+                  : service.browse(token, input, signal),
         signal,
       );
       if (!live()) return reject(409, 'retired');

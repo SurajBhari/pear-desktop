@@ -31,6 +31,7 @@ type Ipc = RendererContext<APIServerConfig>['ipc'];
 type Owner = {
   app: MusicPlayerAppElement;
   network: MusicPlayerAppElement['networkManager'];
+  fetch: MusicPlayerAppElement['networkManager']['fetch'];
 };
 type Job = {
   requestId: string;
@@ -71,6 +72,11 @@ const browseId = (value: unknown) =>
 export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
   if (!isRecord(value)) return null;
   const keys = Object.keys(value);
+  if (
+    (value.operation === 'home' || value.operation === 'library') &&
+    keys.length === 1
+  )
+    return { operation: value.operation };
   if (value.operation === 'queue' && keys.length === 1)
     return { operation: 'queue' };
   if (value.operation === 'current' && keys.length === 1)
@@ -166,47 +172,128 @@ export function createMusicRendererController(
       playbackEpoch = randomId();
     }
   };
+  const binding = (object: object, key: string) => {
+    let holder: object | null = object;
+    for (
+      let depth = 0;
+      holder && depth < 16;
+      depth++, holder = Object.getPrototypeOf(holder) as object | null
+    ) {
+      const descriptor = Object.getOwnPropertyDescriptor(holder, key);
+      if (descriptor) return { object, holder, descriptor };
+    }
+    return undefined;
+  };
+  const bindingCurrent = (link: ReturnType<typeof binding>, key: string) => {
+    if (!link) return false;
+    const current = binding(link.object, key),
+      next = current?.descriptor,
+      old = link.descriptor;
+    return (
+      current?.holder === link.holder &&
+      !!next &&
+      next.value === old.value &&
+      next.get === old.get &&
+      next.set === old.set &&
+      next.writable === old.writable &&
+      next.configurable === old.configurable
+    );
+  };
   const capture = (): Owner | undefined => {
     try {
       const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
+      if (!app) return;
+      const networkLink = binding(app, 'networkManager');
+      const network = app.networkManager;
+      if (!network) return;
+      const fetchLink = binding(network, 'fetch');
+      const fetch = network.fetch;
+      const api = getApi();
+      // Native getters/getApi can synchronously retire the controller. Check
+      // scalar lifetime after all callouts and retain the exact fetch function.
       if (
         disposed ||
-        getApi() !== apiOwner ||
+        api !== apiOwner ||
         (apiOwner as MusicPlayer & Partial<HTMLElement>).isConnected ===
           false ||
-        !app?.isConnected ||
-        !app.networkManager ||
-        typeof app.networkManager.fetch !== 'function'
+        !app.isConnected ||
+        typeof fetch !== 'function' ||
+        !bindingCurrent(networkLink, 'networkManager') ||
+        !bindingCurrent(fetchLink, 'fetch') ||
+        disposed
       )
         return;
-      return { app, network: app.networkManager };
+      return { app, network, fetch };
     } catch {
       return;
     }
   };
   const same = (a: Owner | undefined, b: Owner | undefined) =>
-    !!a && !!b && a.app === b.app && a.network === b.network;
-  const invalidate = () => {
-    send({ type: 'retire', documentId, sourceId });
-    sourceId = randomId();
-    for (const job of active) job.canceled = true;
-    for (const job of queued.splice(0))
-      settled(job, { ok: false, reason: 'retired' });
+    !!a &&
+    !!b &&
+    a.app === b.app &&
+    a.network === b.network &&
+    a.fetch === b.fetch;
+  const invalidate = (
+    nextOwner?: Owner,
+    expectedSource = sourceId,
+    expectedOwner = owner,
+  ) => {
+    const nextSource = randomId();
+    if (sourceId !== expectedSource || owner !== expectedOwner) return false;
+    // Publish the complete transition before IPC can synchronously reenter.
+    // Old physical jobs remain active until settlement, preserving capacity.
+    sourceId = nextSource;
+    owner = nextOwner;
+    for (const job of active)
+      if (job.sourceId === expectedSource) job.canceled = true;
+    const retiredQueue = queued.splice(0);
     handshakes.clear();
+    for (const job of retiredQueue) job.canceled = true;
+    send({ type: 'retire', documentId, sourceId: expectedSource });
+    for (const job of retiredQueue)
+      settled(job, { ok: false, reason: 'retired' });
+    return !disposed && sourceId === nextSource && owner === nextOwner;
   };
   const refresh = () => {
+    const registeredOwner = owner,
+      registeredSource = sourceId;
     const next = capture();
-    if (!same(owner, next)) {
-      invalidate();
-      owner = next;
-    }
+    // A native getter may have already adopted a newer source or disposed us.
+    if (disposed || owner !== registeredOwner || sourceId !== registeredSource)
+      return;
+    if (
+      !same(registeredOwner, next) &&
+      !invalidate(next, registeredSource, registeredOwner)
+    )
+      return;
     return next;
   };
-  const valid = (job: Job) =>
-    !job.canceled &&
-    !disposed &&
-    sourceId === job.sourceId &&
-    same(job.owner, capture());
+  const valid = (job: Job) => {
+    // A retired physical job must not call native getters for a newer source.
+    if (
+      job.canceled ||
+      disposed ||
+      sourceId !== job.sourceId ||
+      !same(job.owner, owner)
+    )
+      return false;
+    const registeredOwner = owner,
+      registeredSource = sourceId;
+    const captured = capture();
+    if (
+      job.canceled ||
+      disposed ||
+      owner !== registeredOwner ||
+      sourceId !== registeredSource
+    )
+      return false;
+    if (!same(registeredOwner, captured)) {
+      invalidate(captured, registeredSource, registeredOwner);
+      return false;
+    }
+    return !job.canceled && !disposed && sourceId === job.sourceId;
+  };
   const snapshot = (job: Job): PlaybackSnapshot => {
     observePlayback();
     const sampledEpoch = playbackEpoch;
@@ -303,6 +390,17 @@ export function createMusicRendererController(
               ),
             );
           }
+        } else if (
+          input.operation === 'home' ||
+          input.operation === 'library'
+        ) {
+          endpoint = 'browse';
+          data = {
+            browseId:
+              input.operation === 'home'
+                ? 'FEmusic_home'
+                : 'FEmusic_liked_playlists',
+          };
         } else if (input.operation === 'browse') {
           endpoint = 'browse';
           data = {
@@ -313,12 +411,19 @@ export function createMusicRendererController(
           endpoint = input.endpoint;
           data = { continuation: input.token };
         }
-        const raw = await job.owner.network.fetch<
-          unknown,
-          Record<string, string>
-        >(`/${endpoint}`, data);
         if (!valid(job)) throw new MusicServiceError('retired');
-        const value = normalizeMusicSource(raw, endpoint);
+        const raw = await job.owner.fetch.call(
+          job.owner.network,
+          `/${endpoint}`,
+          data,
+        );
+        if (!valid(job)) throw new MusicServiceError('retired');
+        const value = normalizeMusicSource(
+          raw,
+          input.operation === 'home' || input.operation === 'library'
+            ? input.operation
+            : endpoint,
+        );
         if (!valid(job)) throw new MusicServiceError('retired');
         settled(job, { ok: true, value });
       }
@@ -444,8 +549,8 @@ export function createMusicRendererController(
   );
   const dispose = () => {
     if (disposed) return;
-    invalidate();
     disposed = true;
+    invalidate();
     queueOwner?.dispose();
     for (const release of releases.splice(0)) release();
     window.removeEventListener('pagehide', dispose);
@@ -453,11 +558,32 @@ export function createMusicRendererController(
   };
   window.addEventListener('pagehide', dispose);
   const timer = setInterval(refresh, 100);
-  owner = capture();
+  const initialOwner = owner,
+    initialSource = sourceId;
+  const capturedOwner = capture();
+  if (!disposed && owner === initialOwner && sourceId === initialSource)
+    owner = capturedOwner;
   return {
     dispose,
     refresh,
-    isCurrent: () => !disposed && same(owner, capture()),
+    isCurrent: () => {
+      const registeredOwner = owner,
+        registeredSource = sourceId;
+      const captured = capture();
+      if (
+        disposed ||
+        owner !== registeredOwner ||
+        sourceId !== registeredSource
+      )
+        return false;
+      if (!same(registeredOwner, captured)) {
+        invalidate(captured, registeredSource, registeredOwner);
+        return false;
+      }
+      return (
+        !disposed && owner === registeredOwner && sourceId === registeredSource
+      );
+    },
     stats: () => ({ active: active.size, queued: queued.length }),
   };
 }

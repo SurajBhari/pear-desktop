@@ -10,6 +10,7 @@ import {
 import {
   parseMusicInput,
   parseMusicQueueInput,
+  parseMusicCollectionInput,
   parseNativeQueue,
   parseNativeCatalog,
   parseNativeSnapshot,
@@ -43,7 +44,8 @@ type PageContext =
       query: string;
       kind?: 'song' | 'video' | 'album' | 'artist' | 'playlist';
     }
-  | { route: 'browse'; target: MusicTarget };
+  | { route: 'browse'; target: MusicTarget }
+  | { route: 'home' | 'library' };
 export interface MusicPage {
   version: 1;
   availability: 'supported';
@@ -58,6 +60,8 @@ interface CursorBase {
   id: string;
   principal: MusicGrantRecord;
   scope: MusicScope;
+  resource: string;
+  issuerScope?: MusicScope;
   revision: number;
   owner: SourceOwner;
   offset: number;
@@ -72,6 +76,7 @@ type Cursor = CursorBase &
         kind: 'catalog';
         context: PageContext;
         source: NormalizedMusicSource;
+        seenPlaylistIds?: string[];
         replay?: MusicPage;
       }
     | {
@@ -83,6 +88,9 @@ type Cursor = CursorBase &
 interface TargetReference {
   id: string;
   principal: MusicGrantRecord;
+  scope: MusicScope;
+  resource: string;
+  issuerScope?: MusicScope;
   revision: number;
   owner: SourceOwner;
   browseId: string;
@@ -93,6 +101,8 @@ interface TargetReference {
 interface Lease {
   principal: MusicGrantRecord;
   scope: MusicScope;
+  resource: string;
+  issuerScope?: MusicScope;
   revision: number;
   admission: MusicAdmission;
   signal: AbortSignal;
@@ -185,10 +195,18 @@ export class MusicService {
       }) ?? (() => {});
     this.detachGrantRetirement = this.grants.subscribe(() => {
       for (const [id, cursor] of this.cursors)
-        if (!this.grants.isCurrent(cursor.principal, cursor.scope))
+        if (
+          !this.grants.isCurrent(cursor.principal, cursor.scope) ||
+          (cursor.issuerScope &&
+            !this.grants.isCurrent(cursor.principal, cursor.issuerScope))
+        )
           this.cursors.delete(id);
       for (const [id, reference] of this.references)
-        if (!this.grants.isCurrent(reference.principal, 'catalog.read'))
+        if (
+          !this.grants.isCurrent(reference.principal, reference.scope) ||
+          (reference.issuerScope &&
+            !this.grants.isCurrent(reference.principal, reference.issuerScope))
+        )
           this.references.delete(id);
       this.scheduleCacheCleanup();
     });
@@ -321,6 +339,8 @@ export class MusicService {
         action({
           principal,
           scope,
+          resource,
+          ...(extra[0] ? { issuerScope: extra[0] } : {}),
           revision,
           admission,
           signal: joined,
@@ -414,6 +434,8 @@ export class MusicService {
         if (
           !cursor ||
           cursor.kind !== 'queue' ||
+          cursor.resource !== lease.resource ||
+          cursor.scope !== lease.scope ||
           cursor.principal.id !== lease.principal.id ||
           cursor.principal.digest !== lease.principal.digest ||
           cursor.expires <= this.now()
@@ -422,7 +444,9 @@ export class MusicService {
         if (
           cursor.revision !== this.revision ||
           !cursor.owner.current() ||
-          !this.grants.isCurrent(cursor.principal, cursor.scope)
+          !this.grants.isCurrent(cursor.principal, cursor.scope) ||
+          (cursor.issuerScope !== undefined &&
+            !this.grants.isCurrent(cursor.principal, cursor.issuerScope))
         )
           return failMusic('retired');
         if (input.limit !== cursor.limit) return failMusic('invalid');
@@ -498,6 +522,8 @@ export class MusicService {
         id: result.nextCursor,
         principal: lease.principal,
         scope: lease.scope,
+        resource: lease.resource,
+        ...(lease.issuerScope ? { issuerScope: lease.issuerScope } : {}),
         revision: lease.revision,
         source,
         owner,
@@ -518,6 +544,82 @@ export class MusicService {
   }
   browse(token: unknown, value: unknown, signal?: AbortSignal) {
     return this.catalog(token, parseMusicInput(value, 'browse'), signal);
+  }
+  home(
+    token: unknown,
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<MusicPage> {
+    return this.collection(token, value, 'home', signal);
+  }
+  library(
+    token: unknown,
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<MusicPage> {
+    return this.collection(token, value, 'library', signal);
+  }
+  private collection(
+    token: unknown,
+    value: unknown,
+    route: 'home' | 'library',
+    signal?: AbortSignal,
+  ): Promise<MusicPage> {
+    const input = parseMusicCollectionInput(value);
+    return this.admitted(
+      token,
+      route === 'home' ? 'personalized.read' : 'library.read',
+      [],
+      signal,
+      false,
+      async (lease) => {
+        if (input.cursor)
+          return this.next(lease, input.cursor, route, input.limit);
+        const captured = await this.native(lease, { operation: route });
+        const parsed = parseNativeCatalog(captured.value, 'browse');
+        const { source, seenPlaylistIds } =
+          route === 'library'
+            ? this.librarySource(parsed, [])
+            : { source: parsed, seenPlaylistIds: undefined };
+        return this.page(
+          lease,
+          { route },
+          source,
+          captured.owner,
+          0,
+          input.limit,
+          seenPlaylistIds,
+        );
+      },
+    );
+  }
+  /** Bounded playlist-only first-occurrence projection; preserve shelf intersections. */
+  private librarySource(source: NormalizedMusicSource, prior: string[]) {
+    const seen = new Set(prior),
+      items: MusicItem[] = [],
+      offsets = [0];
+    for (const item of source.items) {
+      if (item.kind === 'playlist' && !seen.has(item.id)) {
+        seen.add(item.id);
+        items.push(item);
+      }
+      offsets.push(items.length);
+    }
+    return {
+      source: {
+        ...source,
+        items,
+        shelves: source.shelves
+          .map((s) => ({
+            title: s.title,
+            start: offsets[s.start],
+            count: offsets[s.start + s.count] - offsets[s.start],
+          }))
+          .filter((s) => s.count > 0),
+        targetRecipes: [],
+      },
+      seenPlaylistIds: [...seen],
+    };
   }
   private catalog(
     token: unknown,
@@ -567,14 +669,35 @@ export class MusicService {
               !reference ||
               reference.principal.id !== lease.principal.id ||
               reference.principal.digest !== lease.principal.digest ||
+              reference.resource !== lease.resource ||
               reference.expires <= this.now()
             )
               return failMusic('not_found');
             if (
               reference.revision !== this.revision ||
-              !reference.owner.current()
+              !reference.owner.current() ||
+              !this.grants.isCurrent(reference.principal, reference.scope) ||
+              (reference.issuerScope !== undefined &&
+                !this.grants.isCurrent(
+                  reference.principal,
+                  reference.issuerScope,
+                ))
             )
               return failMusic('retired');
+            const originLease = lease;
+            lease = {
+              ...originLease,
+              issuerScope: reference.issuerScope ?? reference.scope,
+              current: () =>
+                originLease.current() &&
+                reference.owner.current() &&
+                this.grants.isCurrent(reference.principal, reference.scope) &&
+                (!reference.issuerScope ||
+                  this.grants.isCurrent(
+                    reference.principal,
+                    reference.issuerScope,
+                  )),
+            };
             nativeInput = {
               operation: 'browse',
               browseId: reference.browseId,
@@ -617,13 +740,17 @@ export class MusicService {
     for (const [id, r] of this.cursors)
       if (
         r.expires <= this.now() ||
-        !this.grants.isCurrent(r.principal, r.scope)
+        !this.grants.isCurrent(r.principal, r.scope) ||
+        (r.issuerScope !== undefined &&
+          !this.grants.isCurrent(r.principal, r.issuerScope))
       )
         this.cursors.delete(id);
     for (const [id, r] of this.references)
       if (
         r.expires <= this.now() ||
-        !this.grants.isCurrent(r.principal, 'catalog.read')
+        !this.grants.isCurrent(r.principal, r.scope) ||
+        (r.issuerScope !== undefined &&
+          !this.grants.isCurrent(r.principal, r.issuerScope))
       )
         this.references.delete(id);
   }
@@ -665,6 +792,7 @@ export class MusicService {
     owner: SourceOwner,
     offset: number,
     limit: number,
+    seenPlaylistIds?: string[],
   ): MusicPage {
     if (!lease.current() || !owner.current()) return failMusic('retired');
     const sliced = sliceMusicSource(source, offset, limit);
@@ -683,7 +811,9 @@ export class MusicService {
             query: context.query,
             ...(context.kind ? { kind: context.kind } : {}),
           }
-        : { target: context.target };
+        : context.route === 'browse'
+          ? { target: context.target }
+          : {};
     let result: MusicPage;
     for (;;) {
       const end = offset + projected.length;
@@ -718,6 +848,9 @@ export class MusicService {
         const reference = {
           id: item.reference,
           principal: lease.principal,
+          scope: lease.scope,
+          resource: lease.resource,
+          ...(lease.issuerScope ? { issuerScope: lease.issuerScope } : {}),
           revision: lease.revision,
           owner,
           browseId: recipe.browseId,
@@ -742,9 +875,12 @@ export class MusicService {
         id: result.nextCursor,
         principal: lease.principal,
         scope: lease.scope,
+        resource: lease.resource,
+        ...(lease.issuerScope ? { issuerScope: lease.issuerScope } : {}),
         revision: lease.revision,
         context,
         source,
+        ...(seenPlaylistIds ? { seenPlaylistIds } : {}),
         owner,
         offset: offset + projected.length,
         limit,
@@ -768,13 +904,15 @@ export class MusicService {
   private async next(
     lease: Lease,
     id: string,
-    route: 'search' | 'browse',
+    route: PageContext['route'],
     limit: number,
   ) {
     const cursor = this.cursors.get(id);
     if (
       !cursor ||
       cursor.kind !== 'catalog' ||
+      cursor.resource !== lease.resource ||
+      cursor.scope !== lease.scope ||
       cursor.principal.id !== lease.principal.id ||
       cursor.principal.digest !== lease.principal.digest ||
       cursor.context.route !== route ||
@@ -784,14 +922,26 @@ export class MusicService {
     if (
       cursor.revision !== this.revision ||
       !cursor.owner.current() ||
-      !this.grants.isCurrent(cursor.principal, cursor.scope)
+      !this.grants.isCurrent(cursor.principal, cursor.scope) ||
+      (cursor.issuerScope !== undefined &&
+        !this.grants.isCurrent(cursor.principal, cursor.issuerScope))
     )
       return failMusic('retired');
     if (limit !== cursor.limit) return failMusic('invalid');
     if (cursor.busy) return failMusic('busy');
     if (cursor.replay) return structuredClone(cursor.replay);
+    const originLease = lease;
+    if (cursor.issuerScope)
+      lease = {
+        ...originLease,
+        issuerScope: cursor.issuerScope,
+        current: () =>
+          originLease.current() &&
+          this.grants.isCurrent(cursor.principal, cursor.issuerScope!),
+      };
     cursor.busy = true;
     try {
+      let seenPlaylistIds = cursor.seenPlaylistIds;
       let source = cursor.source,
         owner = cursor.owner,
         offset = cursor.offset;
@@ -805,6 +955,13 @@ export class MusicService {
           captured.value,
           source.continuation.endpoint,
         );
+        if (owner.epoch !== captured.owner.epoch || !owner.current())
+          return failMusic('retired');
+        if (cursor.context.route === 'library') {
+          const projected = this.librarySource(source, seenPlaylistIds ?? []);
+          source = projected.source;
+          seenPlaylistIds = projected.seenPlaylistIds;
+        }
         owner = captured.owner;
         offset = 0;
       }
@@ -815,6 +972,7 @@ export class MusicService {
         owner,
         offset,
         limit,
+        seenPlaylistIds,
       );
       const bytes = utf8Bytes(JSON.stringify(page));
       if (this.bytes() + bytes + 32 > MUSIC_LIMITS.cacheBytes) {
