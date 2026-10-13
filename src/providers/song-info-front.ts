@@ -268,6 +268,27 @@ export const setupSongInfo = (api: MusicPlayer) => {
 
   const waitingEvent = new Set<string>();
   const waitingTimeouts = new Map<string, NodeJS.Timeout>();
+  let submittedBinding: PlaybackBinding | null = null;
+
+  const refreshBinding = (
+    previous: PlaybackBinding,
+    binding: PlaybackBinding | null,
+  ) => {
+    if (submittedBinding !== previous) return;
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
+    if (binding && !playbackOwner.binding(previous.videoId, binding))
+      binding = null;
+    if (submittedBinding !== previous) return;
+    submittedBinding = binding;
+    window.ipcRenderer.send('peard:time-changed', {
+      type: 'playback-binding-refresh',
+      previous,
+      binding,
+    });
+  };
 
   const clearVideoTimeout = (videoId: string) => {
     const timeoutId = waitingTimeouts.get(videoId);
@@ -281,15 +302,26 @@ export const setupSongInfo = (api: MusicPlayer) => {
   // Name = "dataloaded" and abit later "dataupdated"
   // Sometimes "dataupdated" is not fired, so we need to fallback to "dataloaded"
   api.addEventListener('videodatachange', (name, videoData) => {
-    if (!playbackOwner.isCurrent()) return;
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
+    const previous = submittedBinding;
     const binding = playbackOwner.binding(videoData.videoId);
     videoEventDispatcher(name, videoData);
+    // A synchronous document listener can publish or retire a newer lineage.
+    if (submittedBinding !== previous) return;
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
 
     if (name === 'dataupdated' && waitingEvent.has(videoData.videoId)) {
       waitingEvent.delete(videoData.videoId);
       clearVideoTimeout(videoData.videoId);
       sendSongInfo(videoData, binding);
     } else if (name === 'dataloaded') {
+      if (previous) refreshBinding(previous, null);
       const video = document.querySelector<HTMLVideoElement>('video');
       video?.dispatchEvent(srcChangedEvent);
 
@@ -310,6 +342,13 @@ export const setupSongInfo = (api: MusicPlayer) => {
       }, DATAUPDATED_FALLBACK_TIMEOUT_MS);
 
       waitingTimeouts.set(videoData.videoId, timeoutId);
+    } else if (previous) {
+      refreshBinding(
+        previous,
+        name === 'dataupdated' && videoData.videoId === previous.videoId
+          ? binding
+          : null,
+      );
     }
   });
 
@@ -377,6 +416,7 @@ export const setupSongInfo = (api: MusicPlayer) => {
       ? playbackOwner.binding(videoData.videoId, binding)
       : null;
     if (!playbackOwner.isCurrent() || (binding && !annotation)) return;
+    submittedBinding = annotation;
     window.ipcRenderer.send('peard:video-src-changed', data, annotation);
   }
 };

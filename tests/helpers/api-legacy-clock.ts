@@ -17,6 +17,9 @@ export async function legacyClockNative<T>(task: () => Promise<T>): Promise<T> {
     await writeFile(
       mainEntry,
       [
+        `export {net,nativeImage} from 'electron';`,
+        `export {ScrobblerManager} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/scrobbler/main.ts')))};`,
+        `export {defaultConfig} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/scrobbler/config.ts')))};`,
         `export * from ${JSON.stringify(normalizePath(path.join(root, 'src/providers/music-request.ts')))};`,
         `export {register as registerControl} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/api-server/backend/routes/control.ts')))};`,
         `export * from ${JSON.stringify(normalizePath(path.join(root, 'src/providers/song-info.ts')))};`,

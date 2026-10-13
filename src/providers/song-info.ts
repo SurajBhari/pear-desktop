@@ -10,7 +10,12 @@ import {
 
 import * as config from '@/config';
 
-import { parsePlaybackBinding, type PlaybackBinding } from './playback-owner';
+import {
+  parsePlaybackBinding,
+  samePlaybackBinding,
+  type PlaybackBinding,
+} from './playback-owner';
+import { isRecord } from './queue-playlist';
 
 import type { GetPlayerResponse } from '@/types/get-player-response';
 
@@ -69,6 +74,7 @@ type Admission = {
   readonly epoch: number;
   readonly token: SongInfoProvenance;
   readonly frame: WebFrameMain;
+  playbackBinding: PlaybackBinding | null;
 };
 type ProviderOwner = {
   readonly window: BrowserWindow;
@@ -355,11 +361,12 @@ const registerProvider = (win: BrowserWindow): (() => void) => {
       epoch,
       frame,
       token: Object.freeze({}) as SongInfoProvenance,
+      playbackBinding: null,
     };
     // Invalidate at raw arrival, including an owned unknown/invalid payload.
     owner.admission = admission;
     songInfo = null;
-    const binding = parsePlaybackBinding(annotation);
+    admission.playbackBinding = parsePlaybackBinding(annotation);
     const current = () => isCurrentAdmission(owner, admission);
     try {
       const info = await dataMutex.runExclusive(async () => {
@@ -368,14 +375,16 @@ const registerProvider = (win: BrowserWindow): (() => void) => {
         if (!prepared || !current()) return null;
         const extracted = prepared.info;
         provenance.set(extracted, admission.token);
-        if (binding && binding.videoId === extracted.videoId)
-          playbackBindings.set(extracted, binding);
         if (prepared.resume) {
           config.set('url', prepared.resume.url);
           if (!current()) return null;
         }
         owner.contents.send('peard:update-song-info', extracted);
         if (!current()) return null;
+        // A passive update can arrive during artwork extraction or publication.
+        const binding = admission.playbackBinding;
+        if (binding && binding.videoId === extracted.videoId)
+          playbackBindings.set(extracted, binding);
         songInfo = extracted;
         return extracted;
       });
@@ -426,10 +435,58 @@ const registerProvider = (win: BrowserWindow): (() => void) => {
       info.elapsedSeconds = elapsedSeconds;
     });
   };
-  const elapsed = (event: IpcMainEvent, seconds: number) =>
-    update(event, SongInfoEvent.TimeChanged, (info) => {
+  const refreshPlaybackBinding = (event: IpcMainEvent, packet: unknown) => {
+    if (
+      !isRecord(packet) ||
+      Object.keys(packet).length !== 3 ||
+      !Object.hasOwn(packet, 'type') ||
+      packet.type !== 'playback-binding-refresh' ||
+      !Object.hasOwn(packet, 'previous') ||
+      !Object.hasOwn(packet, 'binding')
+    )
+      return;
+    const previous = parsePlaybackBinding(packet.previous);
+    const binding = parsePlaybackBinding(packet.binding);
+    if (
+      !previous ||
+      (packet.binding !== null && !binding) ||
+      (binding &&
+        (binding.documentId !== previous.documentId ||
+          binding.videoId !== previous.videoId ||
+          binding.episodeId === previous.episodeId))
+    )
+      return;
+    const admission = owner.admission;
+    if (!admission) return;
+    const frame = captureFrame(event);
+    const info = songInfo;
+    if (
+      !frame ||
+      frame !== admission.frame ||
+      (info &&
+        (getSongInfoProvenance(info) !== admission.token ||
+          info.videoId !== previous.videoId ||
+          !samePlaybackBinding(playbackBindings.get(info), previous))) ||
+      !isCurrentAdmission(owner, admission) ||
+      songInfo !== info ||
+      !samePlaybackBinding(admission.playbackBinding, previous)
+    )
+      return;
+    admission.playbackBinding = binding;
+    if (info) {
+      if (binding) playbackBindings.set(info, binding);
+      else playbackBindings.delete(info);
+    }
+  };
+  const elapsed = (event: IpcMainEvent, seconds: unknown) => {
+    if (typeof seconds !== 'number') {
+      refreshPlaybackBinding(event, seconds);
+      return Promise.resolve();
+    }
+    return update(event, SongInfoEvent.TimeChanged, (info) => {
       info.elapsedSeconds = seconds;
     });
+  };
   const retireDocument = () => {
     if (owner.disposed || activeProvider !== owner) return;
     // WebFrameMain identity can survive a same-origin document replacement.

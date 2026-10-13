@@ -2,6 +2,433 @@ import { test, expect } from '@playwright/test';
 
 import { legacyClockNative } from './helpers/api-legacy-clock';
 
+test('same-track passive binding refresh preserves HTTP precision and pending/submitted scrobble admission', async () => {
+  const result = await legacyClockNative(async () => {
+    const f = (globalThis as any).MusicNativeProof;
+    const window = new f.BrowserWindow({
+      show: false,
+      webPreferences: {
+        preload: f.preload,
+        contextIsolation: true,
+        sandbox: true,
+        nodeIntegration: false,
+      },
+    });
+    const wait = async (check: () => boolean) => {
+      const end = Date.now() + 5000;
+      while (!check()) {
+        if (Date.now() >= end)
+          throw Error('Missing passive native observation');
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    };
+    const evaluate = (code: string) =>
+      window.webContents.executeJavaScript('(async()=>{' + code + '})()');
+    const config = {
+      enabled: true,
+      musicApiEnabled: false,
+      hostname: '127.0.0.1',
+      port: 0,
+      authStrategy: 'NONE',
+      secret: 'owned fixture',
+      authorizedClients: [],
+      useHttps: false,
+      certPath: '',
+      keyPath: '',
+    };
+    const backend = f.source.backend;
+    f.source.setupSongInfo(window);
+    const events: string[] = [],
+      posts: { listen_type: string }[] = [];
+    const releaseObserver = f.source.registerCallback(
+      (_info: unknown, event: string) => events.push(event),
+      { replayCurrent: false },
+    );
+    f.source.net.fetch = async (url: string, options: any) => {
+      if (url !== 'https://listen.fixture.invalid/submit-listens')
+        throw Error('Unexpected passive native request');
+      posts.push(JSON.parse(options.body));
+      return new Response('{}');
+    };
+    await backend.start({
+      window,
+      ipc: { on: () => {}, send: () => {} },
+      getConfig: () => config,
+    });
+    await wait(() => !!backend.server.address());
+    const address = backend.server.address();
+    const read = async () => {
+      const response = await fetch(
+        'http://127.0.0.1:' + address.port + '/api/v1/song',
+      );
+      return response.json();
+    };
+    await window.loadFile(f.owned + '/main.html');
+    await evaluate(`
+      window.ipcRenderer={send:window.musicProof.send,on:(channel,fn)=>window.musicProof.subscribe(channel,(...args)=>fn({},...args))};
+    `);
+    await window.webContents.executeJavaScript(f.bundle);
+    await evaluate(`
+      window.nativeListeners=[];
+      window.nativeApi={
+        getVideoData:()=>({video_id:'current0001'}),
+        getPlayerResponse:()=>({videoDetails:{videoId:'current0001',title:'Owned metadata',author:'Owned artist',viewCount:'0',lengthSeconds:'4',musicVideoType:'MUSIC_VIDEO_TYPE_ATV'}}),
+        getCurrentTime:()=>1.2345,getVolume:()=>50,getPlayerState:()=>1,getWatchNextResponse:()=>({}),
+        addEventListener:(name,fn)=>{if(name==='videodatachange')window.nativeListeners.push(fn)},
+        removeEventListener:(name,fn)=>{window.nativeListeners=window.nativeListeners.filter(item=>item!==fn)}
+      };
+      window.emitNative=name=>{for(const fn of [...window.nativeListeners])fn(name,{videoId:'current0001'})};
+      window.ctx={getConfig:()=>(${JSON.stringify(config)}),ipc:{subscribe:window.musicProof.subscribe,send:window.musicProof.send}};
+      MusicNativeSource.setupFront(window.nativeApi);
+      await MusicNativeSource.pluginRenderer.start(window.ctx);
+      await MusicNativeSource.pluginRenderer.onPlayerApiReady(window.nativeApi,window.ctx);
+    `);
+    const scrobblerConfig = {
+      ...f.source.defaultConfig,
+      enabled: true,
+      scrobblers: {
+        ...f.source.defaultConfig.scrobblers,
+        listenbrainz: {
+          enabled: true,
+          token: 'owned-fixture-token',
+          apiRoot: 'https://listen.fixture.invalid/',
+        },
+      },
+    };
+    const manager = new f.source.ScrobblerManager({
+      window,
+      getConfig: () => scrobblerConfig,
+      setConfig() {
+        throw Error('Unexpected passive account mutation');
+      },
+      ipc: {},
+    });
+    await manager.start();
+    await evaluate(
+      `window.emitNative('dataloaded');window.emitNative('dataupdated');`,
+    );
+    await wait(() => !!backend.songInfo && posts.length === 1);
+    await evaluate(`window.ipcRenderer.send('peard:time-changed',1);`);
+    await wait(() => backend.songInfo.elapsedSeconds === 1);
+    const info = backend.songInfo,
+      token = f.source.getSongInfoProvenance(info),
+      eventCount = events.length,
+      before = await read();
+    const replies = [];
+    for (let index = 0; index < 6; index++) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await evaluate(`window.emitNative('dataupdated');`);
+      replies.push(await read());
+    }
+    const pendingCompleted = posts.filter(
+      (post) => post.listen_type === 'single',
+    ).length;
+    for (let index = 0; index < 5; index++) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await evaluate(`window.emitNative('dataupdated');`);
+      replies.push(await read());
+    }
+    const sameAdmission =
+      backend.songInfo === info &&
+      f.source.getSongInfoProvenance(backend.songInfo) === token;
+    const callbackDelta = events.length - eventCount;
+    const outputs = posts.map((post) => post.listen_type);
+    manager.stop();
+    await evaluate(`window.emitNative('dataupdated');`);
+    const afterStop = posts.length;
+    releaseObserver();
+    backend.stop();
+    window.destroy();
+    return {
+      before,
+      replies,
+      pendingCompleted,
+      sameAdmission,
+      callbackDelta,
+      outputs,
+      afterStop,
+    };
+  });
+  expect(result.before.elapsedMilliseconds).toBe(1234.5);
+  for (const reply of result.replies) {
+    expect(reply.elapsedMilliseconds).toBe(1234.5);
+    expect(reply.elapsedSeconds).toBe(1);
+  }
+  expect(result.pendingCompleted).toBe(1);
+  expect(result.sameAdmission).toBe(true);
+  expect(result.callbackDelta).toBe(0);
+  expect(result.outputs).toEqual(['playing_now', 'single']);
+  expect(result.afterStop).toBe(2);
+});
+
+test('passive refresh binds pending metadata and rejects retired generations', async () => {
+  const result = await legacyClockNative(async () => {
+    const f = (globalThis as any).MusicNativeProof;
+    const window = new f.BrowserWindow({
+      show: false,
+      webPreferences: {
+        preload: f.preload,
+        contextIsolation: true,
+        sandbox: true,
+        nodeIntegration: false,
+        nodeIntegrationInSubFrames: true,
+      },
+    });
+    const wait = async (check: () => boolean | Promise<boolean>) => {
+      const end = Date.now() + 5000;
+      while (!(await check())) {
+        if (Date.now() >= end)
+          throw Error('Missing passive generation observation');
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    };
+    const evaluate = (code: string) =>
+      window.webContents.executeJavaScript('(async()=>{' + code + '})()');
+    const config = {
+      enabled: true,
+      musicApiEnabled: false,
+      hostname: '127.0.0.1',
+      port: 0,
+      authStrategy: 'NONE',
+      secret: 'owned fixture',
+      authorizedClients: [],
+      useHttps: false,
+      certPath: '',
+      keyPath: '',
+    };
+    const backend = f.source.backend;
+    const disposeProvider = f.source.setupSongInfo(window);
+    let releaseArt: (() => void) | undefined;
+    const png = f.source.nativeImage
+      .createFromBitmap(Buffer.from([0, 0, 0, 255]), { width: 1, height: 1 })
+      .toPNG();
+    f.source.net.fetch = async (url: string, options: any = {}) => {
+      if (url !== 'https://thumbnail.fixture.invalid/owned.png')
+        throw Error('Unexpected passive artwork request');
+      if (options.method === 'HEAD') return new Response(null);
+      await new Promise<void>((resolve) => {
+        releaseArt = resolve;
+      });
+      return new Response(png);
+    };
+    const events: string[] = [];
+    const releaseObserver = f.source.registerCallback(
+      (_info: unknown, event: string) => events.push(event),
+      { replayCurrent: false },
+    );
+    await backend.start({
+      window,
+      ipc: { on: () => {}, send: () => {} },
+      getConfig: () => config,
+    });
+    await wait(() => !!backend.server.address());
+    const address = backend.server.address();
+    const read = async () => {
+      const response = await fetch(
+        'http://127.0.0.1:' + address.port + '/api/v1/song',
+      );
+      return response.json();
+    };
+    const setup = async () => {
+      await evaluate(
+        `window.ipcRenderer={send:window.musicProof.send,on:(channel,fn)=>window.musicProof.subscribe(channel,(...args)=>fn({},...args))};`,
+      );
+      await window.webContents.executeJavaScript(f.bundle);
+      await evaluate(`
+        window.nativeListeners=[];window.nativeId='current0001';window.art=true;window.nativeSeconds=1.2345;
+        window.holdSettlements=false;window.heldSettlements=[];window.cancels=[];
+        window.nativeApi={
+          getVideoData:()=>({video_id:window.nativeId}),
+          getPlayerResponse:()=>({videoDetails:{videoId:window.nativeId,title:'Owned metadata',author:'Owned artist',viewCount:'0',lengthSeconds:'30',musicVideoType:'MUSIC_VIDEO_TYPE_ATV',...(window.art?{thumbnail:{thumbnails:[{url:'https://thumbnail.fixture.invalid/owned.png'}]}}:{})}}),
+          getCurrentTime:()=>window.nativeSeconds,getVolume:()=>50,getPlayerState:()=>1,getWatchNextResponse:()=>({}),
+          addEventListener:(name,fn)=>{if(name==='videodatachange')window.nativeListeners.push(fn)},
+          removeEventListener:(name,fn)=>{window.nativeListeners=window.nativeListeners.filter(item=>item!==fn)}
+        };
+        window.emitNative=(name,id=window.nativeId)=>{window.nativeId=id;for(const fn of [...window.nativeListeners])fn(name,{videoId:id})};
+        window.ctx={getConfig:()=>(${JSON.stringify(config)}),ipc:{subscribe:(channel,fn)=>window.musicProof.subscribe(channel,packet=>{if(channel==='peard:legacy-clock-cancel')window.cancels.push(packet);fn(packet)}),send:(channel,...args)=>{if(window.holdSettlements&&channel==='peard:legacy-clock-reply'&&args[0].type==='settled')window.heldSettlements.push(args[0]);else window.musicProof.send(channel,...args)}}};
+        MusicNativeSource.setupFront(window.nativeApi);
+        await MusicNativeSource.pluginRenderer.start(window.ctx);
+        await MusicNativeSource.pluginRenderer.onPlayerApiReady(window.nativeApi,window.ctx);
+      `);
+    };
+    const publish = async () => {
+      const before = backend.songInfo;
+      await evaluate(
+        `window.art=false;window.emitNative('dataloaded','current0001');window.emitNative('dataupdated');`,
+      );
+      await wait(() => !!backend.songInfo && backend.songInfo !== before);
+    };
+    await window.loadFile(f.owned + '/main.html');
+    await setup();
+    await evaluate(
+      `window.emitNative('dataloaded');window.emitNative('dataupdated');`,
+    );
+    await wait(() => !!releaseArt);
+    const pendingToken = f.source.getCurrentSongInfoProvenance(window);
+    await evaluate(
+      `window.emitNative('dataupdated');window.emitNative('dataupdated');`,
+    );
+    releaseArt!();
+    releaseArt = undefined;
+    await wait(() => !!backend.songInfo);
+    const pending = await read();
+    const originalTokenPreserved =
+      f.source.getSongInfoProvenance(backend.songInfo) === pendingToken;
+    const initialMetadataCount = events.filter(
+      (event) => event === 'peard:video-src-changed',
+    ).length;
+    // A failed recovery is already a meaningful RED; later controls require a live clock.
+    if (pending.elapsedMilliseconds !== 1234.5) {
+      releaseObserver();
+      backend.stop();
+      window.destroy();
+      return {
+        pending,
+        originalTokenPreserved,
+        initialMetadataCount,
+        completed: false,
+      };
+    }
+    const broker = f.source.createMusicRequestBroker(window);
+    const bindingBefore = f.source.getSongInfoPlaybackBinding(backend.songInfo);
+    await evaluate(`window.holdSettlements=true;`);
+    const oldRead = read();
+    await wait(
+      async () => await evaluate(`return window.heldSettlements.length===1;`),
+    );
+    const dispatchedBefore = broker.stats().dispatched;
+    await evaluate(`window.emitNative('dataupdated');`);
+    const retiredReply = await oldRead;
+    await wait(
+      () =>
+        f.source.getSongInfoPlaybackBinding(backend.songInfo) !== bindingBefore,
+    );
+    const tombstone = broker.stats().dispatched;
+    const cancel = await evaluate(`return window.cancels.at(-1);`);
+    await evaluate(
+      `window.holdSettlements=false;window.musicProof.send('peard:legacy-clock-reply',window.heldSettlements.shift());`,
+    );
+    await wait(() => broker.stats().dispatched === 0);
+    const fresh = await read();
+    const info = backend.songInfo,
+      token = f.source.getSongInfoProvenance(info),
+      binding = f.source.getSongInfoPlaybackBinding(info),
+      eventCount = events.length;
+    const candidate = { ...binding, episodeId: 'f'.repeat(32) };
+    const packet = {
+      type: 'playback-binding-refresh',
+      previous: binding,
+      binding: candidate,
+    };
+    const childFrame = window.webContents.mainFrame.frames[0];
+    await childFrame.executeJavaScript(
+      `window.musicProof.send('peard:time-changed',${JSON.stringify(packet)});undefined;`,
+    );
+    for (const invalid of [
+      { ...packet, extra: true },
+      { ...packet, previous: null },
+      { ...packet, binding: {} },
+      { ...packet, binding },
+      { ...packet, binding: { ...candidate, videoId: 'foreign0002' } },
+      { ...packet, binding: { ...candidate, documentId: 'e'.repeat(32) } },
+      { ...packet, previous: { ...binding, episodeId: 'd'.repeat(32) } },
+    ])
+      await evaluate(
+        `window.musicProof.send('peard:time-changed',${JSON.stringify(invalid)});`,
+      );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const rejectedRefreshes =
+      backend.songInfo === info &&
+      f.source.getSongInfoProvenance(info) === token &&
+      f.source.getSongInfoPlaybackBinding(info) === binding &&
+      events.length === eventCount;
+    await evaluate(`window.nativeSeconds=0;window.emitNative('dataupdated');`);
+    const zero = await read();
+    await evaluate(
+      `window.nativeSeconds=1.2345;window.art=true;window.emitNative('dataloaded');window.emitNative('dataupdated');`,
+    );
+    await wait(() => !!releaseArt);
+    const abaToken = f.source.getCurrentSongInfoProvenance(window);
+    const beforeAba = backend.songInfo;
+    await evaluate(
+      `window.emitNative('dataupdated','foreign0002');window.emitNative('dataupdated','current0001');`,
+    );
+    releaseArt!();
+    releaseArt = undefined;
+    await wait(() => !!backend.songInfo && backend.songInfo !== beforeAba);
+    const aba = await read();
+    const abaTokenPreserved =
+      f.source.getSongInfoProvenance(backend.songInfo) === abaToken;
+    const abaRetired =
+      f.source.getSongInfoPlaybackBinding(backend.songInfo) === null;
+    await evaluate(`window.emitNative('dataupdated');`);
+    const abaStillRetired = await read();
+    await publish();
+    const recovered = await read();
+    const oldDocument = f.source.getSongInfoPlaybackBinding(backend.songInfo);
+    await window.reload();
+    await wait(() => !window.webContents.isLoading());
+    await setup();
+    await publish();
+    const reloadBinding = f.source.getSongInfoPlaybackBinding(backend.songInfo);
+    const reloadEvents = events.length;
+    await evaluate(
+      `window.ipcRenderer.send('peard:time-changed',${JSON.stringify({ type: 'playback-binding-refresh', previous: oldDocument, binding: { ...oldDocument, episodeId: 'c'.repeat(32) } })});`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const reloadRejected =
+      f.source.getSongInfoPlaybackBinding(backend.songInfo) === reloadBinding &&
+      events.length === reloadEvents;
+    const afterReload = await read();
+    disposeProvider();
+    await evaluate(`window.emitNative('dataupdated');`);
+    const afterProviderStop = await read();
+    releaseObserver();
+    backend.stop();
+    window.destroy();
+    return {
+      pending,
+      originalTokenPreserved,
+      initialMetadataCount,
+      completed: true,
+      dispatchedBefore,
+      retiredReply,
+      tombstone,
+      cancel,
+      fresh,
+      rejectedRefreshes,
+      zero,
+      aba,
+      abaTokenPreserved,
+      abaRetired,
+      abaStillRetired,
+      recovered,
+      reloadRejected,
+      afterReload,
+      afterProviderStop,
+    };
+  });
+  expect(result.pending.elapsedMilliseconds).toBe(1234.5);
+  expect(result.originalTokenPreserved).toBe(true);
+  expect(result.initialMetadataCount).toBe(1);
+  expect(result.completed).toBe(true);
+  expect(result.dispatchedBefore).toBe(1);
+  expect(result.retiredReply).not.toHaveProperty('elapsedMilliseconds');
+  expect(result.tombstone).toBe(1);
+  expect(result.cancel.phase).toBe('read');
+  expect(result.fresh.elapsedMilliseconds).toBe(1234.5);
+  expect(result.rejectedRefreshes).toBe(true);
+  expect(result.zero.elapsedMilliseconds).toBe(0);
+  expect(result.abaTokenPreserved).toBe(true);
+  expect(result.abaRetired).toBe(true);
+  expect(result.aba).not.toHaveProperty('elapsedMilliseconds');
+  expect(result.abaStillRetired).not.toHaveProperty('elapsedMilliseconds');
+  expect(result.recovered.elapsedMilliseconds).toBe(1234.5);
+  expect(result.reloadRejected).toBe(true);
+  expect(result.afterReload.elapsedMilliseconds).toBe(1234.5);
+  expect(result.afterProviderStop).not.toHaveProperty('elapsedMilliseconds');
+});
+
 test('actual legacy-only Electron metadata and HTTP precision reject stale playback and reload ownership', async () => {
   const result = await legacyClockNative(async () => {
     const f = (globalThis as any).MusicNativeProof;
