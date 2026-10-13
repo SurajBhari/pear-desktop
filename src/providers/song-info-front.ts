@@ -1,6 +1,7 @@
 import { LikeType, type GetState } from '@/types/datahost-get-state';
 
 import { singleton } from './decorators';
+import { adoptPlaybackOwner, type PlaybackBinding } from './playback-owner';
 
 import type { SongInfo } from './song-info';
 import type { MusicPlayer } from '@/types/music-player';
@@ -204,6 +205,7 @@ export const setupAutoPlayChangedListener = singleton(() => {
 });
 
 export const setupSongInfo = (api: MusicPlayer) => {
+  const playbackOwner = adoptPlaybackOwner(api);
   window.ipcRenderer.on('peard:setup-time-changed-listener', () => {
     setupTimeChangedListener();
   });
@@ -279,12 +281,14 @@ export const setupSongInfo = (api: MusicPlayer) => {
   // Name = "dataloaded" and abit later "dataupdated"
   // Sometimes "dataupdated" is not fired, so we need to fallback to "dataloaded"
   api.addEventListener('videodatachange', (name, videoData) => {
+    if (!playbackOwner.isCurrent()) return;
+    const binding = playbackOwner.binding(videoData.videoId);
     videoEventDispatcher(name, videoData);
 
     if (name === 'dataupdated' && waitingEvent.has(videoData.videoId)) {
       waitingEvent.delete(videoData.videoId);
       clearVideoTimeout(videoData.videoId);
-      sendSongInfo(videoData);
+      sendSongInfo(videoData, binding);
     } else if (name === 'dataloaded') {
       const video = document.querySelector<HTMLVideoElement>('video');
       video?.dispatchEvent(srcChangedEvent);
@@ -301,7 +305,7 @@ export const setupSongInfo = (api: MusicPlayer) => {
         if (waitingEvent.has(videoData.videoId)) {
           waitingEvent.delete(videoData.videoId);
           waitingTimeouts.delete(videoData.videoId);
-          sendSongInfo(videoData);
+          sendSongInfo(videoData, binding);
         }
       }, DATAUPDATED_FALLBACK_TIMEOUT_MS);
 
@@ -341,7 +345,13 @@ export const setupSongInfo = (api: MusicPlayer) => {
     }
   }
 
-  function sendSongInfo(videoData: VideoDataChangeValue) {
+  function sendSongInfo(
+    videoData: VideoDataChangeValue,
+    binding = playbackOwner.binding(videoData.videoId),
+  ) {
+    if (!playbackOwner.isCurrent()) return;
+    // A delayed payload cannot acquire a newer episode, including same-ID ABA.
+    if (binding && !playbackOwner.binding(videoData.videoId, binding)) return;
     const data = api.getPlayerResponse();
 
     let playerOverlay: PlayerOverlays | undefined;
@@ -363,6 +373,10 @@ export const setupSongInfo = (api: MusicPlayer) => {
     data.videoDetails.elapsedSeconds = 0;
     data.videoDetails.isPaused = false;
 
-    window.ipcRenderer.send('peard:video-src-changed', data);
+    const annotation: PlaybackBinding | null = binding
+      ? playbackOwner.binding(videoData.videoId, binding)
+      : null;
+    if (!playbackOwner.isCurrent() || (binding && !annotation)) return;
+    window.ipcRenderer.send('peard:video-src-changed', data, annotation);
   }
 };

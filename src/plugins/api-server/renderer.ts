@@ -1,3 +1,4 @@
+import { createLegacyClockRendererController } from '@/providers/legacy-clock-renderer';
 import { createMusicRendererController } from '@/providers/music-renderer';
 import { createRenderer } from '@/utils';
 
@@ -6,6 +7,9 @@ import type { RendererContext } from '@/types/contexts';
 import type { MusicPlayer } from '@/types/music-player';
 
 let controller: ReturnType<typeof createMusicRendererController> | undefined;
+let clockController:
+  | ReturnType<typeof createLegacyClockRendererController>
+  | undefined;
 let currentApi: MusicPlayer | null = null;
 let currentContext: RendererContext<APIServerConfig> | undefined;
 let config: APIServerConfig | undefined;
@@ -14,11 +18,43 @@ let generation = 0;
 let configRevision = 0;
 let readyRevision = 0;
 const disposeController = () => {
-  const previous = controller;
+  const previous = controller,
+    clock = clockController;
   controller = undefined;
+  clockController = undefined;
   previous?.dispose();
+  clock?.dispose();
 };
 const activate = () => {
+  if (
+    running &&
+    config?.enabled === true &&
+    currentApi &&
+    currentContext &&
+    !clockController
+  ) {
+    const epoch = generation,
+      revision = configRevision,
+      ready = readyRevision,
+      api = currentApi,
+      ctx = currentContext;
+    const candidate = createLegacyClockRendererController(
+      api,
+      () => currentApi,
+      ctx.ipc,
+    );
+    if (
+      !running ||
+      epoch !== generation ||
+      revision !== configRevision ||
+      ready !== readyRevision ||
+      currentApi !== api ||
+      currentContext !== ctx ||
+      clockController
+    )
+      candidate.dispose();
+    else clockController = candidate;
+  }
   if (
     !running ||
     config?.enabled !== true ||
@@ -104,9 +140,8 @@ export const renderer = createRenderer<unknown, APIServerConfig>({
   onConfigChange(next) {
     configRevision++;
     config = next;
-    if (next.enabled !== true || next.musicApiEnabled !== true)
-      disposeController();
-    else activate();
+    disposeController();
+    activate();
   },
   stop,
 });

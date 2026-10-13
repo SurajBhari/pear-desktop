@@ -92,7 +92,7 @@ export async function playlistApiFixture() {
               mediaEnum +
               '\n' +
               eventEnum +
-              '\nexport const registerCallback=()=>()=>{};'
+              '\nexport const registerCallback=()=>()=>{};export const getSongInfoPlaybackBinding=()=>null;export const getSongInfoProvenance=()=>null;export const isSongInfoCurrent=()=>false;'
             );
           if (id === '\0@hono/node-server')
             return 'export const serve=options=>globalThis.__playlistApiBoundary.serve(options);export const upgradeWebSocket=()=>async()=>{};';

@@ -16,6 +16,12 @@ import { registerCallback } from '@/providers/song-info';
 import { createBackend } from '@/utils';
 
 import { API_VERSION } from './api-version';
+import {
+  captureLegacyClock,
+  captureLegacyRequestScope,
+  configureLegacyClock,
+  stopLegacyClock,
+} from './legacy-clock';
 import { MusicGrantStore } from './music-grant-store';
 import { createMusicService } from './music-service';
 import { registerAuth, registerControl, registerWebsocket } from './routes';
@@ -34,6 +40,7 @@ import type { MiddlewareHandler } from 'hono';
 
 export const backend = createBackend<BackendType, APIServerConfig>({
   async start(ctx) {
+    if (this.musicWindow) stopLegacyClock(this.musicWindow);
     this.musicService?.stop();
     this.musicService = undefined;
     this.musicWindow = undefined;
@@ -156,6 +163,11 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       );
       await next();
     });
+    for (const alias of ['song', 'song-info'])
+      this.app.use(`/api/${API_VERSION}/${alias}`, async (ctx, next) => {
+        captureLegacyRequestScope(ctx.req.raw, backendCtx.window);
+        await next();
+      });
     // middlewares
     const jwtGuard: MiddlewareHandler = async (ctx, next) => {
       if (ctx.req.path.endsWith(`${API_VERSION}/ws`)) {
@@ -203,6 +215,23 @@ export const backend = createBackend<BackendType, APIServerConfig>({
           'document.querySelector("#like-button-renderer")?.likeStatus',
         ) as Promise<LikeType>,
       () => this.volumeState,
+      (info, ctx) => {
+        const payload: unknown = ctx.get('jwtPayload');
+        const principal =
+          payload &&
+          typeof payload === 'object' &&
+          'id' in payload &&
+          typeof payload.id === 'string'
+            ? payload.id
+            : 'legacy-anonymous';
+        return captureLegacyClock(
+          backendCtx.window,
+          info,
+          principal,
+          ctx.req.raw,
+          () => this.app === owningApp && this.songInfo === info,
+        );
+      },
     );
     registerAuth(this.app, backendCtx);
     registerWebsocket(this.app, backendCtx, upgradeWebSocket);
@@ -269,6 +298,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     }
   },
   end() {
+    if (this.musicWindow) stopLegacyClock(this.musicWindow);
     this.musicService?.stop();
     this.musicService = undefined;
     this.queueRequestScope?.abort();
@@ -277,6 +307,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     this.server = undefined;
   },
   configureMusic(config) {
+    if (this.musicWindow) configureLegacyClock(this.musicWindow, config);
     this.musicConfig = { ...config };
     if (this.musicService) {
       this.musicService.configure(config);

@@ -27,6 +27,7 @@ import {
 } from '../scheme';
 
 import type { APIServerConfig } from '../../config';
+import type { LegacyClockCapture } from '../legacy-clock';
 import type { HonoApp } from '../types';
 import type { SongInfo } from '@/providers/song-info';
 import type { BackendContext } from '@/types/contexts';
@@ -605,6 +606,10 @@ export const register = (
   repeatModeGetter: () => PromiseOrValue<RepeatMode | undefined>,
   likeTypeGetter: () => PromiseOrValue<LikeType | undefined>,
   volumeStateGetter: () => PromiseOrValue<VolumeState | undefined>,
+  preciseClock?: (
+    info: SongInfo,
+    ctx: Context,
+  ) => Promise<number | LegacyClockCapture | undefined>,
 ) => {
   const controller = getSongControls(window);
 
@@ -765,8 +770,25 @@ export const register = (
       return ctx.body(null);
     }
 
-    const body = { ...info };
+    const body: SongInfo & { elapsedMilliseconds?: number } = { ...info };
     delete body.image;
+    try {
+      const captured = await preciseClock?.(info, ctx);
+      const milliseconds =
+        typeof captured === 'number'
+          ? captured
+          : captured?.isCurrent()
+            ? captured.elapsedMilliseconds
+            : undefined;
+      if (
+        typeof milliseconds === 'number' &&
+        Number.isFinite(milliseconds) &&
+        milliseconds >= 0
+      )
+        body.elapsedMilliseconds = milliseconds;
+    } catch {
+      // Optional native precision cannot turn compatible metadata into an error.
+    }
 
     ctx.status(200);
     return ctx.json(body satisfies ResponseSongInfo);

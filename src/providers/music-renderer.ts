@@ -10,6 +10,10 @@ import {
 
 import { normalizeMusicSource } from './music-catalog';
 import {
+  nativeElapsedMilliseconds,
+  nativePlaybackIdentity,
+} from './playback-owner';
+import {
   isOwnerId,
   isRecord,
   isRequestId,
@@ -222,16 +226,11 @@ export function createMusicRendererController(
     if (
       sampledEpoch !== playbackEpoch ||
       !valid(job) ||
-      apiOwner.getVideoData()?.video_id !== id ||
-      apiOwner.getPlayerResponse()?.videoDetails?.videoId !== id
+      nativePlaybackIdentity(apiOwner) !== id
     )
       throw new MusicServiceError('retired');
     const elapsedSeconds =
-      Number.isFinite(elapsed) &&
-      Number.isFinite(elapsed * 1000) &&
-      elapsed >= 0
-        ? elapsed
-        : null;
+      nativeElapsedMilliseconds(elapsed) !== undefined ? elapsed : null;
     const durationSeconds =
       Number.isFinite(duration) && duration >= 0 ? duration : null;
     return {

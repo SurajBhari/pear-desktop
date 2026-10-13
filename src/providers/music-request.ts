@@ -16,6 +16,11 @@ import {
   type MusicFailure,
 } from '@/plugins/api-server/music-types';
 
+import {
+  samePlaybackBinding,
+  type PlaybackBinding,
+  type LegacyClockValue,
+} from './playback-owner';
 import { isOwnerId, isRecord, isRequestId } from './queue-playlist';
 
 export interface MusicAdmission {
@@ -28,6 +33,7 @@ interface Pending {
   admission: MusicAdmission;
   principal: string;
   input: MusicReadInput;
+  binding?: PlaybackBinding;
   phase: 'queued' | 'owner' | 'read';
   documentId?: string;
   sourceId?: string;
@@ -82,6 +88,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     { epoch: string; current(): boolean }
   >();
   const sourceOwners = new Map<string, { retired: boolean }>();
+  const clockSourceOwners = new Map<string, { retired: boolean }>();
   const alive = () => {
     try {
       return (
@@ -129,16 +136,17 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     r.done = true;
     cleanupCaller(r);
     if (result.ok) {
+      const owners = r.binding ? clockSourceOwners : sourceOwners;
       const epoch = `${r.documentId}:${r.sourceId}`;
-      let owner = sourceOwners.get(epoch);
+      let owner = owners.get(epoch);
       if (!owner) {
         owner = { retired: false };
-        sourceOwners.set(epoch, owner);
-        if (sourceOwners.size > 128) {
-          const oldest = sourceOwners.entries().next().value;
+        owners.set(epoch, owner);
+        if (owners.size > 128) {
+          const oldest = owners.entries().next().value;
           if (oldest) {
             oldest[1].retired = true;
-            sourceOwners.delete(oldest[0]);
+            owners.delete(oldest[0]);
           }
         }
       }
@@ -170,7 +178,9 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       return;
     }
     try {
-      send('peard:music-cancel', r, { phase: r.phase });
+      send(r.binding ? 'peard:legacy-clock-cancel' : 'peard:music-cancel', r, {
+        phase: r.phase,
+      });
     } catch {
       /* Physical work remains owned until settlement or process destruction. */
     }
@@ -192,7 +202,13 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       if (slots.filter((x) => x.principal === r.principal).length >= 2) break;
       r.phase = 'owner';
       try {
-        send('peard:music-owner-query', r);
+        send(
+          r.binding
+            ? 'peard:legacy-clock-owner-query'
+            : 'peard:music-owner-query',
+          r,
+          r.binding ? { binding: r.binding } : {},
+        );
       } catch {
         retire(r);
       }
@@ -262,7 +278,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       return false;
     }
   };
-  const onReply = (event: IpcMainEvent, packet: unknown) => {
+  const onReply = (event: IpcMainEvent, packet: unknown, clock = false) => {
     if (!isRecord(packet)) return;
     if (
       packet.type === 'retire' &&
@@ -274,7 +290,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
           event.sender === contents &&
           event.senderFrame === contents.mainFrame
         ) {
-          const owner = sourceOwners.get(
+          const owner = (clock ? clockSourceOwners : sourceOwners).get(
             `${packet.documentId}:${packet.sourceId}`,
           );
           if (owner) owner.retired = true;
@@ -284,6 +300,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       }
       for (const r of [...records.values()])
         if (
+          !!r.binding === clock &&
           rawSender(event, r.admission.frame) &&
           r.documentId === packet.documentId &&
           r.sourceId === packet.sourceId
@@ -295,6 +312,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     const r = records.get(packet.requestId);
     if (
       !r ||
+      !!r.binding !== clock ||
       packet.nonce !== r.nonce ||
       !rawSender(event, r.admission.frame, packet.type !== 'settled')
     )
@@ -310,7 +328,13 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       isOwnerId(packet.documentId) &&
       isOwnerId(packet.sourceId)
     ) {
-      if (!owned(r) || r.done) {
+      if (
+        !owned(r) ||
+        r.done ||
+        (r.binding &&
+          (packet.documentId !== r.binding.documentId ||
+            packet.sourceId !== r.binding.episodeId))
+      ) {
         retire(r);
         return;
       }
@@ -318,7 +342,11 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       r.sourceId = packet.sourceId;
       r.phase = 'read';
       try {
-        send('peard:music-read', r, { input: r.input });
+        send(
+          r.binding ? 'peard:legacy-clock-read' : 'peard:music-read',
+          r,
+          r.binding ? { binding: r.binding } : { input: r.input },
+        );
       } catch {
         retire(r);
       }
@@ -334,7 +362,16 @@ function buildMusicRequestBroker(window: BrowserWindow) {
         else if (
           isRecord(result) &&
           result.ok === true &&
-          isRecord(result.value)
+          isRecord(result.value) &&
+          (!r.binding ||
+            (Object.keys(result.value).length === 4 &&
+              samePlaybackBinding(
+                result.value as unknown as PlaybackBinding,
+                r.binding,
+              ) &&
+              typeof result.value.elapsedMilliseconds === 'number' &&
+              Number.isFinite(result.value.elapsedMilliseconds) &&
+              result.value.elapsedMilliseconds >= 0))
         )
           complete(r, {
             ok: true,
@@ -351,8 +388,13 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       release(r);
     }
   };
+  const onClockReply = (event: IpcMainEvent, packet: unknown) =>
+    onReply(event, packet, true);
+  const onMusicReply = (event: IpcMainEvent, packet: unknown) =>
+    onReply(event, packet, false);
   const detach = () => {
-    ipcMain.removeListener('peard:music-reply', onReply);
+    ipcMain.removeListener('peard:music-reply', onMusicReply);
+    ipcMain.removeListener('peard:legacy-clock-reply', onClockReply);
     window.removeListener('closed', destroyed);
     contents.removeListener('destroyed', destroyed);
     contents.removeListener('render-process-gone', processGone);
@@ -360,7 +402,8 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     contents.removeListener('did-navigate', committed);
     contents.removeListener('did-fail-load', navigationFailed);
   };
-  ipcMain.on('peard:music-reply', onReply);
+  ipcMain.on('peard:music-reply', onMusicReply);
+  ipcMain.on('peard:legacy-clock-reply', onClockReply);
   window.on('closed', destroyed);
   contents.on('destroyed', destroyed);
   contents.on('render-process-gone', processGone);
@@ -377,6 +420,65 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     disposed = true;
     cleanupUnused();
   };
+  const read = (
+    admission: MusicAdmission,
+    input: MusicReadInput,
+    principal: string,
+    options: {
+      signal?: AbortSignal;
+      deadline?: number;
+      isCurrent?: () => boolean;
+    } = {},
+    binding?: PlaybackBinding,
+  ): Promise<NativeMusicValue> => {
+    if (
+      !current(admission) ||
+      options.signal?.aborted ||
+      !guardCurrent(options.isCurrent)
+    )
+      return Promise.reject(new MusicServiceError('retired'));
+    if (
+      records.size >= 12 ||
+      [...records.values()].filter((r) => r.phase === 'queued').length >= 8
+    )
+      return Promise.reject(new MusicServiceError('busy'));
+    const lifetime = Math.min(
+      input.operation === 'current' ? 5000 : 15000,
+      (options.deadline ?? Infinity) - Date.now(),
+    );
+    if (lifetime <= 0) return Promise.reject(new MusicServiceError('timeout'));
+    return new Promise((resolve, reject) => {
+      const r: Pending = {
+        id: randomUUID(),
+        nonce: randomBytes(16).toString('hex'),
+        admission,
+        principal,
+        input,
+        binding,
+        phase: 'queued',
+        done: false,
+        resolve,
+        reject,
+        signal: options.signal,
+        isCurrent: options.isCurrent,
+      };
+      records.set(r.id, r);
+      r.timer = setTimeout(() => retire(r, 'timeout'), lifetime);
+      r.timer.unref?.();
+      if (r.signal) {
+        r.abort = () =>
+          retire(
+            r,
+            r.signal?.reason instanceof MusicServiceError &&
+              r.signal.reason.code === 'timeout'
+              ? 'timeout'
+              : 'retired',
+          );
+        r.signal.addEventListener('abort', r.abort, { once: true });
+      }
+      pump();
+    });
+  };
   return {
     capture,
     captureWindowOwner() {
@@ -389,6 +491,8 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       return () => retirementObservers.delete(observer);
     },
     resultOwner: (value: NativeMusicValue) => resultOwners.get(value),
+    clockResultOwner: (value: LegacyClockValue) =>
+      resultOwners.get(value as unknown as NativeMusicValue),
     retain() {
       // A restarted service shares every still-live physical tombstone, never a fresh capacity counter.
       if (disposed && records.size) disposed = false;
@@ -407,59 +511,23 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       admission: MusicAdmission,
       input: MusicReadInput,
       principal: string,
-      options: {
-        signal?: AbortSignal;
-        deadline?: number;
-        isCurrent?: () => boolean;
-      } = {},
-    ): Promise<NativeMusicValue> {
-      if (
-        !current(admission) ||
-        options.signal?.aborted ||
-        !guardCurrent(options.isCurrent)
-      )
-        return Promise.reject(new MusicServiceError('retired'));
-      if (
-        records.size >= 12 ||
-        [...records.values()].filter((r) => r.phase === 'queued').length >= 8
-      )
-        return Promise.reject(new MusicServiceError('busy'));
-      const lifetime = Math.min(
-        input.operation === 'current' ? 5000 : 15000,
-        (options.deadline ?? Infinity) - Date.now(),
-      );
-      if (lifetime <= 0)
-        return Promise.reject(new MusicServiceError('timeout'));
-      return new Promise((resolve, reject) => {
-        const r: Pending = {
-          id: randomUUID(),
-          nonce: randomBytes(16).toString('hex'),
-          admission,
-          principal,
-          input,
-          phase: 'queued',
-          done: false,
-          resolve,
-          reject,
-          signal: options.signal,
-          isCurrent: options.isCurrent,
-        };
-        records.set(r.id, r);
-        r.timer = setTimeout(() => retire(r, 'timeout'), lifetime);
-        r.timer.unref?.();
-        if (r.signal) {
-          r.abort = () =>
-            retire(
-              r,
-              r.signal?.reason instanceof MusicServiceError &&
-                r.signal.reason.code === 'timeout'
-                ? 'timeout'
-                : 'retired',
-            );
-          r.signal.addEventListener('abort', r.abort, { once: true });
-        }
-        pump();
-      });
+      options: Parameters<typeof read>[3] = {},
+    ) {
+      return read(admission, input, principal, options);
+    },
+    readClock(
+      admission: MusicAdmission,
+      binding: PlaybackBinding,
+      principal: string,
+      options: Parameters<typeof read>[3] = {},
+    ): Promise<LegacyClockValue> {
+      return read(
+        admission,
+        { operation: 'current' },
+        principal,
+        options,
+        binding,
+      ) as unknown as Promise<LegacyClockValue>;
     },
     stats: () => ({
       dispatched: active().length,

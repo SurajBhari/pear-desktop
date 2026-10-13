@@ -10,6 +10,8 @@ import {
 
 import * as config from '@/config';
 
+import { parsePlaybackBinding, type PlaybackBinding } from './playback-owner';
+
 import type { GetPlayerResponse } from '@/types/get-player-response';
 
 export enum MediaType {
@@ -56,6 +58,9 @@ declare const provenanceBrand: unique symbol;
 /** Read-only identity for one native metadata admission; never serialized. */
 export type SongInfoProvenance = Readonly<{ [provenanceBrand]: true }>;
 const provenance = new WeakMap<SongInfo, SongInfoProvenance>();
+const playbackBindings = new WeakMap<SongInfo, PlaybackBinding>();
+export const getSongInfoPlaybackBinding = (info: SongInfo) =>
+  playbackBindings.get(info) ?? null;
 export const getSongInfoProvenance = (
   info: SongInfo,
 ): SongInfoProvenance | null => provenance.get(info) ?? null;
@@ -108,6 +113,10 @@ export const getCurrentSongInfoProvenance = (
     ? admission.token
     : null;
 };
+export const isSongInfoCurrent = (info: SongInfo, window: BrowserWindow) =>
+  readCurrentSongInfo?.() === info &&
+  getSongInfoProvenance(info) !== null &&
+  getSongInfoProvenance(info) === getCurrentSongInfoProvenance(window);
 
 const getOwnedImage = async (
   src: string,
@@ -333,7 +342,11 @@ const registerProvider = (win: BrowserWindow): (() => void) => {
       callback(info, event);
     }
   };
-  const metadata = async (event: IpcMainEvent, data: GetPlayerResponse) => {
+  const metadata = async (
+    event: IpcMainEvent,
+    data: GetPlayerResponse,
+    annotation: unknown,
+  ) => {
     const frame = captureFrame(event);
     if (!frame) return;
     const epoch = (admissionEpochs.get(win) ?? 0) + 1;
@@ -346,6 +359,7 @@ const registerProvider = (win: BrowserWindow): (() => void) => {
     // Invalidate at raw arrival, including an owned unknown/invalid payload.
     owner.admission = admission;
     songInfo = null;
+    const binding = parsePlaybackBinding(annotation);
     const current = () => isCurrentAdmission(owner, admission);
     try {
       const info = await dataMutex.runExclusive(async () => {
@@ -354,6 +368,8 @@ const registerProvider = (win: BrowserWindow): (() => void) => {
         if (!prepared || !current()) return null;
         const extracted = prepared.info;
         provenance.set(extracted, admission.token);
+        if (binding && binding.videoId === extracted.videoId)
+          playbackBindings.set(extracted, binding);
         if (prepared.resume) {
           config.set('url', prepared.resume.url);
           if (!current()) return null;
