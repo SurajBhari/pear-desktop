@@ -1017,6 +1017,8 @@
       "description": "Allows setting global hotkeys for playback (play/pause/next/previous) and turning off media OSD by overriding media keys, turning on Ctrl/CMD + F to search, turning on Linux MPRIS support for media keys, and custom hotkeys for advanced users",
       "menu": {
         "override-media-keys": "Override Media Keys",
+        "focus-window-on-double-play-pause": "Focus Window on Double Play/Pause Command",
+        "double-command-repeat-info": "System key repeat can count as another command.",
         "set-keybinds": "Set Global Song Controls",
         "set-local-keybinds": "Set Local Song Controls",
         "seek-seconds": "Seek intervals",
@@ -1035,7 +1037,9 @@
             "play-pause": "Play / Pause",
             "previous": "Previous",
             "seek-forward": "Seek forward",
-            "seek-backward": "Seek backward"
+            "seek-backward": "Seek backward",
+            "like": "Like",
+            "dislike": "Dislike"
           },
           "label": "Choose Global Keybinds for Songs Control:",
           "title": "Global Keybinds",

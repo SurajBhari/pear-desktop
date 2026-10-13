@@ -1,62 +1,10 @@
+import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
-import { test, expect } from '@playwright/test';
-import { transformWithOxc } from 'vite';
+import { shortcutRatingSource } from './helpers/shortcut-rating-source';
 
 async function fixture() {
-  const provider = await readFile(
-    new URL('../src/providers/song-info.ts', import.meta.url),
-    'utf8',
-  );
-  const enumCode = (
-    await transformWithOxc(
-      provider.match(/export enum MediaType \{[\s\S]*?\n\}/)![0],
-      'media.ts',
-    )
-  ).code;
-  const { MediaType } = await import(
-    `data:text/javascript;base64,${Buffer.from(enumCode).toString('base64')}`
-  );
-  const sent: any[] = [];
-  const global = new Map<string, () => void>();
-  const local = new Map<string, () => void>();
-  const songListeners = new Set<any>();
-  const key = `seek_${crypto.randomUUID()}`;
-  const window = {
-    isDestroyed: () => false,
-    webContents: { send: (...args: any[]) => sent.push(args) },
-  };
-  const state = {
-    window,
-    MediaType,
-    current: { mediaType: MediaType.Audio },
-    songListeners,
-    global,
-    local,
-    sent,
-  };
-  (globalThis as any)[key] = state;
-  const controls = stripTypeScriptTypes(
-    await readFile(
-      new URL('../src/providers/song-controls.ts', import.meta.url),
-      'utf8',
-    ),
-  )
-    .replace(/^import[\s\S]*?;\n/gm, '')
-    .replace(/^export /gm, '');
-  const main = stripTypeScriptTypes(
-    await readFile(
-      new URL('../src/plugins/shortcuts/main.ts', import.meta.url),
-      'utf8',
-    ),
-  ).replace(/^import[\s\S]*?;\n/gm, '');
-  const boundary = `const state=globalThis[${JSON.stringify(key)}];const MediaType=state.MediaType;const is={linux:()=>false};const registerMPRIS=()=>{};const createBackend=x=>x;
-const globalShortcut={isRegistered:key=>state.global.has(key),register:(key,fn)=>{if(state.global.has(key))return false;state.global.set(key,fn);return true},unregister:key=>state.global.delete(key)};
-const registerElectronLocalShortcut=(win,key,fn)=>state.local.set(key,fn);const unregisterElectronLocalShortcut=(win,key)=>state.local.delete(key);const isRegisteredElectronLocalShortcut=(win,key)=>state.local.has(key);
-const registerCallback=(fn,options)=>{state.songListeners.add(fn);if(options?.replayCurrent)fn(state.current);return()=>state.songListeners.delete(fn)};`;
-  const source = await import(
-    `data:text/javascript;base64,${Buffer.from(boundary + controls + main).toString('base64')}`
-  );
+  const f = await shortcutRatingSource();
   const config = {
     enabled: true,
     overrideMediaKeys: false,
@@ -71,24 +19,22 @@ const registerCallback=(fn,options)=>{state.songListeners.add(fn);if(options?.re
     podcastSeekForwardSeconds: 11,
     podcastSeekBackwardSeconds: 31,
   };
-  const backend = source.backend;
-  const ctx = { window, getConfig: async () => config };
+  f.config = config;
+  f.state.songListeners = f.state.callbacks;
   return {
-    state,
+    state: f.state,
     config,
-    source,
-    start: async (context = ctx) => {
-      if (backend) await backend.start(context);
-      else await source.onMainLoad(context);
+    source: f.source,
+    start: async (context = f.context) => {
+      await f.source.backend.start(context);
     },
-    stop: () => backend?.stop(),
+    stop: () => f.source.backend.stop(),
     song: (type: string) => {
-      state.current = { mediaType: type };
-      for (const fn of songListeners) fn(state.current);
+      f.state.current = { mediaType: type };
+      for (const fn of f.state.callbacks) fn(f.state.current);
     },
     close: () => {
-      backend?.stop();
-      delete (globalThis as any)[key];
+      void f.close();
     },
   };
 }
