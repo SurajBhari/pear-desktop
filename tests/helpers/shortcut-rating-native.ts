@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { build, normalizePath } from 'vite';
+import solid from 'vite-plugin-solid';
 
 const root = normalizePath(path.resolve(import.meta.dirname, '../..'));
 const requireRoot = createRequire(path.join(root, 'package.json'));
@@ -15,7 +16,7 @@ const localShortcutPath = normalizePath(
 /** Actual source, Electron registry/windows/input/IPC/provider. Callback stimuli are explicitly controlled. */
 export async function shortcutRatingNative<T>(
   task: () => Promise<T>,
-  { duplicateLocalCallbacks = false } = {},
+  { duplicateLocalCallbacks = false, speedRenderer = false } = {},
 ): Promise<T> {
   const sourceRoot = normalizePath(
     process.env.PEAR_SHORTCUT_NATIVE_SOURCE_ROOT ?? root,
@@ -30,6 +31,7 @@ export async function shortcutRatingNative<T>(
         `export {backend} from ${JSON.stringify(normalizePath(sourceRoot + '/src/plugins/shortcuts/main.ts'))};`,
         `export {default as shortcuts} from ${JSON.stringify(normalizePath(sourceRoot + '/src/plugins/shortcuts/index.ts'))};`,
         `export {default as precise} from ${JSON.stringify(normalizePath(sourceRoot + '/src/plugins/precise-volume/index.ts'))};`,
+        `export {default as playbackSpeed} from ${JSON.stringify(normalizePath(sourceRoot + '/src/plugins/playback-speed/index.ts'))};`,
         `export * from ${JSON.stringify(normalizePath(sourceRoot + '/src/providers/song-info.ts'))};`,
         `export * as localShortcut from ${JSON.stringify(localShortcutPath)};`,
       ].join('\n'),
@@ -51,6 +53,12 @@ export async function shortcutRatingNative<T>(
             if (['@/utils', '@/i18n', '@/config'].includes(id))
               return '\0native-shortcut:' + id;
             if (id === './mpris') return '\0native-shortcut:mpris';
+            if (
+              importer &&
+              normalizePath(importer).endsWith('/playback-speed/index.ts') &&
+              id === './renderer'
+            )
+              return '\0native-shortcut:speed-renderer';
             if (
               importer &&
               normalizePath(importer).endsWith('/precise-volume/index.ts') &&
@@ -79,6 +87,8 @@ export async function shortcutRatingNative<T>(
               return 'export const registerMPRIS=()=>{};';
             if (id === '\0native-shortcut:volume-renderer')
               return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},overrideListener=()=>{};';
+            if (id === '\0native-shortcut:speed-renderer')
+              return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},onUnload=()=>{};';
           },
           generateBundle() {
             const owner = normalizePath(
@@ -145,9 +155,84 @@ export async function shortcutRatingNative<T>(
         minify: false,
       },
     });
+    if (speedRenderer) {
+      const speedEntry = path.join(owned, 'speed-client.ts');
+      await writeFile(
+        speedEntry,
+        `export * as renderer from ${JSON.stringify(normalizePath(sourceRoot + '/src/plugins/playback-speed/renderer.tsx'))};export * from ${JSON.stringify(normalizePath(sourceRoot + '/src/plugins/utils/renderer/playback-rate-owner.ts'))};`,
+      );
+      await build({
+        root: sourceRoot,
+        configFile: false,
+        logLevel: 'silent',
+        plugins: [
+          solid(),
+          {
+            name: 'native-speed-renderer-public-boundaries',
+            enforce: 'pre',
+            resolveId(id) {
+              if (id === 'solid-js')
+                return normalizePath(
+                  requireRoot.resolve('solid-js/dist/solid.js'),
+                );
+              if (id === 'solid-js/web')
+                return normalizePath(
+                  requireRoot.resolve('solid-js/web/dist/web.js'),
+                );
+              if (
+                [
+                  '@/i18n',
+                  '@/providers/dom-elements',
+                  '@/plugins/utils/renderer/check',
+                ].includes(id)
+              )
+                return '\0native-speed:' + id;
+              if (id.startsWith('@/'))
+                return normalizePath(
+                  path.join(sourceRoot, 'src', id.slice(2)) + '.ts',
+                );
+            },
+            load(id) {
+              if (id === '\0native-speed:@/i18n') return 'export const t=k=>k;';
+              if (id === '\0native-speed:@/providers/dom-elements')
+                return "export const getSongMenu=()=>document.querySelector('ytmusic-menu-popup-renderer');";
+              if (id === '\0native-speed:@/plugins/utils/renderer/check')
+                return 'export const isMusicOrVideoTrack=()=>true,isPlayerMenu=()=>true;';
+            },
+            generateBundle() {
+              const owner = normalizePath(
+                sourceRoot +
+                  '/src/plugins/utils/renderer/playback-rate-owner.ts',
+              );
+              if (
+                [...this.getModuleIds()].filter(
+                  (id) => normalizePath(id) === owner,
+                ).length !== 1
+              )
+                this.error(
+                  'Native speed renderer must have one actual rate owner',
+                );
+            },
+          },
+        ],
+        build: {
+          outDir: owned,
+          emptyOutDir: false,
+          minify: false,
+          lib: {
+            entry: normalizePath(speedEntry),
+            formats: ['iife'],
+            name: 'NativeSpeedFixture',
+            fileName: () => 'speed-client.js',
+          },
+        },
+      });
+    }
     await writeFile(
       path.join(owned, 'main.html'),
-      '<html><body><video></video><div id="like-button-renderer" like-status="INDIFFERENT"></div></body></html>',
+      speedRenderer
+        ? '<html><body><div id="movie_player"><video></video></div><ytmusic-popup-container><ytmusic-menu-popup-renderer></ytmusic-menu-popup-renderer></ytmusic-popup-container><div id="like-button-renderer" like-status="INDIFFERENT"></div></body></html>'
+        : '<html><body><video></video><div id="like-button-renderer" like-status="INDIFFERENT"></div></body></html>',
     );
     await writeFile(
       path.join(owned, 'preload.cjs'),
@@ -156,7 +241,7 @@ export async function shortcutRatingNative<T>(
     const nativeEntry = path.join(owned, 'entry.cjs');
     await writeFile(
       nativeEntry,
-      `const {app,BrowserWindow,globalShortcut,ipcMain,session,net}=require('electron');const fs=require('node:fs'),path=require('node:path');const owned=${JSON.stringify(owned)};for(const key of ['userData','sessionData','downloads']){const target=path.join(owned,key);fs.mkdirSync(target,{recursive:true});app.setPath(key,target)};(async()=>{await app.whenReady();session.defaultSession.webRequest.onBeforeRequest((details,done)=>done({cancel:!details.url.startsWith('file://')}));net.fetch=async()=>{throw Error('Unexpected native network request')};const callbacks=new Map(),register=globalShortcut.register.bind(globalShortcut),unregister=globalShortcut.unregister.bind(globalShortcut);globalShortcut.register=(key,fn)=>{const ok=register(key,fn);if(ok)callbacks.set(key,fn);return ok};globalShortcut.unregister=key=>{unregister(key);callbacks.delete(key)};globalThis.ShortcutNativeProof={app,BrowserWindow,globalShortcut,ipcMain,callbacks,owned,localShortcut:require('./source.cjs').localShortcut,versions:process.versions,preload:path.join(owned,'preload.cjs'),source:require('./source.cjs'),client:fs.readFileSync(path.join(owned,'client.js'),'utf8')};const result=await (${task.toString()})();console.log('SHORTCUT_NATIVE '+JSON.stringify(result));for(const w of BrowserWindow.getAllWindows())w.destroy();app.quit()})().catch(error=>{console.error(String(error?.stack??error));app.exit(1)});`,
+      `const {app,BrowserWindow,globalShortcut,ipcMain,session,net}=require('electron');const fs=require('node:fs'),path=require('node:path');const owned=${JSON.stringify(owned)};for(const key of ['userData','sessionData','downloads']){const target=path.join(owned,key);fs.mkdirSync(target,{recursive:true});app.setPath(key,target)};(async()=>{await app.whenReady();session.defaultSession.webRequest.onBeforeRequest((details,done)=>done({cancel:!details.url.startsWith('file://')}));net.fetch=async()=>{throw Error('Unexpected native network request')};const callbacks=new Map(),register=globalShortcut.register.bind(globalShortcut),unregister=globalShortcut.unregister.bind(globalShortcut);globalShortcut.register=(key,fn)=>{const ok=register(key,fn);if(ok)callbacks.set(key,fn);return ok};globalShortcut.unregister=key=>{unregister(key);callbacks.delete(key)};globalThis.ShortcutNativeProof={app,BrowserWindow,globalShortcut,ipcMain,callbacks,owned,localShortcut:require('./source.cjs').localShortcut,versions:process.versions,preload:path.join(owned,'preload.cjs'),source:require('./source.cjs'),client:fs.readFileSync(path.join(owned,'client.js'),'utf8'),speedClient:${speedRenderer ? "fs.readFileSync(path.join(owned,'speed-client.js'),'utf8')" : "''"}};const result=await (${task.toString()})();console.log('SHORTCUT_NATIVE '+JSON.stringify(result));for(const w of BrowserWindow.getAllWindows())w.destroy();app.quit()})().catch(error=>{console.error(String(error?.stack??error));app.exit(1)});`,
     );
     const env = { ...process.env };
     delete env.ELECTRON_RUN_AS_NODE;

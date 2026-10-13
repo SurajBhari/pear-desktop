@@ -430,3 +430,111 @@ for (const duplicateLocalCallbacks of [false, true]) {
     ).toHaveLength(3);
   });
 }
+
+test('speed nonfocus native registry and owned IPC advance actual video through the real renderer owner', async () => {
+  const result = await shortcutRatingNative(
+    async () => {
+      const f = (globalThis as any).ShortcutNativeProof;
+      const window = new f.BrowserWindow({
+        show: false,
+        webPreferences: {
+          preload: f.preload,
+          contextIsolation: true,
+          sandbox: true,
+          nodeIntegration: false,
+        },
+      });
+      await window.loadFile(f.owned + '/main.html');
+      await window.webContents.executeJavaScript(f.speedClient);
+      const config = {
+        ...f.source.playbackSpeed.config,
+        enabled: true,
+        preservesPitch: false,
+        step: 0.1,
+        globalShortcuts: {
+          speedUp: 'CommandOrControl+Shift+Alt+F5',
+          speedDown: 'CommandOrControl+Shift+Alt+F6',
+        },
+      };
+      await window.webContents.executeJavaScript(
+        `window.speedApi={};window.speedConfig=${JSON.stringify(config)};document.querySelector('video').playbackRate=1;document.querySelector('video').volume=0;document.querySelector('video').muted=true;window.speedContext={getConfig:()=>window.speedConfig,ipc:{subscribe:(channel,listener)=>window.shortcutProof.on(channel,(_event,...args)=>listener(...args))}};NativeSpeedFixture.renderer.onPlayerApiReady(window.speedApi,window.speedContext);`,
+      );
+      const initial = await window.webContents.executeJavaScript(
+        `({owner:NativeSpeedFixture.getPlaybackRateOwner(document.querySelector('video')),rate:document.querySelector('video').playbackRate})`,
+      );
+      await f.source.playbackSpeed.backend?.start?.({
+        window,
+        getConfig: () => config,
+        ipc: { send: (...args: any[]) => window.webContents.send(...args) },
+      });
+      const registered = Object.values(config.globalShortcuts).map((key: any) =>
+        f.globalShortcut.isRegistered(key),
+      );
+      const up = f.callbacks.get(config.globalShortcuts.speedUp),
+        down = f.callbacks.get(config.globalShortcuts.speedDown);
+      if (registered.every(Boolean)) {
+        up();
+      }
+      let upRate = 1;
+      for (let i = 0; i < 100; i++) {
+        upRate = await window.webContents.executeJavaScript(
+          'document.querySelector("video").playbackRate',
+        );
+        if (upRate === 1.1) break;
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      const upLabel = await window.webContents.executeJavaScript(
+        'document.querySelector("#ytmcustom-playback-speed")?.textContent',
+      );
+      if (registered.every(Boolean)) down();
+      let downRate = upRate;
+      for (let i = 0; i < 100; i++) {
+        downRate = await window.webContents.executeJavaScript(
+          'document.querySelector("video").playbackRate',
+        );
+        if (downRate === 1) break;
+        await new Promise((done) => setTimeout(done, 5));
+      }
+      const downLabel = await window.webContents.executeJavaScript(
+        'document.querySelector("#ytmcustom-playback-speed")?.textContent',
+      );
+      const facts = await window.webContents.executeJavaScript(
+        `({owner:NativeSpeedFixture.getPlaybackRateOwner(document.querySelector('video')),pitch:document.querySelector('video').preservesPitch,muted:document.querySelector('video').muted,volume:document.querySelector('video').volume,paused:document.querySelector('video').paused})`,
+      );
+      f.source.playbackSpeed.backend?.stop?.();
+      if (up) up();
+      await window.webContents.executeJavaScript(
+        'NativeSpeedFixture.renderer.onUnload();',
+      );
+      const released = Object.values(config.globalShortcuts).every(
+        (key: any) => !f.globalShortcut.isRegistered(key),
+      );
+      return {
+        initial,
+        registered,
+        upRate,
+        downRate,
+        released,
+        upLabel,
+        downLabel,
+        ...facts,
+      };
+    },
+    { speedRenderer: true },
+  );
+  console.log('NATIVE_SPEED_NONFOCUS ' + JSON.stringify(result));
+  expect(result).toEqual({
+    initial: { owner: null, rate: 1 },
+    registered: [true, true],
+    upRate: 1.1,
+    downRate: 1,
+    released: true,
+    upLabel: 'plugins.playback-speed.templates.button (1.1)',
+    downLabel: 'plugins.playback-speed.templates.button (1)',
+    owner: 'playback-speed',
+    pitch: false,
+    muted: true,
+    volume: 0,
+    paused: true,
+  });
+});

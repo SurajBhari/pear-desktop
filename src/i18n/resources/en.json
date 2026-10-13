@@ -919,10 +919,24 @@
       "description": "Listen fast, listen slow! Adds a slider that controls song speed",
       "name": "Playback Speed",
       "menu": {
-        "preserve-pitch": "Preserve pitch when changing speed"
+        "preserve-pitch": "Preserve pitch when changing speed",
+        "global-shortcuts": "Global speed hotkeys",
+        "step": "Hotkey speed step"
       },
       "templates": {
         "button": "Speed"
+      },
+      "prompt": {
+        "global-shortcuts": {
+          "title": "Playback speed hotkeys",
+          "label": "Choose global hotkeys for playback speed:",
+          "speedUp": "Increase speed",
+          "speedDown": "Decrease speed"
+        },
+        "step": {
+          "title": "Playback speed step",
+          "label": "Speed change per hotkey command (0.01–15.93):"
+        }
       }
     },
     "precise-volume": {
