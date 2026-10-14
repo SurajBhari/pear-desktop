@@ -49,6 +49,9 @@ const codes: Record<MusicFailure, ContentfulStatusCode> = {
   budget: 502,
   unavailable: 503,
   timeout: 504,
+  unknown_operation: 404,
+  expired_operation: 409,
+  conflict: 409,
 };
 const failure = (error: unknown) => {
   if (error instanceof HttpMusicFailure)
@@ -240,6 +243,13 @@ export function registerMusicRoutes<E extends Env>(
       )
         return reject(400);
       const route = rawTarget.split('?')[0].slice(prefix.length);
+      const prepare = route === '/operations/prepare';
+      const mutation = ['/play/song', '/play/playlist', '/radio'].includes(
+        route,
+      );
+      const operationId = /^\/operations\/([^/]+)$/.exec(route)?.[1];
+      const status = !!operationId && !prepare;
+      const navigation = prepare || mutation || status;
       const current = route === '/current',
         queue = route === '/queue',
         home = route === '/home',
@@ -248,10 +258,16 @@ export function registerMusicRoutes<E extends Env>(
         lyrics = route === '/song/lyrics',
         related = route === '/song/related',
         metadata = lyrics || related,
-        get = current || queue || collection || metadata;
+        get = current || queue || collection || metadata || status;
       if (rawTarget.includes('?') && !queue && !collection && !metadata)
         return reject(400);
-      if (!get && route !== '/search' && route !== '/browse')
+      if (
+        !get &&
+        !prepare &&
+        !mutation &&
+        route !== '/search' &&
+        route !== '/browse'
+      )
         return reject(404, 'not_found');
       if (context.req.method !== (get ? 'GET' : 'POST')) return reject(405);
       if (
@@ -260,7 +276,9 @@ export function registerMusicRoutes<E extends Env>(
           Number(incoming.headers['content-length'] ?? '0') > 0)
       )
         return reject(400);
-      const deadlineAt = Date.now() + (current || queue ? 5000 : 15000);
+      const deadlineAt =
+        Date.now() +
+        (prepare || mutation ? 10000 : current || queue ? 5000 : 15000);
       const controller = new AbortController();
       const socketLost = () => {
         if (!outgoing.writableFinished)
@@ -283,8 +301,9 @@ export function registerMusicRoutes<E extends Env>(
         Math.max(0, deadlineAt - Date.now()),
       );
       timer.unref?.();
-      const scope =
-        current || queue
+      const scope = navigation
+        ? 'playback.control'
+        : current || queue
           ? 'playback.read'
           : home
             ? 'personalized.read'
@@ -315,7 +334,7 @@ export function registerMusicRoutes<E extends Env>(
         ? parseMusicLyricsQuery(new URLSearchParams(query))
         : related
           ? parseMusicRelatedQuery(new URLSearchParams(query))
-          : current
+          : current || status
             ? undefined
             : queue
               ? parseMusicQueueQuery(new URLSearchParams(query))
@@ -323,27 +342,54 @@ export function registerMusicRoutes<E extends Env>(
                 ? parseMusicCollectionQuery(new URLSearchParams(query))
                 : await jsonBody(context.req.raw, incoming, signal);
       if (!live()) return reject(409, 'retired');
+      if (
+        mutation &&
+        input &&
+        typeof input === 'object' &&
+        Object.hasOwn(input, 'action')
+      )
+        return reject(400);
       const result = await wait<
         | Awaited<ReturnType<MusicService['current']>>
         | Awaited<ReturnType<MusicService['search']>>
         | Awaited<ReturnType<MusicService['queue']>>
         | Awaited<ReturnType<MusicService['lyrics']>>
+        | Awaited<ReturnType<MusicService['prepare']>>
       >(
-        lyrics
-          ? service.lyrics(token, input, signal, deadlineAt)
-          : related
-            ? service.related(token, input, signal, deadlineAt)
-            : current
-              ? service.current(token, signal)
-              : queue
-                ? service.queue(token, input, signal)
-                : home
-                  ? service.home(token, input, signal)
-                  : library
-                    ? service.library(token, input, signal)
-                    : route === '/search'
-                      ? service.search(token, input, signal)
-                      : service.browse(token, input, signal),
+        prepare
+          ? service.prepare(token, input, signal, deadlineAt)
+          : status
+            ? service.operation(token, operationId, signal, deadlineAt)
+            : mutation
+              ? service.navigate(
+                  token,
+                  {
+                    ...(input as object),
+                    action:
+                      route === '/play/song'
+                        ? 'play_song'
+                        : route === '/play/playlist'
+                          ? 'play_playlist'
+                          : 'radio',
+                  },
+                  signal,
+                  deadlineAt,
+                )
+              : lyrics
+                ? service.lyrics(token, input, signal, deadlineAt)
+                : related
+                  ? service.related(token, input, signal, deadlineAt)
+                  : current
+                    ? service.current(token, signal)
+                    : queue
+                      ? service.queue(token, input, signal)
+                      : home
+                        ? service.home(token, input, signal)
+                        : library
+                          ? service.library(token, input, signal)
+                          : route === '/search'
+                            ? service.search(token, input, signal)
+                            : service.browse(token, input, signal),
         signal,
       );
       if (!live()) return reject(409, 'retired');

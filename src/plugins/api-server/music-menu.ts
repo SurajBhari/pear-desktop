@@ -80,6 +80,7 @@ export async function createMusicGrantMenu(
               'Cancel',
               `${scopes.includes('personalized.read') ? 'Remove' : 'Add'} Home read`,
               `${scopes.includes('library.read') ? 'Remove' : 'Add'} library playlists read`,
+              `${scopes.includes('playback.control') ? 'Remove' : 'Add'} playback control`,
             ],
             defaultId: 3,
             cancelId: 3,
@@ -92,8 +93,9 @@ export async function createMusicGrantMenu(
               1: 'catalog.read',
               4: 'personalized.read',
               5: 'library.read',
+              6: 'playback.control',
             } as const
-          )[choice.response as 0 | 1 | 4 | 5];
+          )[choice.response as 0 | 1 | 4 | 5 | 6];
           if (!scope) return;
           const index = scopes.indexOf(scope);
           if (index < 0) scopes.push(scope);

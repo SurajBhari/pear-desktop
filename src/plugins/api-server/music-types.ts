@@ -57,7 +57,33 @@ export interface NativeMetadataProbe {
   version: 1;
   binding: MetadataBinding;
 }
+export type MusicPrepareInput =
+  | { action: 'play_song'; videoId: string; playlistId?: string }
+  | {
+      action: 'play_playlist';
+      playlistId: string;
+      videoId?: string;
+      shuffle: boolean;
+    }
+  | {
+      action: 'radio';
+      seed:
+        | { kind: 'video'; videoId: string }
+        | { kind: 'playlist'; playlistId: string }
+        | { kind: 'current' };
+    };
+export type MusicMutationInput = MusicPrepareInput & { operationId: string };
+export interface MusicOperationReceipt {
+  operationId: string;
+  status: 'pending' | 'accepted' | 'failed' | 'uncertain' | 'retired';
+  meaning?: 'owned_navigation_dispatch';
+  error?: MusicFailure | 'outcome_unknown';
+}
+export type NativeNavigationValue =
+  | { version: 1; phase: 'owned_dispatch'; binding?: MetadataBinding }
+  | { version: 1; phase: 'pre_effect_denial'; reason: MusicFailure };
 export type MusicReadInput =
+  | { operation: 'navigate'; command: MusicPrepareInput; deadlineAt: number }
   | { operation: 'lyrics'; target: MetadataTarget; deadlineAt: number }
   | { operation: 'related'; target: MetadataTarget; deadlineAt: number }
   | { operation: 'metadata-current'; deadlineAt: number }
@@ -91,6 +117,7 @@ export type MusicReadInput =
       deadlineAt?: number;
     };
 export type NativeMusicValue =
+  | NativeNavigationValue
   | NativeLyricsMetadata
   | NativeRelatedMetadata
   | NativeMetadataProbe
@@ -169,7 +196,10 @@ export type MusicFailure =
   | 'timeout'
   | 'forbidden'
   | 'unauthorized'
-  | 'not_found';
+  | 'not_found'
+  | 'unknown_operation'
+  | 'expired_operation'
+  | 'conflict';
 const messages: Record<MusicFailure, string> = {
   invalid: 'Invalid music request.',
   source: 'Invalid music service response.',
@@ -182,6 +212,9 @@ const messages: Record<MusicFailure, string> = {
   forbidden: 'Music access is not permitted.',
   unauthorized: 'A valid client grant is required.',
   not_found: 'Music reference not found.',
+  unknown_operation: 'Music operation history is unavailable.',
+  expired_operation: 'Music operation has expired.',
+  conflict: 'Music operation command conflicts with its preparation.',
 };
 export class MusicServiceError extends Error {
   constructor(readonly code: MusicFailure) {

@@ -8,6 +8,11 @@ import {
 } from '@/providers/music-request';
 
 import {
+  musicOperationLedger,
+  type MusicOperationLedger,
+  type MusicOperationRow,
+} from './music-operations';
+import {
   parseMusicInput,
   parseMusicLyricsInput,
   parseMusicRelatedInput,
@@ -19,6 +24,9 @@ import {
   parseNativeQueue,
   parseNativeCatalog,
   parseNativeSnapshot,
+  parseMusicPrepareInput,
+  parseMusicMutationInput,
+  parseMusicOperationId,
   type MusicTarget,
   type MusicClientInput,
 } from './scheme/music';
@@ -38,6 +46,7 @@ import {
   type MetadataBinding,
   type MetadataTarget,
   type LyricsResult,
+  type MusicOperationReceipt,
 } from '../music-types';
 
 import type { APIServerConfig } from '../config';
@@ -179,6 +188,7 @@ export class MusicService {
   readonly grants: MusicGrantStore;
   private readonly broker: MusicRequestBroker;
   private readonly now: () => number;
+  private readonly operations: MusicOperationLedger;
   private readonly detachNativeRetirement: () => void;
   private readonly detachGrantRetirement: () => void;
   private readonly releaseBroker: () => void;
@@ -195,8 +205,10 @@ export class MusicService {
     this.broker = runtime.broker ?? createMusicRequestBroker(runtime.window);
     this.releaseBroker = this.broker.retain?.() ?? (() => {});
     this.now = runtime.now ?? Date.now;
+    this.operations = musicOperationLedger(this.now);
     this.detachNativeRetirement =
       this.broker.subscribeRetirement?.(() => {
+        this.operations.retire(this);
         this.revision++;
         this.scope.abort();
         this.scope = new AbortController();
@@ -253,6 +265,7 @@ export class MusicService {
     };
   }
   configure(config: APIServerConfig) {
+    this.operations.retire(this);
     this.revision++;
     this.scope.abort();
     this.scope = new AbortController();
@@ -264,6 +277,7 @@ export class MusicService {
   }
   stop() {
     if (this.stopped) return;
+    this.operations.retire(this);
     this.stopped = true;
     this.revision++;
     this.scope.abort();
@@ -409,6 +423,176 @@ export class MusicService {
     const owner = this.broker.resultOwner(value);
     if (!lease.current() || !owner?.current()) return failMusic('retired');
     return { value, owner };
+  }
+  prepare(
+    token: unknown,
+    input: unknown,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ) {
+    const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
+    return this.admitted(
+      token,
+      'playback.control',
+      [],
+      signal,
+      false,
+      (lease) => {
+        const command = parseMusicPrepareInput(input);
+        return Promise.resolve(
+          this.operations.prepare(command, {
+            principal: lease.principal,
+            resource: lease.resource,
+            service: this,
+            revision: lease.revision,
+            admission: lease.admission,
+            current: () =>
+              this.enabled &&
+              this.revision === lease.revision &&
+              this.grants.isCurrent(lease.principal, 'playback.control') &&
+              this.resource === lease.resource &&
+              this.broker.isCurrent(lease.admission),
+          }),
+        );
+      },
+      deadline,
+    );
+  }
+  private requireOperationContext(lease: Lease, row: MusicOperationRow) {
+    if (
+      row.binding.service !== this ||
+      row.binding.revision !== lease.revision ||
+      row.binding.admission.generation !== lease.admission.generation ||
+      row.binding.admission.frame !== lease.admission.frame ||
+      !row.binding.current() ||
+      !lease.current()
+    )
+      return failMusic('retired');
+  }
+  operation(
+    token: unknown,
+    operationId: unknown,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ) {
+    return this.admitted(
+      token,
+      'playback.control',
+      [],
+      signal,
+      false,
+      (lease) => {
+        const row = this.operations.lookup(
+          parseMusicOperationId(operationId),
+          lease.principal,
+          lease.resource,
+          (row) => this.requireOperationContext(lease, row),
+        );
+        return Promise.resolve(this.operations.receipt(row));
+      },
+      deadlineAt,
+    );
+  }
+  navigate(
+    token: unknown,
+    input: unknown,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ) {
+    const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
+    return this.admitted(
+      token,
+      'playback.control',
+      [],
+      signal,
+      false,
+      async (lease) => {
+        const { operationId, ...command } = parseMusicMutationInput(input);
+        const row = this.operations.lookup(
+          operationId,
+          lease.principal,
+          lease.resource,
+          (row) => this.requireOperationContext(lease, row),
+        );
+        if (JSON.stringify(command) !== row.canonical)
+          return failMusic('conflict');
+        const receipt = this.operations.receipt(row);
+        if (receipt.status !== 'pending') return receipt;
+        if (row.executing) return row.promise!;
+        // Claim before the broker or any native callout can reenter. A duplicate's
+        // signal only cancels its own admitted wait, never this first caller's job.
+        row.executing = true;
+        row.physicalHold = true;
+        row.promise = (async (): Promise<MusicOperationReceipt> => {
+          try {
+            const value = await this.broker.read(
+              lease.admission,
+              {
+                operation: 'navigate',
+                command: row.command,
+                deadlineAt: lease.deadline,
+              },
+              lease.principal.id,
+              {
+                signal: lease.signal,
+                deadline: lease.deadline,
+                isCurrent: () => lease.current(),
+                onPhysicalSettled: (reason) =>
+                  this.operations.settled(row, reason === 'not_admitted'),
+              },
+            );
+            const own = Object.keys(value).every((key) => {
+              const d = Object.getOwnPropertyDescriptor(value, key);
+              return !!d && 'value' in d;
+            });
+            if (!own || !('phase' in value) || value.version !== 1)
+              throw new MusicServiceError('source');
+            if (
+              value.phase === 'owned_dispatch' &&
+              Object.keys(value).every((key) =>
+                ['version', 'phase', 'binding'].includes(key),
+              )
+            )
+              row.receipt = {
+                operationId,
+                status: 'accepted',
+                meaning: 'owned_navigation_dispatch',
+              };
+            else if (
+              value.phase === 'pre_effect_denial' &&
+              Object.keys(value).length === 3 &&
+              [
+                'invalid',
+                'source',
+                'unsupported',
+                'budget',
+                'retired',
+                'busy',
+                'unavailable',
+                'timeout',
+              ].includes(value.reason)
+            )
+              row.receipt = {
+                operationId,
+                status: 'failed',
+                error: value.reason,
+              };
+            else throw new MusicServiceError('source');
+          } catch (error) {
+            const code =
+              error instanceof MusicServiceError ? error.code : 'source';
+            row.receipt = row.notAdmitted
+              ? { operationId, status: 'failed', error: code }
+              : { operationId, status: 'uncertain', error: 'outcome_unknown' };
+          } finally {
+            this.operations.completed(row);
+          }
+          return this.operations.receipt(row);
+        })();
+        return row.promise;
+      },
+      deadline,
+    );
   }
   private metadataBinding(
     binding: MetadataBinding,

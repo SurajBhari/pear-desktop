@@ -7,6 +7,7 @@ import {
   type PlaybackSnapshot,
   type MusicFailure,
   type MetadataBinding,
+  type NativeNavigationValue,
 } from '@/plugins/api-server/music-types';
 
 import { normalizeMusicSource } from './music-catalog';
@@ -16,6 +17,11 @@ import {
   parseLyrics,
   parseRelated,
 } from './music-metadata';
+import {
+  directNavigation,
+  parseNavigationCommand,
+  projectNavigationRecipe,
+} from './music-navigation';
 import { createMusicQueueOwner } from './music-queue';
 import {
   nativeElapsedMilliseconds,
@@ -51,6 +57,7 @@ type Job = {
   currentBinding?: MetadataBinding;
   playbackRetired?: boolean;
   currentMetadata?: boolean;
+  navigationEntered?: boolean;
 };
 const randomId = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
@@ -104,6 +111,12 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
     typeof deadlineValue === 'number' &&
     Number.isFinite(deadlineValue) &&
     deadlineValue > 0;
+  if (own && value.operation === 'navigate' && keys.length === 3 && deadline) {
+    const command = parseNavigationCommand(value.command);
+    if (command)
+      return { operation: 'navigate', command, deadlineAt: deadlineValue };
+    return null;
+  }
   const metadataBinding = (v: unknown): v is MetadataBinding =>
     isRecord(v) &&
     Object.keys(v).length === 2 &&
@@ -575,12 +588,79 @@ export function createMusicRendererController(
     metadataValid(job, input.deadlineAt);
     return value;
   };
+  const navigate = async (
+    job: Job,
+    input: Extract<MusicReadInput, { operation: 'navigate' }>,
+  ): Promise<NativeNavigationValue> => {
+    metadataValid(job, input.deadlineAt);
+    let command = input.command;
+    if (command.action === 'radio' && command.seed.kind === 'current') {
+      job.currentBinding = probe(job);
+      command = {
+        action: 'radio',
+        seed: { kind: 'video', videoId: job.currentBinding.videoId },
+      };
+    }
+    metadataValid(job, input.deadlineAt);
+    let endpoint = directNavigation(command);
+    if (!endpoint) {
+      const seedVideo =
+        command.action === 'radio' && command.seed.kind === 'video'
+          ? command.seed.videoId
+          : undefined;
+      const video = seedVideo !== undefined;
+      const data = video
+        ? { videoId: seedVideo, isAudioOnly: true }
+        : {
+            browseId:
+              'VL' +
+              (command.action === 'play_playlist'
+                ? command.playlistId
+                : command.action === 'radio' && command.seed.kind === 'playlist'
+                  ? command.seed.playlistId
+                  : ''),
+          };
+      const raw = await Reflect.apply(job.owner.fetch, job.owner.network, [
+        video ? '/next' : '/browse',
+        data,
+      ]);
+      metadataValid(job, input.deadlineAt);
+      endpoint = projectNavigationRecipe(raw, command);
+    }
+    metadataValid(job, input.deadlineAt);
+    const app = job.owner.app,
+      dispatchLink = binding(app, 'dispatchEvent'),
+      // oxlint-disable-next-line typescript/unbound-method -- Captured once, invoked below with the exact owned app receiver.
+      dispatch = app.dispatchEvent,
+      EventClass = app.ownerDocument.defaultView?.CustomEvent;
+    if (typeof dispatch !== 'function' || !EventClass)
+      throw new MusicServiceError('unavailable');
+    const event = new EventClass('yt-navigate', {
+      detail: { endpoint },
+      bubbles: true,
+      composed: true,
+    });
+    metadataValid(job, input.deadlineAt);
+    if (!bindingCurrent(dispatchLink, 'dispatchEvent'))
+      throw new MusicServiceError('retired');
+    // Entering dispatch may itself change playback. No post-effect playback fence.
+    job.navigationEntered = true;
+    Reflect.apply(dispatch, app, [event]);
+    return {
+      version: 1,
+      phase: 'owned_dispatch',
+      ...(job.currentBinding ? { binding: job.currentBinding } : {}),
+    };
+  };
   const process = async (job: Job) => {
     active.add(job);
     try {
       if (!valid(job)) throw new MusicServiceError('retired');
       const input = job.input!;
       job.currentMetadata =
+        (input.operation === 'navigate' &&
+          input.command.action === 'radio' &&
+          input.command.seed.kind === 'current') ||
         input.operation === 'metadata-current' ||
         ((input.operation === 'lyrics' || input.operation === 'related') &&
           'current' in input.target) ||
@@ -588,7 +668,10 @@ export function createMusicRendererController(
           input.binding.playbackEpoch !== null) ||
         ((input.operation === 'browse' || input.operation === 'continuation') &&
           !!input.expectedCurrent);
-      if (
+      if (input.operation === 'navigate') {
+        const value = await navigate(job, input);
+        settled(job, { ok: true, value });
+      } else if (
         input.operation === 'lyrics' ||
         input.operation === 'related' ||
         input.operation === 'metadata-current' ||
@@ -698,7 +781,15 @@ export function createMusicRendererController(
         : error instanceof MusicServiceError
           ? error.code
           : 'source';
-      settled(job, { ok: false, reason });
+      settled(
+        job,
+        job.input?.operation === 'navigate' && !job.navigationEntered
+          ? {
+              ok: true,
+              value: { version: 1, phase: 'pre_effect_denial', reason },
+            }
+          : { ok: false, reason },
+      );
     } finally {
       active.delete(job);
       pump();

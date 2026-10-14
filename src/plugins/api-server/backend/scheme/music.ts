@@ -381,3 +381,89 @@ export const parseNativeRelatedMetadata = (value: unknown) => {
 };
 export const parseNativeMetadataProbe = (value: unknown) =>
   nativeMetadata(probeSchema, value);
+
+const navigationCommandSchema = z.discriminatedUnion('action', [
+  z
+    .object({
+      action: z.literal('play_song'),
+      videoId: z.string().refine(isVideoId),
+      playlistId: playlistId.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('play_playlist'),
+      playlistId,
+      videoId: z.string().refine(isVideoId).optional(),
+      shuffle: z.boolean().default(false),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('radio'),
+      seed: z.discriminatedUnion('kind', [
+        z
+          .object({
+            kind: z.literal('video'),
+            videoId: z.string().refine(isVideoId),
+          })
+          .strict(),
+        z.object({ kind: z.literal('playlist'), playlistId }).strict(),
+        z.object({ kind: z.literal('current') }).strict(),
+      ]),
+    })
+    .strict(),
+]);
+function navigationOwnData(value: unknown, depth = 0): boolean {
+  if (!value || typeof value !== 'object') return true;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (
+    depth > 4 ||
+    Array.isArray(value) ||
+    (prototype !== Object.prototype && prototype !== null)
+  )
+    return false;
+  return Reflect.ownKeys(value).every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return (
+      typeof key === 'string' &&
+      !!descriptor &&
+      'value' in descriptor &&
+      navigationOwnData(descriptor.value, depth + 1)
+    );
+  });
+}
+export function parseMusicPrepareInput(
+  value: unknown,
+): import('../../music-types').MusicPrepareInput {
+  if (!navigationOwnData(value)) return failMusic('invalid');
+  const parsed = navigationCommandSchema.safeParse(value);
+  if (!parsed.success) return failMusic('invalid');
+  return parsed.data;
+}
+export function parseMusicOperationId(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  )
+    return failMusic('invalid');
+  return value.toLowerCase();
+}
+export function parseMusicMutationInput(
+  value: unknown,
+): import('../../music-types').MusicMutationInput {
+  if (
+    !navigationOwnData(value) ||
+    !value ||
+    typeof value !== 'object' ||
+    !Object.hasOwn(value, 'operationId')
+  )
+    return failMusic('invalid');
+  const { operationId, ...command } = value as Record<string, unknown>;
+  return {
+    ...parseMusicPrepareInput(command),
+    operationId: parseMusicOperationId(operationId),
+  };
+}

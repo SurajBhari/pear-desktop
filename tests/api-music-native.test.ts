@@ -850,3 +850,139 @@ for (const mode of ['abort', 'deadline', 'service-reconfig'] as const)
       else process.env.PEAR_HANDSHAKE_NATIVE_MODE = previous;
     }
   });
+
+// N1 append-only actual physical ownership proof; original native tests above stay byte-identical.
+test('N1 actual late authenticated ACK and committed/process/window termination notify physical settlement once', async () => {
+  const proof = await musicNative(async () => {
+    const f = (globalThis as any).MusicNativeProof;
+    const make = () =>
+      new f.BrowserWindow({
+        show: false,
+        webPreferences: {
+          preload: f.preload,
+          contextIsolation: true,
+          sandbox: true,
+          nodeIntegrationInSubFrames: true,
+        },
+      });
+    const wait = async (check: () => boolean | Promise<boolean>) => {
+      const end = Date.now() + 5000;
+      while (!(await check())) {
+        if (Date.now() >= end)
+          throw Error('Missing N1 native physical observation');
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+    const anchor = make();
+    const results: any[] = [];
+    for (const mode of ['late-ack', 'committed', 'process', 'window']) {
+      const window = make();
+      await window.loadFile(f.owned + '/main.html');
+      const evaluate = (code: string) =>
+        window.webContents.executeJavaScript(code);
+      await evaluate(f.bundle);
+      await evaluate(
+        `window.replies=[];window.events=0;window.api={getVideoData:()=>({video_id:'seedVideo01'}),getPlayerResponse:()=>({videoDetails:{videoId:'seedVideo01'}}),addEventListener(){},removeEventListener(){}};const app=document.querySelector('ytmusic-app');app.networkManager={fetch:()=>new Promise(()=>{})};app.addEventListener('yt-navigate',()=>window.events++);window.controller=MusicNativeSource.createMusicRendererController(window.api,()=>window.api,{subscribe:window.musicProof.subscribe,send:(channel,packet)=>{if(packet.type==='settled')window.replies.push(packet);else window.musicProof.send(channel,packet)}});undefined;`,
+      );
+      const broker = f.source.createMusicRequestBroker(window),
+        controller = new AbortController(),
+        notices: any[] = [];
+      const p = broker
+        .read(
+          broker.capture(),
+          {
+            operation: 'navigate',
+            command: { action: 'play_song', videoId: 'seedVideo01' },
+            deadlineAt: Date.now() + 10000,
+          },
+          'n1',
+          {
+            signal: controller.signal,
+            deadline: mode === 'late-ack' ? Date.now() + 60 : undefined,
+            onPhysicalSettled: (reason: string) =>
+              notices.push({ reason, slots: broker.stats().dispatched }),
+          },
+        )
+        .catch((e: any) => e.code);
+      await wait(async () => await evaluate('window.replies.length===1'));
+      const packet = await evaluate('window.replies[0]'),
+        dispatches = await evaluate('window.events');
+      // A logical cancellation or source retirement never certifies physical completion.
+      if (mode !== 'late-ack') controller.abort();
+      const logical = await p;
+      const before = {
+        notices: notices.length,
+        slots: broker.stats().dispatched,
+      };
+      if (mode === 'late-ack') {
+        const foreign = make();
+        await foreign.loadFile(f.owned + '/child.html');
+        await foreign.webContents.executeJavaScript(
+          `window.musicProof.send('peard:music-reply',${JSON.stringify(packet)})`,
+        );
+        const child = window.webContents.mainFrame.frames[0];
+        await child.executeJavaScript(
+          `window.musicProof.send('peard:music-reply',${JSON.stringify(packet)})`,
+        );
+        for (const patch of [
+          { nonce: 'f'.repeat(32) },
+          { documentId: 'f'.repeat(32) },
+          { sourceId: 'f'.repeat(32) },
+          { requestId: '00000000-0000-4000-8000-000000000000' },
+        ])
+          await evaluate(
+            `window.musicProof.send('peard:music-reply',${JSON.stringify({ ...packet, ...patch })})`,
+          );
+        await new Promise((r) => setTimeout(r, 20));
+        const afterWrong = {
+          notices: notices.length,
+          slots: broker.stats().dispatched,
+        };
+        await evaluate(
+          `window.musicProof.send('peard:music-reply',${JSON.stringify(packet)});window.musicProof.send('peard:music-reply',${JSON.stringify(packet)})`,
+        );
+        await wait(() => notices.length === 1);
+        results.push({
+          mode,
+          logical,
+          dispatches,
+          before,
+          afterWrong,
+          notices,
+        });
+        foreign.destroy();
+      } else {
+        if (mode === 'committed') await window.loadFile(f.owned + '/main.html');
+        else if (mode === 'process') {
+          window.webContents.forcefullyCrashRenderer();
+          await wait(() => notices.length === 1);
+        } else window.destroy();
+        await wait(() => notices.length === 1);
+        results.push({ mode, logical, dispatches, before, notices });
+      }
+      if (!window.isDestroyed()) window.destroy();
+      broker.dispose();
+    }
+    anchor.destroy();
+    return results;
+  });
+  expect(proof).toHaveLength(4);
+  for (const row of proof) {
+    expect(row.dispatches).toBe(1);
+    expect(row.before).toEqual({ notices: 0, slots: 1 });
+    expect(row.notices).toEqual([
+      {
+        reason:
+          row.mode === 'late-ack'
+            ? 'authenticated_ack'
+            : 'authoritative_termination',
+        slots: 0,
+      },
+    ]);
+    if (row.mode === 'late-ack') {
+      expect(row.logical).toBe('timeout');
+      expect(row.afterWrong).toEqual(row.before);
+    } else expect(row.logical).toBe('retired');
+  }
+  console.log('N1_PHYSICAL_NATIVE_PROOF ' + JSON.stringify(proof));
+});
