@@ -113,6 +113,7 @@ export async function shortcutRatingSource() {
     `export {onMenu} from ${JSON.stringify(root + '/src/plugins/shortcuts/menu.ts')};`,
     `export {default as shortcuts} from ${JSON.stringify(root + '/src/plugins/shortcuts/index.ts')};`,
     `export {default as precise} from ${JSON.stringify(root + '/src/plugins/precise-volume/index.ts')};`,
+    `export {default as playbackSpeed} from ${JSON.stringify(root + '/src/plugins/playback-speed/index.ts')};`,
   ];
   if (existsSync(root + '/src/utils/global-shortcut-owner.ts'))
     exports.push(
@@ -148,6 +149,12 @@ export async function shortcutRatingSource() {
             )
               return '\0shortcut:' + id;
             if (id === './mpris') return '\0shortcut:mpris';
+            if (
+              importer &&
+              normalizePath(importer).endsWith('/playback-speed/index.ts') &&
+              id === './renderer'
+            )
+              return '\0shortcut:speed-renderer';
             if (
               importer &&
               normalizePath(importer).endsWith('/precise-volume/index.ts') &&
@@ -187,6 +194,8 @@ export async function shortcutRatingSource() {
               return 'export const registerMPRIS=()=>{};';
             if (id === '\0shortcut:volume-renderer')
               return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},overrideListener=()=>{};';
+            if (id === '\0shortcut:speed-renderer')
+              return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},onUnload=()=>{};';
           },
           transform(source, id) {
             if (normalizePath(id).startsWith(root + '/src/'))
@@ -263,6 +272,7 @@ export async function shortcutRatingSource() {
       async close() {
         source.backend.stop();
         source.precise.backend?.stop?.();
+        source.playbackSpeed.backend?.stop?.();
         delete (globalThis as any)[key];
         await rm(directory, { recursive: true, force: true });
       },

@@ -35,6 +35,8 @@ export type CatalogOperation = 'search' | 'browse' | 'home' | 'library';
 export type MusicReadInput =
   | { operation: 'current' }
   | { operation: 'queue' }
+  | { operation: 'home' }
+  | { operation: 'library' }
   | {
       operation: 'search';
       query: string;

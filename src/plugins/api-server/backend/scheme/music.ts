@@ -229,6 +229,9 @@ export function parseMusicQueueQuery(query: URLSearchParams) {
   }
   return parseMusicQueueInput(value);
 }
+/** Collections share the canonical limit/cursor grammar; no native recipe is client input. */
+export const parseMusicCollectionInput = parseMusicQueueInput;
+export const parseMusicCollectionQuery = parseMusicQueueQuery;
 const queueSchema = z
   .object({
     version: z.literal(1),

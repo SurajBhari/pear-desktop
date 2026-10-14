@@ -392,3 +392,71 @@ test('queue client schema rejects malformed input before native dispatch', async
     expect(f.calls).toHaveLength(0);
   } finally { await f.close(); }
 });
+// C1 ownership controls exercise the same cache/admission/ledger as catalog and queue.
+test('Home and library use shared32-principal cursor quota and release on revoke', async () => {
+  const f = await musicServiceFixture();
+  try {
+    const grant = await f.store.issue(
+      'Shared scopes',
+      'rest',
+      f.resource,
+      ['catalog.read', 'personalized.read', 'library.read'],
+      () => true,
+    );
+    expect(f.calls).toHaveLength(0);
+    for (let i = 0; i < 16; i++)
+      await f.service.home(grant.token, { limit: 100 });
+    for (let i = 0; i < 16; i++)
+      await f.service.search(grant.token, { query: 'fixture', limit: 100 });
+    expect(f.service.stats().cursors).toBe(32);
+    // A new Home call cannot allocate a separate collection cache beyond catalog's quota.
+    await expect(
+      f.service.home(grant.token, { limit: 100 }),
+    ).rejects.toMatchObject({ code: 'budget' });
+    expect(f.service.stats().cursors).toBe(32);
+    await f.store.revoke(grant.record.id, () => true);
+    expect(f.service.stats()).toEqual({
+      cursors: 0,
+      references: 0,
+      cacheBytes: 0,
+    });
+  } finally {
+    await f.close();
+  }
+});
+test('collection grant expiry configuration and source retirement cannot reuse completed replay', async () => {
+  for (const retire of ['expiry', 'config', 'source']) {
+    const f = await musicServiceFixture();
+    try {
+      const grant = await f.store.issue(
+        'Home scope',
+        'rest',
+        f.resource,
+        ['personalized.read'],
+        () => true,
+      );
+      const first = await f.service.home(grant.token, { limit: 100 });
+      const second = await f.service.home(grant.token, {
+        cursor: first.nextCursor,
+        limit: 100,
+      });
+      expect(second.items).toHaveLength(51);
+      if (retire === 'expiry') f.advance(86400001);
+      else if (retire === 'config') f.service.configure({ ...f.config });
+      else f.retireSource();
+      await expect(
+        f.service.home(grant.token, { cursor: first.nextCursor, limit: 100 }),
+      ).rejects.toMatchObject({
+        code:
+          retire === 'expiry'
+            ? 'unauthorized'
+            : retire === 'config'
+              ? 'not_found'
+              : 'retired',
+      });
+      expect(f.calls).toHaveLength(1);
+    } finally {
+      await f.close();
+    }
+  }
+});

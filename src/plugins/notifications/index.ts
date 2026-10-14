@@ -1,12 +1,14 @@
 import { t } from '@/i18n';
 import { createPlugin } from '@/utils';
 
-import { onConfigChange, onMainLoad } from './main';
+import { onConfigChange, onMainLoad, onMainStop } from './main';
 import { onMenu } from './menu';
+import { ratingFeedbackRenderer } from './rating-feedback-renderer';
 
 export interface NotificationsPluginConfig {
   enabled: boolean;
   unpauseNotification: boolean;
+  notifyOnLikeChange: boolean;
   /**
    * Has effect only on Linux
    */
@@ -27,6 +29,7 @@ export interface NotificationsPluginConfig {
 export const defaultConfig: NotificationsPluginConfig = {
   enabled: false,
   unpauseNotification: false,
+  notifyOnLikeChange: false,
   urgency: 'normal',
   interactive: true,
   toastStyle: 1,
@@ -38,11 +41,13 @@ export const defaultConfig: NotificationsPluginConfig = {
 export default createPlugin({
   name: () => t('plugins.notifications.name'),
   description: () => t('plugins.notifications.description'),
-  restartNeeded: true,
+  restartNeeded: false,
   config: defaultConfig,
   menu: onMenu,
+  renderer: ratingFeedbackRenderer,
   backend: {
     start: onMainLoad,
     onConfigChange,
+    stop: onMainStop,
   },
 });

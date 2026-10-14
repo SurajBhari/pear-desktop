@@ -78,15 +78,23 @@ export async function createMusicGrantMenu(
               `${scopes.includes('catalog.read') ? 'Remove' : 'Add'} catalog read`,
               'Create grant',
               'Cancel',
+              `${scopes.includes('personalized.read') ? 'Remove' : 'Add'} Home read`,
+              `${scopes.includes('library.read') ? 'Remove' : 'Add'} library playlists read`,
             ],
             defaultId: 3,
             cancelId: 3,
           });
           if (!current() || !choice || choice.response === 3) return;
           if (choice.response === 2) break;
-          if (choice.response !== 0 && choice.response !== 1) return;
-          const scope =
-            choice.response === 0 ? 'playback.read' : 'catalog.read';
+          const scope = (
+            {
+              0: 'playback.read',
+              1: 'catalog.read',
+              4: 'personalized.read',
+              5: 'library.read',
+            } as const
+          )[choice.response as 0 | 1 | 4 | 5];
+          if (!scope) return;
           const index = scopes.indexOf(scope);
           if (index < 0) scopes.push(scope);
           else scopes.splice(index, 1);

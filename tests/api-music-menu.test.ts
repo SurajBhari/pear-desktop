@@ -148,3 +148,24 @@ test('native prompt and permission dialog disappearance settle without issuing o
     expect(f.copies).toEqual([]);
   }
 });
+// C1: preserve the original grant-editor tests above byte-for-byte.
+test('native editor independently selects Home and library with empty defaults and explicit copy', async () => {
+  for (const [button, scope] of [
+    [4, 'personalized.read'],
+    [5, 'library.read'],
+  ] as const) {
+    const f = await fixture([button, 2, 0]);
+    await f.menu
+      .find((i: any) => i.label.startsWith('Create client grant'))
+      .click();
+    expect(f.issues).toHaveLength(1);
+    expect(f.issues[0][3]).toEqual([scope]);
+    expect(f.copies).toEqual(['synthetic-native-only-bearer']);
+    expect(f.dialogs[0].detail).toContain('Selected: none');
+    expect(f.dialogs[0].buttons[4]).toContain('Home');
+    expect(f.dialogs[0].buttons[5]).toContain('library');
+    expect(JSON.stringify(f.dialogs)).not.toContain(
+      'synthetic-native-only-bearer',
+    );
+  }
+});

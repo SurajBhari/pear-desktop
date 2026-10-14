@@ -366,3 +366,37 @@ test('decoded known label recipe and hidden-property budgets reject before overs
   });
   expect(() => m.normalizeMusicSource(hidden, 'home')).toThrow();
 });
+// C1 fixture acceptance retains the unchanged public parser and bounded layouts.
+test('collection title-linked duplicates and verified empty stay truthful before main library projection', async () => {
+  const m = await fixture();
+  const titleOnly: any = twoRowBrowse('playlist', 'PLcollection');
+  delete titleOnly.musicTwoRowItemRenderer.navigationEndpoint;
+  const normalized = m.normalizeMusicSource(
+    singleColumn([
+      carousel([titleOnly, titleOnly, responsiveSong(0)], 'Collections'),
+    ]),
+    'library',
+  );
+  expect(normalized.items.map((i: any) => [i.kind, i.id])).toEqual([
+    ['playlist', 'PLcollection'],
+    ['playlist', 'PLcollection'],
+    ['song', videoId(0)],
+  ]);
+  expect(normalized.shelves).toEqual([
+    { title: 'Collections', start: 0, count: 3 },
+  ]);
+  for (const route of ['home', 'library']) {
+    expect(
+      m.normalizeMusicSource(singleColumn([carousel([])]), route).items,
+    ).toEqual([]);
+    expect(() =>
+      m.normalizeMusicSource({ contents: { unknownRenderer: {} } }, route),
+    ).toThrow('Unsupported music service layout.');
+    expect(() =>
+      m.normalizeMusicSource(
+        singleColumn([carousel([{ musicTwoRowItemRenderer: {} }])]),
+        route,
+      ),
+    ).toThrow();
+  }
+});

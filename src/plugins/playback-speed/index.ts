@@ -1,11 +1,18 @@
 import { t } from '@/i18n';
 import { createPlugin } from '@/utils';
 
+import { backend } from './main';
+import { onMenu } from './menu';
 import { onConfigChange, onPlayerApiReady, onUnload } from './renderer';
 
 export interface PlaybackSpeedConfig {
   enabled: boolean;
   preservesPitch: boolean;
+}
+
+export interface PlaybackSpeedPluginConfig extends PlaybackSpeedConfig {
+  step: number;
+  globalShortcuts: { speedUp: string; speedDown: string };
 }
 
 export default createPlugin({
@@ -15,15 +22,11 @@ export default createPlugin({
   config: {
     enabled: false,
     preservesPitch: true,
+    step: 0.1,
+    globalShortcuts: { speedUp: '', speedDown: '' },
   },
-  menu: async ({ getConfig, setConfig }) => [
-    {
-      label: t('plugins.playback-speed.menu.preserve-pitch'),
-      type: 'checkbox',
-      checked: (await getConfig()).preservesPitch !== false,
-      click: (item) => setConfig({ preservesPitch: item.checked }),
-    },
-  ],
+  menu: onMenu,
+  backend,
   renderer: {
     stop: onUnload,
     onPlayerApiReady,

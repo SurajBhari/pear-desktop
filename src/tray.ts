@@ -22,23 +22,93 @@ type TrayEvent = (
   bounds: Electron.Rectangle,
 ) => void;
 
-export const setTrayOnClick = (fn: TrayEvent) => {
-  if (!tray) {
-    return;
-  }
-
-  tray.removeAllListeners('click');
-  tray.on('click', fn);
+type CallbackOwner = { isCurrent(): boolean; signal?: AbortSignal };
+type TrayLease = {
+  handler: TrayEvent;
+  owner?: CallbackOwner;
+  live: boolean;
+  previous?: TrayLease;
 };
-
-// Won't do anything on macOS since its disabled
-export const setTrayOnDoubleClick = (fn: TrayEvent) => {
-  if (!tray) {
-    return;
+const slots = new WeakMap<Electron.Tray, Map<string, TrayLease>>();
+function registerTray(
+  event: 'click' | 'double-click',
+  fn: TrayEvent,
+  owner?: CallbackOwner,
+) {
+  const physical = tray;
+  if (!physical) return () => {};
+  let map = slots.get(physical);
+  if (!map) {
+    map = new Map();
+    slots.set(physical, map);
   }
-
-  tray.removeAllListeners('double-click');
-  tray.on('double-click', fn);
+  const previous = map.get(event);
+  const add = (handler: TrayEvent) => {
+    if (event === 'click') physical.on('click', handler);
+    else physical.on('double-click', handler);
+  };
+  const remove = (handler: TrayEvent) => {
+    if (event === 'click') physical.removeListener('click', handler);
+    else physical.removeListener('double-click', handler);
+  };
+  const lease: TrayLease = {
+    live: true,
+    owner,
+    previous,
+    handler: (...args) => {
+      if (!lease.live || tray !== physical || map.get(event) !== lease) return;
+      if (owner && (!owner.isCurrent() || owner.signal?.aborted)) return;
+      if (lease.live && tray === physical && map.get(event) === lease)
+        fn(...args);
+    },
+  };
+  if (owner && (!owner.isCurrent() || owner.signal?.aborted)) return () => {};
+  if (tray !== physical || map.get(event) !== previous) return () => {};
+  if (previous) remove(previous.handler);
+  if (tray !== physical || map.get(event) !== previous) return () => {};
+  map.set(event, lease);
+  add(lease.handler);
+  if (tray !== physical || map.get(event) !== lease) remove(lease.handler);
+  const dispose = () => {
+    if (!lease.live) return;
+    lease.live = false;
+    owner?.signal?.removeEventListener('abort', dispose);
+    remove(lease.handler);
+    if (tray !== physical || map.get(event) !== lease) return;
+    let restore = lease.previous;
+    while (restore) {
+      const candidate = restore;
+      const valid =
+        candidate.live && (!candidate.owner || candidate.owner.isCurrent());
+      const aborted = candidate.owner?.signal?.aborted;
+      if (tray !== physical || map.get(event) !== lease) return;
+      // A prior predicate can dispose that candidate while the upper slot stays current.
+      if (valid && !aborted && candidate.live) break;
+      restore = candidate.previous;
+    }
+    if (restore) {
+      map.set(event, restore);
+      add(restore.handler);
+      if (tray !== physical || map.get(event) !== restore)
+        remove(restore.handler);
+    } else map.delete(event);
+  };
+  owner?.signal?.addEventListener('abort', dispose, { once: true });
+  if (owner?.signal?.aborted) dispose();
+  return dispose;
+}
+export const registerOwnedTrayOnClick = (owner: CallbackOwner, fn: TrayEvent) =>
+  registerTray('click', fn, owner);
+export const registerOwnedTrayOnDoubleClick = (
+  owner: CallbackOwner,
+  fn: TrayEvent,
+) => registerTray('double-click', fn, owner);
+export const setTrayOnClick = (fn: TrayEvent): void => {
+  registerTray('click', fn);
+};
+// Electron ignores double click on macOS.
+export const setTrayOnDoubleClick = (fn: TrayEvent): void => {
+  registerTray('double-click', fn);
 };
 
 export const setUpTray = (app: Electron.App, win: Electron.BrowserWindow) => {
@@ -77,7 +147,7 @@ export const setUpTray = (app: Electron.App, win: Electron.BrowserWindow) => {
   // MacOS only
   tray.setIgnoreDoubleClickEvents(true);
 
-  tray.on('click', () => {
+  setTrayOnClick(() => {
     if (config.get('options.trayClickPlayPause')) {
       playPause();
     } else if (win.isVisible()) {
