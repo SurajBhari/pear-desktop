@@ -9,6 +9,11 @@ import {
 
 import {
   parseMusicInput,
+  parseMusicLyricsInput,
+  parseMusicRelatedInput,
+  parseNativeLyricsMetadata,
+  parseNativeRelatedMetadata,
+  parseNativeMetadataProbe,
   parseMusicQueueInput,
   parseMusicCollectionInput,
   parseNativeQueue,
@@ -30,6 +35,9 @@ import {
   type NormalizedMusicSource,
   type NativeQueueSnapshot,
   type QueuePage,
+  type MetadataBinding,
+  type MetadataTarget,
+  type LyricsResult,
 } from '../music-types';
 
 import type { APIServerConfig } from '../config';
@@ -44,7 +52,8 @@ type PageContext =
       query: string;
       kind?: 'song' | 'video' | 'album' | 'artist' | 'playlist';
     }
-  | { route: 'browse'; target: MusicTarget }
+  | { route: 'browse'; target: MusicTarget; binding?: MetadataBinding }
+  | { route: 'related'; videoId: string; binding: MetadataBinding }
   | { route: 'home' | 'library' };
 export interface MusicPage {
   version: 1;
@@ -55,6 +64,7 @@ export interface MusicPage {
   query?: string;
   kind?: string;
   target?: MusicTarget;
+  videoId?: string;
 }
 interface CursorBase {
   id: string;
@@ -86,6 +96,8 @@ type Cursor = CursorBase &
       }
   );
 interface TargetReference {
+  binding?: MetadataBinding;
+  busy?: boolean;
   id: string;
   principal: MusicGrantRecord;
   scope: MusicScope;
@@ -272,12 +284,16 @@ export class MusicService {
     signal: AbortSignal | undefined,
     currentRead: boolean,
     action: (lease: Lease) => Promise<T>,
+    deadlineAt?: number,
   ): Promise<T> {
     if (!this.enabled) return failMusic('unavailable');
     const revision = this.revision,
       admission = this.broker.capture(),
       resource = this.resource,
-      deadline = this.now() + (currentRead ? 5000 : 15000),
+      deadline = Math.min(
+        this.now() + (currentRead ? 5000 : 15000),
+        deadlineAt ?? Infinity,
+      ),
       controller = new AbortController();
     const joined = AbortSignal.any([
       this.scope.signal,
@@ -393,6 +409,129 @@ export class MusicService {
     const owner = this.broker.resultOwner(value);
     if (!lease.current() || !owner?.current()) return failMusic('retired');
     return { value, owner };
+  }
+  private metadataBinding(
+    binding: MetadataBinding,
+    owner: SourceOwner,
+    target?: MetadataTarget,
+  ) {
+    if (
+      binding.playbackEpoch !== null &&
+      binding.playbackEpoch.split(':')[0] !== owner.epoch.split(':')[0]
+    )
+      return failMusic('source');
+    if (
+      target &&
+      ('videoId' in target
+        ? binding.videoId !== target.videoId || binding.playbackEpoch !== null
+        : binding.playbackEpoch === null)
+    )
+      return failMusic('source');
+    return binding;
+  }
+  private retireMetadata(binding: MetadataBinding) {
+    const matches = (other?: MetadataBinding) =>
+      other?.playbackEpoch === binding.playbackEpoch &&
+      other?.videoId === binding.videoId;
+    for (const [id, cursor] of this.cursors)
+      if (
+        cursor.kind === 'catalog' &&
+        'binding' in cursor.context &&
+        matches(cursor.context.binding)
+      )
+        this.cursors.delete(id);
+    for (const [id, reference] of this.references)
+      if (matches(reference.binding)) this.references.delete(id);
+    this.scheduleCacheCleanup();
+  }
+  private async probeMetadata(
+    lease: Lease,
+    binding: MetadataBinding,
+    owner: SourceOwner,
+  ) {
+    if (binding.playbackEpoch === null) return;
+    const captured = await this.native(lease, {
+      operation: 'metadata-current',
+      deadlineAt: lease.deadline,
+    });
+    const fresh = parseNativeMetadataProbe(captured.value).binding;
+    this.metadataBinding(fresh, captured.owner, { current: true });
+    if (
+      fresh.videoId !== binding.videoId ||
+      fresh.playbackEpoch !== binding.playbackEpoch ||
+      captured.owner.epoch !== owner.epoch ||
+      !owner.current()
+    ) {
+      this.retireMetadata(binding);
+      return failMusic('retired');
+    }
+  }
+  lyrics(
+    token: unknown,
+    value: unknown,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ): Promise<LyricsResult> {
+    const target = parseMusicLyricsInput(value);
+    return this.admitted(
+      token,
+      'catalog.read',
+      [],
+      signal,
+      false,
+      async (lease) => {
+        const captured = await this.native(lease, {
+          operation: 'lyrics',
+          target,
+          deadlineAt: lease.deadline,
+        });
+        const result = parseNativeLyricsMetadata(captured.value);
+        this.metadataBinding(result.binding, captured.owner, target);
+        return result.lyrics;
+      },
+      deadlineAt,
+    );
+  }
+  related(
+    token: unknown,
+    value: unknown,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ): Promise<MusicPage> {
+    const input = parseMusicRelatedInput(value);
+    return this.admitted(
+      token,
+      'catalog.read',
+      [],
+      signal,
+      false,
+      async (lease) => {
+        if ('cursor' in input)
+          return this.next(lease, input.cursor, 'related', input.limit);
+        const target: MetadataTarget =
+          'videoId' in input ? { videoId: input.videoId } : { current: true };
+        const captured = await this.native(lease, {
+          operation: 'related',
+          target,
+          deadlineAt: lease.deadline,
+        });
+        const result = parseNativeRelatedMetadata(captured.value);
+        this.metadataBinding(result.binding, captured.owner, target);
+        return this.page(
+          lease,
+          {
+            route: 'related',
+            videoId: result.binding.videoId,
+            binding: result.binding,
+          },
+          result.source,
+          captured.owner,
+          0,
+          input.limit,
+        );
+      },
+      deadlineAt,
+    );
   }
   current(token: unknown, signal?: AbortSignal) {
     return this.admitted(
@@ -684,6 +823,19 @@ export class MusicService {
                 ))
             )
               return failMusic('retired');
+            if (reference.busy) return failMusic('busy');
+            reference.busy = true;
+            try {
+              await this.probeMetadata(
+                lease,
+                reference.binding ?? { videoId: '', playbackEpoch: null },
+                reference.owner,
+              );
+            } finally {
+              reference.busy = false;
+            }
+            if (reference.binding)
+              context = { ...context, binding: reference.binding };
             const originLease = lease;
             lease = {
               ...originLease,
@@ -701,6 +853,12 @@ export class MusicService {
             nativeInput = {
               operation: 'browse',
               browseId: reference.browseId,
+              ...(reference.binding?.playbackEpoch
+                ? {
+                    expectedCurrent: reference.binding,
+                    deadlineAt: lease.deadline,
+                  }
+                : {}),
               ...(reference.params ? { params: reference.params } : {}),
             };
           } else
@@ -813,7 +971,9 @@ export class MusicService {
           }
         : context.route === 'browse'
           ? { target: context.target }
-          : {};
+          : context.route === 'related'
+            ? { videoId: context.videoId }
+            : {};
     let result: MusicPage;
     for (;;) {
       const end = offset + projected.length;
@@ -853,6 +1013,9 @@ export class MusicService {
           ...(lease.issuerScope ? { issuerScope: lease.issuerScope } : {}),
           revision: lease.revision,
           owner,
+          ...('binding' in context && context.binding?.playbackEpoch
+            ? { binding: context.binding }
+            : {}),
           browseId: recipe.browseId,
           ...(recipe.params ? { params: recipe.params } : {}),
           expires: this.now() + MUSIC_LIMITS.cursorMs,
@@ -929,7 +1092,6 @@ export class MusicService {
       return failMusic('retired');
     if (limit !== cursor.limit) return failMusic('invalid');
     if (cursor.busy) return failMusic('busy');
-    if (cursor.replay) return structuredClone(cursor.replay);
     const originLease = lease;
     if (cursor.issuerScope)
       lease = {
@@ -941,20 +1103,50 @@ export class MusicService {
       };
     cursor.busy = true;
     try {
+      if ('binding' in cursor.context && cursor.context.binding)
+        await this.probeMetadata(lease, cursor.context.binding, cursor.owner);
+      if (cursor.replay) return structuredClone(cursor.replay);
       let seenPlaylistIds = cursor.seenPlaylistIds;
       let source = cursor.source,
         owner = cursor.owner,
         offset = cursor.offset;
       if (offset === source.items.length) {
         if (!source.continuation) return failMusic('not_found');
-        const captured = await this.native(lease, {
-          operation: 'continuation',
-          ...source.continuation,
-        });
-        source = parseNativeCatalog(
-          captured.value,
-          source.continuation.endpoint,
+        const captured = await this.native(
+          lease,
+          cursor.context.route === 'related'
+            ? {
+                operation: 'related-continuation',
+                token: source.continuation.token,
+                binding: cursor.context.binding,
+                deadlineAt: lease.deadline,
+              }
+            : {
+                operation: 'continuation',
+                ...source.continuation,
+                ...('binding' in cursor.context &&
+                cursor.context.binding?.playbackEpoch
+                  ? {
+                      expectedCurrent: cursor.context.binding,
+                      deadlineAt: lease.deadline,
+                    }
+                  : {}),
+              },
         );
+        if (cursor.context.route === 'related') {
+          const result = parseNativeRelatedMetadata(captured.value);
+          this.metadataBinding(result.binding, captured.owner);
+          if (
+            JSON.stringify(result.binding) !==
+            JSON.stringify(cursor.context.binding)
+          )
+            return failMusic('retired');
+          source = result.source;
+        } else
+          source = parseNativeCatalog(
+            captured.value,
+            source.continuation.endpoint,
+          );
         if (owner.epoch !== captured.owner.epoch || !owner.current())
           return failMusic('retired');
         if (cursor.context.route === 'library') {

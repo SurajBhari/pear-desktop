@@ -32,7 +32,41 @@ export type MusicKind =
   | 'playlist'
   | 'category';
 export type CatalogOperation = 'search' | 'browse' | 'home' | 'library';
+export type MetadataTarget = { videoId: string } | { current: true };
+export interface MetadataBinding {
+  videoId: string;
+  playbackEpoch: string | null;
+}
+export interface LyricsResult {
+  videoId: string;
+  available: boolean;
+  lyrics: string | null;
+  source: string | null;
+}
+export interface NativeLyricsMetadata {
+  version: 1;
+  binding: MetadataBinding;
+  lyrics: LyricsResult;
+}
+export interface NativeRelatedMetadata {
+  version: 1;
+  binding: MetadataBinding;
+  source: NormalizedMusicSource;
+}
+export interface NativeMetadataProbe {
+  version: 1;
+  binding: MetadataBinding;
+}
 export type MusicReadInput =
+  | { operation: 'lyrics'; target: MetadataTarget; deadlineAt: number }
+  | { operation: 'related'; target: MetadataTarget; deadlineAt: number }
+  | { operation: 'metadata-current'; deadlineAt: number }
+  | {
+      operation: 'related-continuation';
+      token: string;
+      binding: MetadataBinding;
+      deadlineAt: number;
+    }
   | { operation: 'current' }
   | { operation: 'queue' }
   | { operation: 'home' }
@@ -42,9 +76,24 @@ export type MusicReadInput =
       query: string;
       filter?: 'songs' | 'videos' | 'albums' | 'artists' | 'playlists';
     }
-  | { operation: 'browse'; browseId: string; params?: string }
-  | { operation: 'continuation'; endpoint: 'search' | 'browse'; token: string };
+  | {
+      operation: 'browse';
+      browseId: string;
+      params?: string;
+      expectedCurrent?: MetadataBinding;
+      deadlineAt?: number;
+    }
+  | {
+      operation: 'continuation';
+      endpoint: 'search' | 'browse';
+      token: string;
+      expectedCurrent?: MetadataBinding;
+      deadlineAt?: number;
+    };
 export type NativeMusicValue =
+  | NativeLyricsMetadata
+  | NativeRelatedMetadata
+  | NativeMetadataProbe
   | PlaybackSnapshot
   | NormalizedMusicSource
   | NativeQueueSnapshot;

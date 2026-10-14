@@ -6,9 +6,16 @@ import {
   type NativeMusicResult,
   type PlaybackSnapshot,
   type MusicFailure,
+  type MetadataBinding,
 } from '@/plugins/api-server/music-types';
 
 import { normalizeMusicSource } from './music-catalog';
+import {
+  assertMetadataWorkBudget,
+  parseWatchNextTabs,
+  parseLyrics,
+  parseRelated,
+} from './music-metadata';
 import { createMusicQueueOwner } from './music-queue';
 import {
   nativeElapsedMilliseconds,
@@ -41,6 +48,9 @@ type Job = {
   owner: Owner;
   input?: MusicReadInput;
   canceled: boolean;
+  currentBinding?: MetadataBinding;
+  playbackRetired?: boolean;
+  currentMetadata?: boolean;
 };
 const randomId = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
@@ -71,7 +81,68 @@ const browseId = (value: unknown) =>
     categories.includes(value));
 export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
   if (!isRecord(value)) return null;
+  if (
+    ['lyrics', 'related', 'metadata-current', 'related-continuation'].includes(
+      Object.getOwnPropertyDescriptor(value, 'operation')?.value as string,
+    ) ||
+    Object.hasOwn(value, 'expectedCurrent')
+  ) {
+    try {
+      assertMetadataWorkBudget(value);
+    } catch {
+      return null;
+    }
+  }
   const keys = Object.keys(value);
+  const own = keys.every((key) => {
+    const d = Object.getOwnPropertyDescriptor(value, key);
+    return !!d && 'value' in d;
+  });
+  const deadlineValue = Object.getOwnPropertyDescriptor(value, 'deadlineAt')
+    ?.value as unknown;
+  const deadline =
+    typeof deadlineValue === 'number' &&
+    Number.isFinite(deadlineValue) &&
+    deadlineValue > 0;
+  const metadataBinding = (v: unknown): v is MetadataBinding =>
+    isRecord(v) &&
+    Object.keys(v).length === 2 &&
+    Object.hasOwn(v, 'videoId') &&
+    Object.hasOwn(v, 'playbackEpoch') &&
+    isVideoId(v.videoId) &&
+    (v.playbackEpoch === null ||
+      (typeof v.playbackEpoch === 'string' &&
+        /^[0-9a-f]{32}:[0-9a-f]{32}$/.test(v.playbackEpoch)));
+  if (
+    own &&
+    deadline &&
+    (value.operation === 'lyrics' || value.operation === 'related') &&
+    keys.length === 3 &&
+    isRecord(value.target) &&
+    Object.keys(value.target).length === 1 &&
+    (isVideoId(value.target.videoId) || value.target.current === true)
+  )
+    return value as unknown as MusicReadInput;
+  if (
+    own &&
+    deadline &&
+    value.operation === 'metadata-current' &&
+    keys.length === 2
+  )
+    return {
+      operation: 'metadata-current',
+      deadlineAt: value.deadlineAt as number,
+    };
+  if (
+    own &&
+    deadline &&
+    value.operation === 'related-continuation' &&
+    keys.length === 4 &&
+    metadataBinding(value.binding) &&
+    safeText(value.token, MUSIC_LIMITS.recipeBytes) &&
+    utf8Bytes(value.token as string) <= MUSIC_LIMITS.recipeBytes
+  )
+    return value as unknown as MusicReadInput;
   if (
     (value.operation === 'home' || value.operation === 'library') &&
     keys.length === 1
@@ -105,8 +176,21 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
     };
   if (
     value.operation === 'browse' &&
-    keys.every((key) => ['operation', 'browseId', 'params'].includes(key)) &&
+    keys.every((key) =>
+      [
+        'operation',
+        'browseId',
+        'params',
+        'expectedCurrent',
+        'deadlineAt',
+      ].includes(key),
+    ) &&
     browseId(value.browseId) &&
+    (value.expectedCurrent === undefined
+      ? value.deadlineAt === undefined
+      : metadataBinding(value.expectedCurrent) &&
+        value.expectedCurrent.playbackEpoch !== null &&
+        deadline) &&
     (value.params === undefined ||
       (safeText(value.params, MUSIC_LIMITS.recipeBytes) &&
         utf8Bytes(value.params as string) <= MUSIC_LIMITS.recipeBytes))
@@ -114,12 +198,32 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
     return {
       operation: 'browse',
       browseId: value.browseId as string,
+      ...(value.expectedCurrent === undefined
+        ? {}
+        : {
+            expectedCurrent: value.expectedCurrent as MetadataBinding,
+            deadlineAt: value.deadlineAt as number,
+          }),
       ...(value.params === undefined ? {} : { params: value.params as string }),
     };
   if (
     value.operation === 'continuation' &&
-    keys.every((key) => ['operation', 'endpoint', 'token'].includes(key)) &&
+    keys.every((key) =>
+      [
+        'operation',
+        'endpoint',
+        'token',
+        'expectedCurrent',
+        'deadlineAt',
+      ].includes(key),
+    ) &&
     ['search', 'browse'].includes(value.endpoint as string) &&
+    (value.expectedCurrent === undefined
+      ? value.deadlineAt === undefined
+      : metadataBinding(value.expectedCurrent) &&
+        value.expectedCurrent.playbackEpoch !== null &&
+        value.endpoint === 'browse' &&
+        deadline) &&
     safeText(value.token, MUSIC_LIMITS.recipeBytes) &&
     utf8Bytes(value.token as string) <= MUSIC_LIMITS.recipeBytes
   )
@@ -127,6 +231,12 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
       operation: 'continuation',
       endpoint: value.endpoint as 'search' | 'browse',
       token: value.token as string,
+      ...(value.expectedCurrent === undefined
+        ? {}
+        : {
+            expectedCurrent: value.expectedCurrent as MetadataBinding,
+            deadlineAt: value.deadlineAt as number,
+          }),
     };
   return null;
 }
@@ -273,6 +383,7 @@ export function createMusicRendererController(
     // A retired physical job must not call native getters for a newer source.
     if (
       job.canceled ||
+      job.playbackRetired ||
       disposed ||
       sourceId !== job.sourceId ||
       !same(job.owner, owner)
@@ -283,6 +394,7 @@ export function createMusicRendererController(
     const captured = capture();
     if (
       job.canceled ||
+      job.playbackRetired ||
       disposed ||
       owner !== registeredOwner ||
       sourceId !== registeredSource
@@ -353,12 +465,139 @@ export function createMusicRendererController(
         Number.isFinite(volume) && volume >= 0 && volume <= 100 ? volume : null,
     };
   };
+  const probe = (job: Job): MetadataBinding => {
+    if (!valid(job)) throw new MusicServiceError('retired');
+    observePlayback();
+    const sampledEpoch = playbackEpoch;
+    const id = nativePlaybackIdentity(apiOwner);
+    if (!valid(job) || sampledEpoch !== playbackEpoch)
+      throw new MusicServiceError('retired');
+    if (!isVideoId(id)) throw new MusicServiceError('unavailable');
+    observePlayback();
+    if (!valid(job) || sampledEpoch !== playbackEpoch)
+      throw new MusicServiceError('retired');
+    return { videoId: id, playbackEpoch: `${documentId}:${sampledEpoch}` };
+  };
+  const metadataValid = (job: Job, deadlineAt: number) => {
+    if (!valid(job)) throw new MusicServiceError('retired');
+    if (Date.now() >= deadlineAt) throw new MusicServiceError('timeout');
+    if (job.currentBinding) {
+      const next = probe(job);
+      if (
+        next.videoId !== job.currentBinding.videoId ||
+        next.playbackEpoch !== job.currentBinding.playbackEpoch ||
+        !valid(job)
+      ) {
+        job.playbackRetired = true;
+        throw new MusicServiceError('retired');
+      }
+    }
+    if (!valid(job)) throw new MusicServiceError('retired');
+    if (Date.now() >= deadlineAt) throw new MusicServiceError('timeout');
+  };
+  const metadata = async (
+    job: Job,
+    input: Extract<
+      MusicReadInput,
+      {
+        operation:
+          | 'lyrics'
+          | 'related'
+          | 'metadata-current'
+          | 'related-continuation';
+      }
+    >,
+  ) => {
+    metadataValid(job, input.deadlineAt);
+    if (input.operation === 'metadata-current') {
+      const value = { version: 1 as const, binding: probe(job) };
+      metadataValid(job, input.deadlineAt);
+      return value;
+    }
+    const binding =
+      input.operation === 'related-continuation'
+        ? input.binding
+        : 'videoId' in input.target
+          ? { videoId: input.target.videoId, playbackEpoch: null }
+          : probe(job);
+    if (binding.playbackEpoch !== null) job.currentBinding = binding;
+    metadataValid(job, input.deadlineAt);
+    let raw: unknown;
+    if (input.operation === 'related-continuation') {
+      raw = await job.owner.fetch.call(job.owner.network, '/browse', {
+        continuation: input.token,
+      });
+    } else {
+      const next = await job.owner.fetch.call(job.owner.network, '/next', {
+        videoId: binding.videoId,
+        isAudioOnly: true,
+      });
+      metadataValid(job, input.deadlineAt);
+      const tabs = parseWatchNextTabs(next, binding.videoId),
+        id = tabs[input.operation];
+      metadataValid(job, input.deadlineAt);
+      if (id === null)
+        return input.operation === 'lyrics'
+          ? {
+              version: 1 as const,
+              binding,
+              lyrics: {
+                videoId: binding.videoId,
+                available: false,
+                lyrics: null,
+                source: null,
+              },
+            }
+          : {
+              version: 1 as const,
+              binding,
+              source: {
+                version: 1 as const,
+                items: [],
+                shelves: [],
+                continuation: null,
+                targetRecipes: [],
+              },
+            };
+      raw = await job.owner.fetch.call(job.owner.network, '/browse', {
+        browseId: id,
+      });
+    }
+    metadataValid(job, input.deadlineAt);
+    const value =
+      input.operation === 'lyrics'
+        ? {
+            version: 1 as const,
+            binding,
+            lyrics: { videoId: binding.videoId, ...parseLyrics(raw) },
+          }
+        : { version: 1 as const, binding, source: parseRelated(raw) };
+    metadataValid(job, input.deadlineAt);
+    return value;
+  };
   const process = async (job: Job) => {
     active.add(job);
     try {
       if (!valid(job)) throw new MusicServiceError('retired');
       const input = job.input!;
-      if (input.operation === 'current')
+      job.currentMetadata =
+        input.operation === 'metadata-current' ||
+        ((input.operation === 'lyrics' || input.operation === 'related') &&
+          'current' in input.target) ||
+        (input.operation === 'related-continuation' &&
+          input.binding.playbackEpoch !== null) ||
+        ((input.operation === 'browse' || input.operation === 'continuation') &&
+          !!input.expectedCurrent);
+      if (
+        input.operation === 'lyrics' ||
+        input.operation === 'related' ||
+        input.operation === 'metadata-current' ||
+        input.operation === 'related-continuation'
+      ) {
+        const value = await metadata(job, input);
+        metadataValid(job, input.deadlineAt);
+        settled(job, { ok: true, value });
+      } else if (input.operation === 'current')
         settled(job, { ok: true, value: snapshot(job) });
       else if (input.operation === 'queue') {
         queueOwner ??= createMusicQueueOwner(apiOwner, getApi, document);
@@ -366,6 +605,14 @@ export function createMusicRendererController(
         if (!valid(job)) throw new MusicServiceError('retired');
         settled(job, { ok: true, value });
       } else {
+        if (
+          (input.operation === 'browse' ||
+            input.operation === 'continuation') &&
+          input.expectedCurrent
+        ) {
+          job.currentBinding = input.expectedCurrent;
+          metadataValid(job, input.deadlineAt!);
+        }
         let endpoint: 'search' | 'browse', data: Record<string, string>;
         if (input.operation === 'search') {
           endpoint = 'search';
@@ -412,12 +659,24 @@ export function createMusicRendererController(
           data = { continuation: input.token };
         }
         if (!valid(job)) throw new MusicServiceError('retired');
+        if (
+          (input.operation === 'browse' ||
+            input.operation === 'continuation') &&
+          input.expectedCurrent
+        )
+          metadataValid(job, input.deadlineAt!);
         const raw = await job.owner.fetch.call(
           job.owner.network,
           `/${endpoint}`,
           data,
         );
         if (!valid(job)) throw new MusicServiceError('retired');
+        if (
+          (input.operation === 'browse' ||
+            input.operation === 'continuation') &&
+          input.expectedCurrent
+        )
+          metadataValid(job, input.deadlineAt!);
         const value = normalizeMusicSource(
           raw,
           input.operation === 'home' || input.operation === 'library'
@@ -425,6 +684,12 @@ export function createMusicRendererController(
             : endpoint,
         );
         if (!valid(job)) throw new MusicServiceError('retired');
+        if (
+          (input.operation === 'browse' ||
+            input.operation === 'continuation') &&
+          input.expectedCurrent
+        )
+          metadataValid(job, input.deadlineAt!);
         settled(job, { ok: true, value });
       }
     } catch (error) {
@@ -536,6 +801,8 @@ export function createMusicRendererController(
       }
   });
   const videoChanged = () => {
+    for (const job of active)
+      if (job.currentMetadata) job.playbackRetired = true;
     playbackEpoch = randomId();
     try {
       observedPlayback = rawCurrent();

@@ -8,6 +8,8 @@ import {
 import { parseMusicBearer, type MusicGrantRecord } from '../music-grants';
 import {
   parseMusicQueueQuery,
+  parseMusicLyricsQuery,
+  parseMusicRelatedQuery,
   parseMusicCollectionQuery,
 } from '../scheme/music';
 
@@ -243,8 +245,12 @@ export function registerMusicRoutes<E extends Env>(
         home = route === '/home',
         library = route === '/library/playlists',
         collection = home || library,
-        get = current || queue || collection;
-      if (rawTarget.includes('?') && !queue && !collection) return reject(400);
+        lyrics = route === '/song/lyrics',
+        related = route === '/song/related',
+        metadata = lyrics || related,
+        get = current || queue || collection || metadata;
+      if (rawTarget.includes('?') && !queue && !collection && !metadata)
+        return reject(400);
       if (!get && route !== '/search' && route !== '/browse')
         return reject(404, 'not_found');
       if (context.req.method !== (get ? 'GET' : 'POST')) return reject(405);
@@ -254,6 +260,7 @@ export function registerMusicRoutes<E extends Env>(
           Number(incoming.headers['content-length'] ?? '0') > 0)
       )
         return reject(400);
+      const deadlineAt = Date.now() + (current || queue ? 5000 : 15000);
       const controller = new AbortController();
       const socketLost = () => {
         if (!outgoing.writableFinished)
@@ -273,7 +280,7 @@ export function registerMusicRoutes<E extends Env>(
       ]);
       timer = setTimeout(
         () => controller.abort(new MusicServiceError('timeout')),
-        current || queue ? 5000 : 15000,
+        Math.max(0, deadlineAt - Date.now()),
       );
       timer.unref?.();
       const scope =
@@ -302,31 +309,41 @@ export function registerMusicRoutes<E extends Env>(
       const query = rawTarget.includes('?')
         ? rawTarget.slice(rawTarget.indexOf('?') + 1)
         : '';
-      if ((queue || collection) && /[%#\\]/.test(query)) return reject(400);
-      const input = current
-        ? undefined
-        : queue
-          ? parseMusicQueueQuery(new URLSearchParams(query))
-          : collection
-            ? parseMusicCollectionQuery(new URLSearchParams(query))
-            : await jsonBody(context.req.raw, incoming, signal);
+      if ((queue || collection || metadata) && /[%#\\]/.test(query))
+        return reject(400);
+      const input = lyrics
+        ? parseMusicLyricsQuery(new URLSearchParams(query))
+        : related
+          ? parseMusicRelatedQuery(new URLSearchParams(query))
+          : current
+            ? undefined
+            : queue
+              ? parseMusicQueueQuery(new URLSearchParams(query))
+              : collection
+                ? parseMusicCollectionQuery(new URLSearchParams(query))
+                : await jsonBody(context.req.raw, incoming, signal);
       if (!live()) return reject(409, 'retired');
       const result = await wait<
         | Awaited<ReturnType<MusicService['current']>>
         | Awaited<ReturnType<MusicService['search']>>
         | Awaited<ReturnType<MusicService['queue']>>
+        | Awaited<ReturnType<MusicService['lyrics']>>
       >(
-        current
-          ? service.current(token, signal)
-          : queue
-            ? service.queue(token, input, signal)
-            : home
-              ? service.home(token, input, signal)
-              : library
-                ? service.library(token, input, signal)
-                : route === '/search'
-                  ? service.search(token, input, signal)
-                  : service.browse(token, input, signal),
+        lyrics
+          ? service.lyrics(token, input, signal, deadlineAt)
+          : related
+            ? service.related(token, input, signal, deadlineAt)
+            : current
+              ? service.current(token, signal)
+              : queue
+                ? service.queue(token, input, signal)
+                : home
+                  ? service.home(token, input, signal)
+                  : library
+                    ? service.library(token, input, signal)
+                    : route === '/search'
+                      ? service.search(token, input, signal)
+                      : service.browse(token, input, signal),
         signal,
       );
       if (!live()) return reject(409, 'retired');

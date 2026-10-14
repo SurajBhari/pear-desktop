@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { assertMetadataWorkBudget } from '@/providers/music-metadata';
 import { isPlaylistId, isVideoId } from '@/providers/queue-playlist';
 
 import { MUSIC_LIMITS, failMusic, utf8Bytes } from '../../music-types';
@@ -250,3 +251,133 @@ export function parseNativeQueue(value: unknown) {
     return failMusic('source');
   return parsed.data;
 }
+
+const metadataSelector = z.union([
+  z.object({ videoId: z.string().refine(isVideoId) }).strict(),
+  z.object({ current: z.literal(true) }).strict(),
+]);
+const relatedSelector = z.union([
+  z.object({ videoId: z.string().refine(isVideoId), limit }).strict(),
+  z.object({ current: z.literal(true), limit }).strict(),
+  cursorSchema,
+]);
+export function parseMusicLyricsInput(value: unknown) {
+  try {
+    assertMetadataWorkBudget(value);
+  } catch {
+    return failMusic('invalid');
+  }
+  const parsed = metadataSelector.safeParse(value);
+  if (!parsed.success) return failMusic('invalid');
+  return parsed.data;
+}
+export function parseMusicRelatedInput(value: unknown) {
+  try {
+    assertMetadataWorkBudget(value);
+  } catch {
+    return failMusic('invalid');
+  }
+  const parsed = relatedSelector.safeParse(value);
+  if (!parsed.success) return failMusic('invalid');
+  return parsed.data;
+}
+function metadataQuery(query: URLSearchParams, related: boolean) {
+  const value: Record<string, unknown> = {};
+  for (const [key, field] of query) {
+    if (
+      !['videoId', 'current', ...(related ? ['limit', 'cursor'] : [])].includes(
+        key,
+      ) ||
+      Object.hasOwn(value, key)
+    )
+      return failMusic('invalid');
+    if (key === 'current') {
+      if (field !== 'true') return failMusic('invalid');
+      value.current = true;
+    } else if (key === 'limit') {
+      if (!/^[1-9][0-9]{0,2}$/.test(field)) return failMusic('invalid');
+      value.limit = Number(field);
+    } else value[key] = field;
+  }
+  return value;
+}
+export const parseMusicLyricsQuery = (query: URLSearchParams) =>
+  parseMusicLyricsInput(metadataQuery(query, false));
+export const parseMusicRelatedQuery = (query: URLSearchParams) =>
+  parseMusicRelatedInput(metadataQuery(query, true));
+const metadataBinding = z
+  .object({
+    videoId: z.string().refine(isVideoId),
+    playbackEpoch: z
+      .string()
+      .regex(/^[0-9a-f]{32}:[0-9a-f]{32}$/)
+      .nullable(),
+  })
+  .strict();
+const lyricText = (bytes: number, chars?: number) =>
+  z
+    .string()
+    .refine(
+      (v) =>
+        utf8Bytes(v) <= bytes &&
+        (chars === undefined || Array.from(v).length <= chars) &&
+        Array.from(v).every(
+          (c) =>
+            c.length !== 1 ||
+            c.charCodeAt(0) < 0xd800 ||
+            c.charCodeAt(0) > 0xdfff,
+        ),
+    );
+const lyricsSchema = z
+  .object({
+    videoId: z.string().refine(isVideoId),
+    available: z.boolean(),
+    lyrics: lyricText(65536).nullable(),
+    source: lyricText(2048, 512).nullable(),
+  })
+  .strict()
+  .refine((v) =>
+    v.available
+      ? v.lyrics !== null && v.lyrics.length > 0
+      : v.lyrics === null && v.source === null,
+  );
+const lyricsMetadataSchema = z
+  .object({
+    version: z.literal(1),
+    binding: metadataBinding,
+    lyrics: lyricsSchema,
+  })
+  .strict()
+  .refine((v) => v.lyrics.videoId === v.binding.videoId);
+const relatedMetadataSchema = z
+  .object({
+    version: z.literal(1),
+    binding: metadataBinding,
+    source: catalogSchema,
+  })
+  .strict();
+const probeSchema = z
+  .object({
+    version: z.literal(1),
+    binding: metadataBinding.refine((v) => v.playbackEpoch !== null),
+  })
+  .strict();
+function nativeMetadata<T>(schema: z.ZodType<T>, value: unknown): T {
+  assertMetadataWorkBudget(value);
+  const parsed = schema.safeParse(value);
+  if (
+    !parsed.success ||
+    utf8Bytes(JSON.stringify(parsed.data)) > MUSIC_LIMITS.nativeBytes
+  )
+    return failMusic('source');
+  return parsed.data;
+}
+export const parseNativeLyricsMetadata = (value: unknown) =>
+  nativeMetadata(lyricsMetadataSchema, value);
+export const parseNativeRelatedMetadata = (value: unknown) => {
+  const result = nativeMetadata(relatedMetadataSchema, value);
+  parseNativeCatalog(result.source, 'browse');
+  return result;
+};
+export const parseNativeMetadataProbe = (value: unknown) =>
+  nativeMetadata(probeSchema, value);
