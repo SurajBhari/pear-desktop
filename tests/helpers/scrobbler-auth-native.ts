@@ -37,7 +37,7 @@ export async function scrobblerAuthNative() {
     createHash('sha256')
       .update(await readFile(observer))
       .digest('hex') !==
-    'd4cedd12f3ba30afe05b597e1e35237c6dc9f4454ae18f6a3aecf21a3e9fe81c'
+    '5a1380e12e81c0be4d111115a150cb3aab1aa8300010b225a8de1a2769e5bdfe'
   )
     throw Error('Unexpected native PID observer');
   const production = path.join(
