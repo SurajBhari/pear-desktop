@@ -23,6 +23,10 @@ if (process.type !== 'browser' || !factsPath) {
 app.setAsDefaultProtocolClient = () => true;
 app.removeAsDefaultProtocolClient = () => true;
 
+// Startup also applies login preferences. Keep that OS setter isolated before
+// entry, preserving its void contract without changing the host's login items.
+app.setLoginItemSettings = () => {};
+
 let published = false;
 let visibilityPoll;
 
