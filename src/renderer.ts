@@ -27,6 +27,7 @@ import {
   loadAllRendererPlugins,
 } from './loader/renderer';
 import { startingPages } from './providers/extracted-data';
+import { publishMusicActionsOwner } from './providers/music-actions';
 import { createPlaylistQueueController } from './providers/queue-playlist-renderer';
 import { createRepeatPreference } from './providers/repeat-preference';
 import { setupShareLinks } from './providers/share-links';
@@ -55,6 +56,7 @@ window.addEventListener(
 let api: (Element & MusicPlayer) | null = null;
 let repeatPreference: ReturnType<typeof createRepeatPreference> | undefined;
 let playlistQueue: ReturnType<typeof createPlaylistQueueController> | undefined;
+let disposeMusicActionsOwner: (() => void) | undefined;
 let isPluginLoaded = false;
 let isApiLoaded = false;
 let firstDataLoaded = false;
@@ -101,10 +103,18 @@ async function callOnPlayerApiReady(
 }
 
 async function onApiLoaded() {
+  disposeMusicActionsOwner?.();
+  disposeMusicActionsOwner = undefined;
   playlistQueue?.dispose();
   playlistQueue = createPlaylistQueueController(api, () => api);
   repeatPreference?.dispose();
   repeatPreference = createRepeatPreference();
+  if (api?.isConnected)
+    disposeMusicActionsOwner = publishMusicActionsOwner(api, {
+      repeatPreference,
+      playlistQueue,
+      getApi: () => api,
+    });
   // Workaround for macOS traffic lights
   {
     let osType = 'Unknown';

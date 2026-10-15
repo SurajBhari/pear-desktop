@@ -13,6 +13,18 @@ export async function forceShuffleNative<T>(
 ): Promise<T> {
   const directory = await mkdtemp(path.join(tmpdir(), 'pear-force-native-'));
   let child: ReturnType<typeof spawn> | undefined;
+  let taskFailed = false;
+  let taskFailure: unknown;
+  const witness = (
+    kind: string,
+    fields: Record<string, boolean | string | null>,
+  ) => {
+    try {
+      process.stdout.write(kind + ' ' + JSON.stringify(fields) + '\n');
+    } catch {
+      // Diagnostic output must never replace a task or cleanup outcome.
+    }
+  };
   const kill = () => {
     if (!child?.pid) return;
     try {
@@ -86,9 +98,87 @@ app.commandLine.appendSwitch('disable-background-networking');
       .split('\n')
       .find((line) => line.startsWith('FORCE_SHUFFLE_NATIVE '));
     if (!line) throw new Error(`Native shuffle result missing: ${stdout}`);
-    return JSON.parse(line.slice('FORCE_SHUFFLE_NATIVE '.length)) as T;
+    const result = JSON.parse(line.slice('FORCE_SHUFFLE_NATIVE '.length)) as T;
+    const value = result as {
+      oldValues?: unknown;
+      calls?: unknown;
+      on?: unknown;
+    } | null;
+    const oldValuesMatch =
+      Array.isArray(value?.oldValues) &&
+      value.oldValues.length === 2 &&
+      value.oldValues[0] === null &&
+      value.oldValues[1] === '';
+    const callsOne = value?.calls === 1;
+    const onTrue = value?.on === true;
+    witness('FORCE_SHUFFLE_OWNED_TASK', {
+      taskCompleted: true,
+      historicalShapeMatches:
+        value !== null &&
+        typeof value === 'object' &&
+        Object.keys(value).sort().join(',') === 'calls,oldValues,on' &&
+        oldValuesMatch &&
+        callsOne &&
+        onTrue,
+      oldValuesMatch,
+      callsOne,
+      onTrue,
+    });
+    return result;
+  } catch (error) {
+    taskFailed = true;
+    taskFailure = error;
+    witness('FORCE_SHUFFLE_OWNED_TASK', {
+      taskCompleted: false,
+      historicalShapeMatches: false,
+      oldValuesMatch: false,
+      callsOne: false,
+      onTrue: false,
+    });
+    throw error;
   } finally {
-    kill();
-    await rm(directory, { recursive: true, force: true });
+    let killAttempted = false,
+      killReturnedWithoutError = false,
+      rmAttempted = false,
+      rmSucceeded = false;
+    let code: string | null = null;
+    try {
+      killAttempted = !!child?.pid;
+      kill();
+      killReturnedWithoutError = true;
+      rmAttempted = true;
+      await rm(directory, { recursive: true, force: true });
+      rmSucceeded = true;
+    } catch (error) {
+      const rawCode = (error as NodeJS.ErrnoException | null)?.code;
+      code =
+        rawCode == null
+          ? null
+          : [
+                'EBUSY',
+                'ENOTEMPTY',
+                'EPERM',
+                'EACCES',
+                'ENOENT',
+                'ESRCH',
+              ].includes(rawCode)
+            ? rawCode
+            : 'other';
+      if (taskFailed) {
+        throw new AggregateError(
+          [taskFailure, error],
+          'Native Force Shuffle task and cleanup both failed',
+        );
+      }
+      throw error;
+    } finally {
+      witness('FORCE_SHUFFLE_OWNED_CLEANUP', {
+        killAttempted,
+        killReturnedWithoutError,
+        rmAttempted,
+        rmSucceeded,
+        code,
+      });
+    }
   }
 }

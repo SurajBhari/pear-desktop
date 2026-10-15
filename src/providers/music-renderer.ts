@@ -6,9 +6,28 @@ import {
   type NativeMusicResult,
   type PlaybackSnapshot,
   type MusicFailure,
+  type MetadataBinding,
+  type NativeNavigationValue,
 } from '@/plugins/api-server/music-types';
 
+import {
+  dispatchMusicControl,
+  parseControlCommand,
+  parseQueueCommand,
+  startMusicQueueAction,
+} from './music-actions';
 import { normalizeMusicSource } from './music-catalog';
+import {
+  assertMetadataWorkBudget,
+  parseWatchNextTabs,
+  parseLyrics,
+  parseRelated,
+} from './music-metadata';
+import {
+  directNavigation,
+  parseNavigationCommand,
+  projectNavigationRecipe,
+} from './music-navigation';
 import { createMusicQueueOwner } from './music-queue';
 import {
   nativeElapsedMilliseconds,
@@ -41,6 +60,13 @@ type Job = {
   owner: Owner;
   input?: MusicReadInput;
   canceled: boolean;
+  currentBinding?: MetadataBinding;
+  playbackRetired?: boolean;
+  currentMetadata?: boolean;
+  navigationEntered?: boolean;
+  controlEntered?: boolean;
+  queueEntered?: boolean;
+  queueCancel?: () => void;
 };
 const randomId = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
@@ -71,7 +97,114 @@ const browseId = (value: unknown) =>
     categories.includes(value));
 export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
   if (!isRecord(value)) return null;
+  if (
+    ['lyrics', 'related', 'metadata-current', 'related-continuation'].includes(
+      Object.getOwnPropertyDescriptor(value, 'operation')?.value as string,
+    ) ||
+    Object.hasOwn(value, 'expectedCurrent')
+  ) {
+    try {
+      assertMetadataWorkBudget(value);
+    } catch {
+      return null;
+    }
+  }
   const keys = Object.keys(value);
+  const own = keys.every((key) => {
+    const d = Object.getOwnPropertyDescriptor(value, key);
+    return !!d && 'value' in d;
+  });
+  const deadlineValue = Object.getOwnPropertyDescriptor(value, 'deadlineAt')
+    ?.value as unknown;
+  const deadline =
+    typeof deadlineValue === 'number' &&
+    Number.isFinite(deadlineValue) &&
+    deadlineValue > 0;
+  if (
+    Object.getOwnPropertyDescriptor(value, 'operation')?.value === 'control'
+  ) {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (
+      !own ||
+      (prototype !== Object.prototype && prototype !== null) ||
+      Reflect.ownKeys(value).length !== 3 ||
+      keys.length !== 3 ||
+      !keys.every((key) =>
+        ['operation', 'command', 'deadlineAt'].includes(key),
+      ) ||
+      !deadline
+    )
+      return null;
+    const command = parseControlCommand(value.command);
+    return command
+      ? { operation: 'control', command, deadlineAt: deadlineValue }
+      : null;
+  }
+  if (
+    Object.getOwnPropertyDescriptor(value, 'operation')?.value ===
+    'mutate-queue'
+  ) {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (
+      !own ||
+      (prototype !== Object.prototype && prototype !== null) ||
+      Reflect.ownKeys(value).length !== 3 ||
+      !keys.every((key) =>
+        ['operation', 'command', 'deadlineAt'].includes(key),
+      ) ||
+      !deadline
+    )
+      return null;
+    const command = parseQueueCommand(value.command);
+    return command
+      ? { operation: 'mutate-queue', command, deadlineAt: deadlineValue }
+      : null;
+  }
+  if (own && value.operation === 'navigate' && keys.length === 3 && deadline) {
+    const command = parseNavigationCommand(value.command);
+    if (command)
+      return { operation: 'navigate', command, deadlineAt: deadlineValue };
+    return null;
+  }
+  const metadataBinding = (v: unknown): v is MetadataBinding =>
+    isRecord(v) &&
+    Object.keys(v).length === 2 &&
+    Object.hasOwn(v, 'videoId') &&
+    Object.hasOwn(v, 'playbackEpoch') &&
+    isVideoId(v.videoId) &&
+    (v.playbackEpoch === null ||
+      (typeof v.playbackEpoch === 'string' &&
+        /^[0-9a-f]{32}:[0-9a-f]{32}$/.test(v.playbackEpoch)));
+  if (
+    own &&
+    deadline &&
+    (value.operation === 'lyrics' || value.operation === 'related') &&
+    keys.length === 3 &&
+    isRecord(value.target) &&
+    Object.keys(value.target).length === 1 &&
+    (isVideoId(value.target.videoId) || value.target.current === true)
+  )
+    return value as unknown as MusicReadInput;
+  if (
+    own &&
+    deadline &&
+    value.operation === 'metadata-current' &&
+    keys.length === 2
+  )
+    return {
+      operation: 'metadata-current',
+      deadlineAt: value.deadlineAt as number,
+    };
+  if (
+    own &&
+    deadline &&
+    value.operation === 'related-continuation' &&
+    keys.length === 4 &&
+    metadataBinding(value.binding) &&
+    safeText(value.token, MUSIC_LIMITS.recipeBytes) &&
+    utf8Bytes(value.token as string) <= MUSIC_LIMITS.recipeBytes
+  )
+    return value as unknown as MusicReadInput;
   if (
     (value.operation === 'home' || value.operation === 'library') &&
     keys.length === 1
@@ -105,8 +238,21 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
     };
   if (
     value.operation === 'browse' &&
-    keys.every((key) => ['operation', 'browseId', 'params'].includes(key)) &&
+    keys.every((key) =>
+      [
+        'operation',
+        'browseId',
+        'params',
+        'expectedCurrent',
+        'deadlineAt',
+      ].includes(key),
+    ) &&
     browseId(value.browseId) &&
+    (value.expectedCurrent === undefined
+      ? value.deadlineAt === undefined
+      : metadataBinding(value.expectedCurrent) &&
+        value.expectedCurrent.playbackEpoch !== null &&
+        deadline) &&
     (value.params === undefined ||
       (safeText(value.params, MUSIC_LIMITS.recipeBytes) &&
         utf8Bytes(value.params as string) <= MUSIC_LIMITS.recipeBytes))
@@ -114,12 +260,32 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
     return {
       operation: 'browse',
       browseId: value.browseId as string,
+      ...(value.expectedCurrent === undefined
+        ? {}
+        : {
+            expectedCurrent: value.expectedCurrent as MetadataBinding,
+            deadlineAt: value.deadlineAt as number,
+          }),
       ...(value.params === undefined ? {} : { params: value.params as string }),
     };
   if (
     value.operation === 'continuation' &&
-    keys.every((key) => ['operation', 'endpoint', 'token'].includes(key)) &&
+    keys.every((key) =>
+      [
+        'operation',
+        'endpoint',
+        'token',
+        'expectedCurrent',
+        'deadlineAt',
+      ].includes(key),
+    ) &&
     ['search', 'browse'].includes(value.endpoint as string) &&
+    (value.expectedCurrent === undefined
+      ? value.deadlineAt === undefined
+      : metadataBinding(value.expectedCurrent) &&
+        value.expectedCurrent.playbackEpoch !== null &&
+        value.endpoint === 'browse' &&
+        deadline) &&
     safeText(value.token, MUSIC_LIMITS.recipeBytes) &&
     utf8Bytes(value.token as string) <= MUSIC_LIMITS.recipeBytes
   )
@@ -127,6 +293,12 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
       operation: 'continuation',
       endpoint: value.endpoint as 'search' | 'browse',
       token: value.token as string,
+      ...(value.expectedCurrent === undefined
+        ? {}
+        : {
+            expectedCurrent: value.expectedCurrent as MetadataBinding,
+            deadlineAt: value.deadlineAt as number,
+          }),
     };
   return null;
 }
@@ -246,10 +418,16 @@ export function createMusicRendererController(
     sourceId = nextSource;
     owner = nextOwner;
     for (const job of active)
-      if (job.sourceId === expectedSource) job.canceled = true;
+      if (job.sourceId === expectedSource) {
+        job.canceled = true;
+        job.queueCancel?.();
+      }
     const retiredQueue = queued.splice(0);
     handshakes.clear();
-    for (const job of retiredQueue) job.canceled = true;
+    for (const job of retiredQueue) {
+      job.canceled = true;
+      job.queueCancel?.();
+    }
     send({ type: 'retire', documentId, sourceId: expectedSource });
     for (const job of retiredQueue)
       settled(job, { ok: false, reason: 'retired' });
@@ -273,6 +451,7 @@ export function createMusicRendererController(
     // A retired physical job must not call native getters for a newer source.
     if (
       job.canceled ||
+      job.playbackRetired ||
       disposed ||
       sourceId !== job.sourceId ||
       !same(job.owner, owner)
@@ -283,6 +462,7 @@ export function createMusicRendererController(
     const captured = capture();
     if (
       job.canceled ||
+      job.playbackRetired ||
       disposed ||
       owner !== registeredOwner ||
       sourceId !== registeredSource
@@ -353,12 +533,270 @@ export function createMusicRendererController(
         Number.isFinite(volume) && volume >= 0 && volume <= 100 ? volume : null,
     };
   };
+  const probe = (job: Job): MetadataBinding => {
+    if (!valid(job)) throw new MusicServiceError('retired');
+    observePlayback();
+    const sampledEpoch = playbackEpoch;
+    const id = nativePlaybackIdentity(apiOwner);
+    if (!valid(job) || sampledEpoch !== playbackEpoch)
+      throw new MusicServiceError('retired');
+    if (!isVideoId(id)) throw new MusicServiceError('unavailable');
+    observePlayback();
+    if (!valid(job) || sampledEpoch !== playbackEpoch)
+      throw new MusicServiceError('retired');
+    return { videoId: id, playbackEpoch: `${documentId}:${sampledEpoch}` };
+  };
+  const metadataValid = (job: Job, deadlineAt: number) => {
+    if (!valid(job)) throw new MusicServiceError('retired');
+    if (Date.now() >= deadlineAt) throw new MusicServiceError('timeout');
+    if (job.currentBinding) {
+      const next = probe(job);
+      if (
+        next.videoId !== job.currentBinding.videoId ||
+        next.playbackEpoch !== job.currentBinding.playbackEpoch ||
+        !valid(job)
+      ) {
+        job.playbackRetired = true;
+        throw new MusicServiceError('retired');
+      }
+    }
+    if (!valid(job)) throw new MusicServiceError('retired');
+    if (Date.now() >= deadlineAt) throw new MusicServiceError('timeout');
+  };
+  const metadata = async (
+    job: Job,
+    input: Extract<
+      MusicReadInput,
+      {
+        operation:
+          | 'lyrics'
+          | 'related'
+          | 'metadata-current'
+          | 'related-continuation';
+      }
+    >,
+  ) => {
+    metadataValid(job, input.deadlineAt);
+    if (input.operation === 'metadata-current') {
+      const value = { version: 1 as const, binding: probe(job) };
+      metadataValid(job, input.deadlineAt);
+      return value;
+    }
+    const binding =
+      input.operation === 'related-continuation'
+        ? input.binding
+        : 'videoId' in input.target
+          ? { videoId: input.target.videoId, playbackEpoch: null }
+          : probe(job);
+    if (binding.playbackEpoch !== null) job.currentBinding = binding;
+    metadataValid(job, input.deadlineAt);
+    let raw: unknown;
+    if (input.operation === 'related-continuation') {
+      raw = await job.owner.fetch.call(job.owner.network, '/browse', {
+        continuation: input.token,
+      });
+    } else {
+      const next = await job.owner.fetch.call(job.owner.network, '/next', {
+        videoId: binding.videoId,
+        isAudioOnly: true,
+      });
+      metadataValid(job, input.deadlineAt);
+      const tabs = parseWatchNextTabs(next, binding.videoId),
+        id = tabs[input.operation];
+      metadataValid(job, input.deadlineAt);
+      if (id === null)
+        return input.operation === 'lyrics'
+          ? {
+              version: 1 as const,
+              binding,
+              lyrics: {
+                videoId: binding.videoId,
+                available: false,
+                lyrics: null,
+                source: null,
+              },
+            }
+          : {
+              version: 1 as const,
+              binding,
+              source: {
+                version: 1 as const,
+                items: [],
+                shelves: [],
+                continuation: null,
+                targetRecipes: [],
+              },
+            };
+      raw = await job.owner.fetch.call(job.owner.network, '/browse', {
+        browseId: id,
+      });
+    }
+    metadataValid(job, input.deadlineAt);
+    const value =
+      input.operation === 'lyrics'
+        ? {
+            version: 1 as const,
+            binding,
+            lyrics: { videoId: binding.videoId, ...parseLyrics(raw) },
+          }
+        : { version: 1 as const, binding, source: parseRelated(raw) };
+    metadataValid(job, input.deadlineAt);
+    return value;
+  };
+  const navigate = async (
+    job: Job,
+    input: Extract<MusicReadInput, { operation: 'navigate' }>,
+  ): Promise<NativeNavigationValue> => {
+    metadataValid(job, input.deadlineAt);
+    let command = input.command;
+    if (command.action === 'radio' && command.seed.kind === 'current') {
+      job.currentBinding = probe(job);
+      command = {
+        action: 'radio',
+        seed: { kind: 'video', videoId: job.currentBinding.videoId },
+      };
+    }
+    metadataValid(job, input.deadlineAt);
+    let endpoint = directNavigation(command);
+    if (!endpoint) {
+      const seedVideo =
+        command.action === 'radio' && command.seed.kind === 'video'
+          ? command.seed.videoId
+          : undefined;
+      const video = seedVideo !== undefined;
+      const data = video
+        ? { videoId: seedVideo, isAudioOnly: true }
+        : {
+            browseId:
+              'VL' +
+              (command.action === 'play_playlist'
+                ? command.playlistId
+                : command.action === 'radio' && command.seed.kind === 'playlist'
+                  ? command.seed.playlistId
+                  : ''),
+          };
+      const raw = await Reflect.apply(job.owner.fetch, job.owner.network, [
+        video ? '/next' : '/browse',
+        data,
+      ]);
+      metadataValid(job, input.deadlineAt);
+      endpoint = projectNavigationRecipe(raw, command);
+    }
+    metadataValid(job, input.deadlineAt);
+    const app = job.owner.app,
+      dispatchLink = binding(app, 'dispatchEvent'),
+      // oxlint-disable-next-line typescript/unbound-method -- Captured once, invoked below with the exact owned app receiver.
+      dispatch = app.dispatchEvent,
+      EventClass = app.ownerDocument.defaultView?.CustomEvent;
+    if (typeof dispatch !== 'function' || !EventClass)
+      throw new MusicServiceError('unavailable');
+    const event = new EventClass('yt-navigate', {
+      detail: { endpoint },
+      bubbles: true,
+      composed: true,
+    });
+    metadataValid(job, input.deadlineAt);
+    if (!bindingCurrent(dispatchLink, 'dispatchEvent'))
+      throw new MusicServiceError('retired');
+    // Entering dispatch may itself change playback. No post-effect playback fence.
+    job.navigationEntered = true;
+    Reflect.apply(dispatch, app, [event]);
+    return {
+      version: 1,
+      phase: 'owned_dispatch',
+      ...(job.currentBinding ? { binding: job.currentBinding } : {}),
+    };
+  };
   const process = async (job: Job) => {
     active.add(job);
     try {
       if (!valid(job)) throw new MusicServiceError('retired');
       const input = job.input!;
-      if (input.operation === 'current')
+      job.currentMetadata =
+        (input.operation === 'navigate' &&
+          input.command.action === 'radio' &&
+          input.command.seed.kind === 'current') ||
+        input.operation === 'metadata-current' ||
+        ((input.operation === 'lyrics' || input.operation === 'related') &&
+          'current' in input.target) ||
+        (input.operation === 'related-continuation' &&
+          input.binding.playbackEpoch !== null) ||
+        ((input.operation === 'browse' || input.operation === 'continuation') &&
+          !!input.expectedCurrent);
+      if (input.operation === 'mutate-queue') {
+        const current = () =>
+          !disposed &&
+          !job.canceled &&
+          sourceId === job.sourceId &&
+          same(job.owner, owner) &&
+          Date.now() < input.deadlineAt;
+        queueOwner ??= createMusicQueueOwner(apiOwner, getApi, document);
+        const handle = startMusicQueueAction(
+          apiOwner,
+          input.command,
+          queueOwner,
+          {
+            current,
+            valid: () => current() && valid(job),
+            enter: () => {
+              job.queueEntered = true;
+            },
+          },
+        );
+        job.queueCancel = handle.cancel;
+        let reply: NativeMusicResult;
+        try {
+          reply = { ok: true, value: await handle.result };
+        } catch {
+          reply = { ok: false, reason: 'source' };
+        }
+        // The sole authenticated settled packet is a physical witness, not the logical result.
+        await handle.physicalSettled;
+        job.queueCancel = undefined;
+        settled(job, reply);
+      } else if (input.operation === 'control') {
+        let controlEpoch: string | null | undefined;
+        // Scalar-only fence after native getter callouts: no DOM/API probing.
+        const current = () => {
+          if (Date.now() >= input.deadlineAt)
+            throw new MusicServiceError('timeout');
+          return (
+            !disposed &&
+            !job.canceled &&
+            !job.playbackRetired &&
+            sourceId === job.sourceId &&
+            same(job.owner, owner) &&
+            (controlEpoch === undefined ||
+              controlEpoch === `${documentId}:${playbackEpoch}`)
+          );
+        };
+        const value = dispatchMusicControl(apiOwner, input.command, {
+          valid: () => current() && valid(job),
+          current,
+          probe: () => {
+            const binding = probe(job);
+            if (controlEpoch === undefined)
+              controlEpoch = binding.playbackEpoch;
+            return binding;
+          },
+          enter: () => {
+            job.controlEntered = true;
+          },
+        });
+        settled(job, { ok: true, value });
+      } else if (input.operation === 'navigate') {
+        const value = await navigate(job, input);
+        settled(job, { ok: true, value });
+      } else if (
+        input.operation === 'lyrics' ||
+        input.operation === 'related' ||
+        input.operation === 'metadata-current' ||
+        input.operation === 'related-continuation'
+      ) {
+        const value = await metadata(job, input);
+        metadataValid(job, input.deadlineAt);
+        settled(job, { ok: true, value });
+      } else if (input.operation === 'current')
         settled(job, { ok: true, value: snapshot(job) });
       else if (input.operation === 'queue') {
         queueOwner ??= createMusicQueueOwner(apiOwner, getApi, document);
@@ -366,6 +804,14 @@ export function createMusicRendererController(
         if (!valid(job)) throw new MusicServiceError('retired');
         settled(job, { ok: true, value });
       } else {
+        if (
+          (input.operation === 'browse' ||
+            input.operation === 'continuation') &&
+          input.expectedCurrent
+        ) {
+          job.currentBinding = input.expectedCurrent;
+          metadataValid(job, input.deadlineAt!);
+        }
         let endpoint: 'search' | 'browse', data: Record<string, string>;
         if (input.operation === 'search') {
           endpoint = 'search';
@@ -412,12 +858,24 @@ export function createMusicRendererController(
           data = { continuation: input.token };
         }
         if (!valid(job)) throw new MusicServiceError('retired');
+        if (
+          (input.operation === 'browse' ||
+            input.operation === 'continuation') &&
+          input.expectedCurrent
+        )
+          metadataValid(job, input.deadlineAt!);
         const raw = await job.owner.fetch.call(
           job.owner.network,
           `/${endpoint}`,
           data,
         );
         if (!valid(job)) throw new MusicServiceError('retired');
+        if (
+          (input.operation === 'browse' ||
+            input.operation === 'continuation') &&
+          input.expectedCurrent
+        )
+          metadataValid(job, input.deadlineAt!);
         const value = normalizeMusicSource(
           raw,
           input.operation === 'home' || input.operation === 'library'
@@ -425,6 +883,12 @@ export function createMusicRendererController(
             : endpoint,
         );
         if (!valid(job)) throw new MusicServiceError('retired');
+        if (
+          (input.operation === 'browse' ||
+            input.operation === 'continuation') &&
+          input.expectedCurrent
+        )
+          metadataValid(job, input.deadlineAt!);
         settled(job, { ok: true, value });
       }
     } catch (error) {
@@ -433,7 +897,17 @@ export function createMusicRendererController(
         : error instanceof MusicServiceError
           ? error.code
           : 'source';
-      settled(job, { ok: false, reason });
+      settled(
+        job,
+        (job.input?.operation === 'navigate' && !job.navigationEntered) ||
+          (job.input?.operation === 'control' && !job.controlEntered) ||
+          (job.input?.operation === 'mutate-queue' && !job.queueEntered)
+          ? {
+              ok: true,
+              value: { version: 1, phase: 'pre_effect_denial', reason },
+            }
+          : { ok: false, reason },
+      );
     } finally {
       active.delete(job);
       pump();
@@ -528,6 +1002,7 @@ export function createMusicRendererController(
         job.sourceId === packet.sourceId
       ) {
         job.canceled = true;
+        job.queueCancel?.();
         const index = queued.indexOf(job);
         if (index >= 0) {
           queued.splice(index, 1);
@@ -536,6 +1011,8 @@ export function createMusicRendererController(
       }
   });
   const videoChanged = () => {
+    for (const job of active)
+      if (job.currentMetadata) job.playbackRetired = true;
     playbackEpoch = randomId();
     try {
       observedPlayback = rawCurrent();

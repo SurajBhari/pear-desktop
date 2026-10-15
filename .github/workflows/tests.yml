@@ -40,11 +40,13 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y xvfb
       - run: pnpm build
+      - name: CI test grouping contracts
+        run: node --test scripts/ci-test-groups.node.cjs
       - name: Run Linux tests in a virtual display
         if: runner.os == 'Linux'
-        run: xvfb-run -a pnpm test
+        run: xvfb-run -a node scripts/run-ci-tests.cjs
       - name: Run macOS and Windows tests
         if: runner.os != 'Linux'
-        run: pnpm test
+        run: node scripts/run-ci-tests.cjs
       - name: Release staging tests
         run: node --test scripts/verify-release.test.cjs

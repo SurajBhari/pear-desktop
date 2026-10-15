@@ -78,6 +78,14 @@ async function fixture(plugins: Record<string, any>) {
   )
     .replace(/^import[\s\S]*?;\n/gm, '')
     .replace(/^export /gm, '');
+  const actionsProvider = stripTypeScriptTypes(
+    await readFile(
+      new URL('../src/providers/music-actions.ts', import.meta.url),
+      'utf8',
+    ),
+  )
+    .replace(/^import[\s\S]*?;\n/gm, '')
+    .replace(/^export /gm, '');
   const shareProvider = (await readFile(new URL('../src/utils/share-url.ts', import.meta.url), 'utf8')) + '\n' + (await readFile(new URL('../src/providers/share-links.ts', import.meta.url), 'utf8')).replace(/^import[^;]+;\n/gm, '');
   const shareSource = stripTypeScriptTypes(shareProvider).replace(/^export /gm, '');
   const boundaries = `
@@ -97,7 +105,7 @@ const forceUnloadRendererPlugin=async()=>{};
 class AudioContext {destination={};addEventListener(){}removeEventListener(){}createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(){return {connect(){},disconnect(){}}}}
 `;
   const source = await import(
-    `data:text/javascript;base64,${Buffer.from(boundaries + shareSource + repeatProvider + (await playlistProviderSource()) + actual).toString('base64')}`
+    `data:text/javascript;base64,${Buffer.from(boundaries + actionsProvider + shareSource + repeatProvider + (await playlistProviderSource()) + actual).toString('base64')}`
   );
   return {
     ...state,

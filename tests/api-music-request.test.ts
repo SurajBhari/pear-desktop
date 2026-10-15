@@ -398,3 +398,321 @@ test('read-phase abort preserves physical tombstone and binds cancellation to ex
     f.broker.dispose();
   }
 });
+
+// N1: physical settlement is independent from logical caller completion.
+test('N1 authenticated late ACK consumes settlement callback exactly once after physical cleanup', async () => {
+  const f = await musicRequestFixture();
+  const controller = new AbortController();
+  const notices: any[] = [];
+  try {
+    const p = f.broker
+      .read(
+        f.broker.capture(),
+        { operation: 'search', query: 'fixture' },
+        'n1',
+        {
+          signal: controller.signal,
+          onPhysicalSettled: (reason: string) =>
+            notices.push({ reason, slots: f.broker.stats().dispatched }),
+        } as any,
+      )
+      .catch((e: any) => e.code);
+    const q = f.challenge();
+    f.ready(q);
+    controller.abort();
+    expect(await p).toBe('retired');
+    expect(notices).toEqual([]);
+    for (const patch of [
+      { nonce: 'f'.repeat(32) },
+      { documentId: '3'.repeat(32) },
+      { sourceId: '4'.repeat(32) },
+    ])
+      f.emit({
+        ...q,
+        type: 'settled',
+        documentId: '1'.repeat(32),
+        sourceId: '2'.repeat(32),
+        ...patch,
+      });
+    f.emit(
+      {
+        ...q,
+        type: 'settled',
+        documentId: '1'.repeat(32),
+        sourceId: '2'.repeat(32),
+      },
+      {},
+      {},
+    );
+    expect(notices).toEqual([]);
+    f.settled(q);
+    f.settled(q);
+    expect(notices).toEqual([{ reason: 'authenticated_ack', slots: 0 }]);
+  } finally {
+    f.contents.emit('render-process-gone');
+    f.broker.dispose();
+  }
+});
+
+for (const mode of [
+  'deadline',
+  'cancel',
+  'revoke',
+  'stop',
+  'source-retire',
+] as const)
+  test(
+    'N1 ' +
+      mode +
+      ' leaves read-phase physical settlement pending until authenticated ACK',
+    async () => {
+      const f = await musicRequestFixture(),
+        controller = new AbortController();
+      let live = true;
+      const notices: string[] = [];
+      try {
+        const p = f.broker
+          .read(
+            f.broker.capture(),
+            { operation: 'search', query: 'fixture' },
+            'n1',
+            {
+              signal: controller.signal,
+              deadline: mode === 'deadline' ? Date.now() + 20 : undefined,
+              isCurrent: () => live,
+              onPhysicalSettled: (reason: string) => notices.push(reason),
+            } as any,
+          )
+          .catch((e: any) => e.code);
+        const q = f.challenge();
+        f.ready(q);
+        if (mode === 'deadline') await new Promise((r) => setTimeout(r, 30));
+        else if (mode === 'stop') f.broker.stop();
+        else if (mode === 'source-retire')
+          f.emit({
+            type: 'retire',
+            documentId: '1'.repeat(32),
+            sourceId: '2'.repeat(32),
+          });
+        else {
+          live = false;
+          controller.abort();
+        }
+        expect(await p).toBe(mode === 'deadline' ? 'timeout' : 'retired');
+        expect(f.broker.stats().dispatched).toBe(1);
+        expect(notices).toEqual([]);
+        f.settled(q);
+        expect(notices).toEqual(['authenticated_ack']);
+        expect(f.broker.stats().dispatched).toBe(0);
+      } finally {
+        f.contents.emit('render-process-gone');
+        f.broker.dispose();
+      }
+    },
+  );
+
+test('N1 no Pending admission refusal and owner/queued releases notify definite non-admission once', async () => {
+  const f = await musicRequestFixture();
+  const notices: string[] = [];
+  const controls = Array.from({ length: 12 }, () => new AbortController());
+  const options = (index: number) => ({
+    signal: controls[index].signal,
+    onPhysicalSettled: (reason: string) => notices.push(index + ':' + reason),
+  });
+  try {
+    const admission = f.broker.capture();
+    const calls = controls.map((_, i) =>
+      f.broker
+        .read(
+          admission,
+          { operation: 'search', query: 'fixture' },
+          'p' + i,
+          options(i) as any,
+        )
+        .catch((e: any) => e.code),
+    );
+    let refused: string | undefined;
+    await expect(
+      f.broker.read(
+        admission,
+        { operation: 'search', query: 'fixture' },
+        'overflow',
+        {
+          onPhysicalSettled: (r: string) => {
+            refused = r;
+          },
+        } as any,
+      ),
+    ).rejects.toMatchObject({ code: 'busy' });
+    expect(refused).toBe('not_admitted');
+    controls[4].abort();
+    expect(await calls[4]).toBe('retired');
+    expect(notices).toContain('4:not_admitted');
+    controls[0].abort();
+    expect(await calls[0]).toBe('retired');
+    expect(notices).toContain('0:not_admitted');
+    for (const c of controls) c.abort();
+    await Promise.all(calls);
+    expect(notices).toHaveLength(12);
+    expect(new Set(notices).size).toBe(12);
+    let expired: string | undefined;
+    await expect(
+      f.broker.read(
+        admission,
+        { operation: 'search', query: 'fixture' },
+        'expired',
+        {
+          deadline: Date.now() - 1,
+          onPhysicalSettled: (r: string) => {
+            expired = r;
+          },
+        } as any,
+      ),
+    ).rejects.toMatchObject({ code: 'timeout' });
+    expect(expired).toBe('not_admitted');
+  } finally {
+    f.broker.dispose();
+  }
+});
+
+for (const event of ['did-navigate', 'render-process-gone', 'closed'] as const)
+  test(
+    'N1 authoritative ' +
+      event +
+      ' cleanup consumes callback before throw and reentry',
+    async () => {
+      const f = await musicRequestFixture();
+      let calls = 0,
+        observed = -1,
+        reported = '';
+      const pending: any[] = [];
+      try {
+        pending.push(
+          f.broker
+            .read(
+              f.broker.capture(),
+              { operation: 'search', query: 'fixture' },
+              'n1',
+              {
+                onPhysicalSettled: (reason: string) => {
+                  reported = reason;
+                  calls++;
+                  observed = f.broker.stats().dispatched;
+                  throw Error('Observer cannot block physical cleanup');
+                },
+              } as any,
+            )
+            .catch((e: any) => e.code),
+        );
+        const q = f.challenge();
+        f.ready(q);
+        f.contents.emit(
+          'did-start-navigation',
+          {},
+          'file://owned',
+          false,
+          true,
+        );
+        expect(await pending[0]).toBe('retired');
+        expect(calls).toBe(0);
+        expect(f.broker.stats().dispatched).toBe(1);
+        if (event === 'closed') f.window.emit(event);
+        else f.contents.emit(event);
+        expect(calls).toBe(1);
+        expect(reported).toBe('authoritative_termination');
+        expect(observed).toBe(0);
+        f.settled(q);
+        expect(calls).toBe(1);
+      } finally {
+        f.contents.emit('render-process-gone');
+        f.broker.dispose();
+      }
+    },
+  );
+
+test('N1 physical callback reentry sees released capacity and cannot reuse a consumed notification', async () => {
+  const f = await musicRequestFixture();
+  let calls = 0,
+    observed = -1;
+  let second: Promise<any> | undefined;
+  try {
+    const p = f.broker.read(
+      f.broker.capture(),
+      { operation: 'search', query: 'fixture' },
+      'n1',
+      {
+        onPhysicalSettled: () => {
+          calls++;
+          observed = f.broker.stats().dispatched;
+          second = f.read('next');
+        },
+      } as any,
+    );
+    const q = f.challenge();
+    f.ready(q);
+    f.settled(q);
+    await p;
+    expect(calls).toBe(1);
+    expect(observed).toBe(0);
+    expect(f.broker.stats().dispatched).toBe(1);
+    f.settled(q);
+    expect(calls).toBe(1);
+    const next = f.challenge();
+    f.ready(next);
+    f.settled(next);
+    await second;
+  } finally {
+    f.contents.emit('render-process-gone');
+    f.broker.dispose();
+  }
+});
+
+test('N1 optional physical hook preserves exact legacy clock ABI and millisecond precision', async () => {
+  const f = await musicRequestFixture();
+  const notices: any[] = [];
+  try {
+    const binding = {
+      documentId: '1'.repeat(32),
+      episodeId: '2'.repeat(32),
+      videoId: 'seedVideo01',
+    };
+    const p = f.broker.readClock(f.broker.capture(), binding, 'legacy-n1', {
+      onPhysicalSettled: (reason: string) => notices.push(reason),
+    } as any);
+    const q = f.sent.find(
+      (message: any) => message[0] === 'peard:legacy-clock-owner-query',
+    )[1];
+    const emit = (packet: any) =>
+      f.ipcMain.emit(
+        'peard:legacy-clock-reply',
+        { sender: f.contents, senderFrame: f.contents.mainFrame },
+        packet,
+      );
+    emit({
+      ...q,
+      type: 'ready',
+      documentId: binding.documentId,
+      sourceId: binding.episodeId,
+    });
+    const read = f.sent.find(
+      (message: any) => message[0] === 'peard:legacy-clock-read',
+    )[1];
+    expect(read.binding).toEqual(binding);
+    expect(JSON.stringify(f.sent)).not.toContain('onPhysicalSettled');
+    const packet = {
+      ...q,
+      type: 'settled',
+      documentId: binding.documentId,
+      sourceId: binding.episodeId,
+      result: { ok: true, value: { ...binding, elapsedMilliseconds: 1234.5 } },
+    };
+    emit(packet);
+    emit(packet);
+    expect(await p).toEqual({ ...binding, elapsedMilliseconds: 1234.5 });
+    expect(notices).toEqual(['authenticated_ack']);
+    expect(f.broker.stats().dispatched).toBe(0);
+  } finally {
+    f.contents.emit('render-process-gone');
+    f.broker.dispose();
+  }
+});

@@ -17,6 +17,16 @@ if (process.type !== 'browser' || !factsPath) {
   );
 }
 
+// The actual app registers its URI handler during startup. Test launches must
+// never change the host's protocol associations, including removal on quit.
+// Install both sinks synchronously, before the real application entry loads.
+app.setAsDefaultProtocolClient = () => true;
+app.removeAsDefaultProtocolClient = () => true;
+
+// Startup also applies login preferences. Keep that OS setter isolated before
+// entry, preserving its void contract without changing the host's login items.
+app.setLoginItemSettings = () => {};
+
 let published = false;
 let visibilityPoll;
 

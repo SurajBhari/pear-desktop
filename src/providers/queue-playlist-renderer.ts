@@ -14,6 +14,7 @@ import {
   type QueueInsertPosition,
 } from './queue-playlist';
 
+import type { NativeQueueActionValue } from '@/plugins/api-server/music-types';
 import type { MusicPlayer } from '@/types/music-player';
 import type { MusicPlayerAppElement } from '@/types/music-player-app-element';
 import type { QueueElement, Store } from '@/types/queue';
@@ -24,7 +25,25 @@ type Owner = {
   store: Store;
   network: MusicPlayerAppElement['networkManager'];
 };
+type OwnedQueueContext = {
+  current(this: void): boolean;
+  scalarCurrent(this: void): boolean;
+  nativeCurrent(this: void): boolean;
+  enter(this: void): void;
+  beforeEffect(this: void): void;
+};
+type OwnedJob = {
+  ownership: OwnedQueueContext;
+  entered: boolean;
+  resolve(value: NativeQueueActionValue): void;
+  reject(error: Error): void;
+  settle(): void;
+  dispatch(this: void, action: unknown): void;
+  fetch(this: void, data: Record<string, unknown>): Promise<unknown>;
+  fence(): boolean;
+};
 type Job = {
+  owned?: OwnedJob;
   requestId?: string;
   input:
     | PlaylistInput
@@ -78,6 +97,23 @@ export function createPlaylistQueueController(
     if (job.finished) return;
     job.finished = true;
     pending.delete(job);
+    if (job.owned) {
+      if (result.ok)
+        job.owned.resolve({
+          version: 1,
+          phase: result.count ? 'owned_queue_dispatch' : 'owned_queue_noop',
+          count: result.count,
+        } as NativeQueueActionValue);
+      else if (job.owned.entered)
+        job.owned.reject(new Error('Queue outcome unknown'));
+      else
+        job.owned.resolve({
+          version: 1,
+          phase: 'pre_effect_denial',
+          reason: result.reason === 'service' ? 'source' : result.reason,
+        });
+      if (active !== job) job.owned.settle();
+    }
     if (job.requestId) {
       requests.delete(job.requestId);
       send(job.requestId, result);
@@ -133,10 +169,13 @@ export function createPlaylistQueueController(
       return null;
     }
   };
+  // This private lifetime is independent of native/actor ownership. It must be
+  // the last, non-calling proof before every shared lane effect.
+  const canonicalCurrent = (job: Job) =>
+    !disposed && !job.finished && job.generation === generation;
   const valid = (job: Job) =>
-    !disposed &&
-    !job.finished &&
-    job.generation === generation &&
+    canonicalCurrent(job) &&
+    (!job.owned || (job.owned.ownership.current() && job.owned.fence())) &&
     apiAlive() &&
     job.owner.app.isConnected &&
     job.owner.queue.isConnected &&
@@ -158,10 +197,25 @@ export function createPlaylistQueueController(
               videoIds: [job.input.videoId],
               queueInsertPosition: job.input.insertPosition,
             };
-      const response = await job.owner.network.fetch<
-        unknown,
-        Record<string, unknown>
-      >('/music/get_queue', { queueContextParams: context, ...data });
+      const payload = { queueContextParams: context, ...data };
+      const fetch = job.owned
+        ? job.owned.fetch
+        : (Reflect.get(job.owner.network, 'fetch') as unknown);
+      const fetchReceiver = job.owned ? undefined : job.owner.network;
+      const fetchArgs = job.owned ? [payload] : ['/music/get_queue', payload];
+      if (typeof fetch !== 'function')
+        throw new Error('Unavailable queue fetch');
+      // Context, target capture and modern ownership may synchronously retire the
+      // shared lane. No ordinary callout follows its final private scalar fence.
+      if ((job.owned && !job.owned.fence()) || !canonicalCurrent(job)) {
+        finish(job, { ok: false, reason: 'retired' });
+        return;
+      }
+      const response: unknown = await Reflect.apply(
+        fetch,
+        fetchReceiver,
+        fetchArgs,
+      );
       if (
         !valid(job) ||
         job.owner.store.getState().queue.queueContextParams !== context
@@ -190,18 +244,42 @@ export function createPlaylistQueueController(
           current >= 0
             ? current + 1
             : state.items.length;
+        const action = {
+          type: 'ADD_ITEMS',
+          payload: {
+            nextQueueItemId: state.nextQueueItemId,
+            index,
+            items,
+            shuffleEnabled: false,
+            shouldAssignIds: true,
+          },
+        };
+        const dispatch = job.owned
+          ? job.owned.dispatch
+          : (Reflect.get(job.owner.queue, 'dispatch') as unknown);
+        const dispatchReceiver = job.owned ? undefined : job.owner.queue;
+        const dispatchArgs = [action];
+        if (typeof dispatch !== 'function')
+          throw new Error('Unavailable queue dispatch');
+        if (job.owned) {
+          if (!valid(job) || !job.owned.fence()) {
+            finish(job, { ok: false, reason: 'retired' });
+            return;
+          }
+          job.owned.entered = true;
+          job.owned.ownership.enter();
+          if (!job.owned.fence()) {
+            finish(job, { ok: false, reason: 'retired' });
+            return;
+          }
+        }
+        if (!canonicalCurrent(job)) {
+          finish(job, { ok: false, reason: 'retired' });
+          return;
+        }
         committing = true;
         try {
-          job.owner.queue.dispatch({
-            type: 'ADD_ITEMS',
-            payload: {
-              nextQueueItemId: state.nextQueueItemId,
-              index,
-              items,
-              shuffleEnabled: false,
-              shouldAssignIds: true,
-            },
-          });
+          Reflect.apply(dispatch, dispatchReceiver, dispatchArgs);
         } finally {
           committing = false;
         }
@@ -219,29 +297,65 @@ export function createPlaylistQueueController(
     process(job)
       .catch(() => finish(job, { ok: false, reason: 'retired' }))
       .finally(() => {
+        job.owned?.settle();
         active = undefined;
         drain();
       });
   };
-  const add = (input: Job['input'], requestId?: string) => {
+  const add = (input: Job['input'], requestId?: string, owned?: OwnedJob) => {
     if (queued.length + (active ? 1 : 0) >= MAX_QUEUE_REQUESTS) {
       if (requestId) send(requestId, { ok: false, reason: 'busy' });
+      if (owned) {
+        owned.resolve({
+          version: 1,
+          phase: 'pre_effect_denial',
+          reason: 'busy',
+        });
+        owned.settle();
+      }
       return;
     }
     if (requestId && requests.has(requestId)) return;
     const owner = capture();
     if (!owner) {
       if (requestId) send(requestId, { ok: false, reason: 'retired' });
+      if (owned) {
+        owned.resolve({
+          version: 1,
+          phase: 'pre_effect_denial',
+          reason: 'retired',
+        });
+        owned.settle();
+      }
       return;
     }
-    (
-      window as unknown as { blockerSceneGuard?: { cancelFromUser(): void } }
-    ).blockerSceneGuard?.cancelFromUser();
-    const job: Job = { input, requestId, owner, generation, finished: false };
+    if (owned) {
+      try {
+        owned.entered = true;
+        owned.ownership.enter();
+        owned.ownership.beforeEffect();
+      } catch {
+        owned.reject(new Error('Queue outcome unknown'));
+        owned.settle();
+        return;
+      }
+    } else
+      (
+        window as unknown as { blockerSceneGuard?: { cancelFromUser(): void } }
+      ).blockerSceneGuard?.cancelFromUser();
+    const job: Job = {
+      input,
+      requestId,
+      owner,
+      generation,
+      finished: false,
+      owned,
+    };
     pending.add(job);
     if (requestId) requests.set(requestId, job);
     queued.push(job);
     drain();
+    return job;
   };
   const unsubscribers = [
     window.ipcRenderer.subscribe(
@@ -304,5 +418,176 @@ export function createPlaylistQueueController(
     window.removeEventListener('pagehide', dispose);
   };
   window.addEventListener('pagehide', dispose);
-  return { dispose };
+  const enqueueOwned = (input: Job['input'], ownership: OwnedQueueContext) => {
+    let resolve!: (value: NativeQueueActionValue) => void,
+      reject!: (error: Error) => void,
+      settle!: () => void;
+    const result = new Promise<NativeQueueActionValue>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    const physicalSettled = new Promise<void>((yes) => {
+      settle = yes;
+    });
+    const links: {
+      object: object;
+      key: string;
+      holder: object;
+      descriptor: PropertyDescriptor;
+    }[] = [];
+    const data = (object: object, key: string): unknown => {
+      let holder: object | null = object;
+      for (
+        let depth = 0;
+        holder && depth < 16;
+        depth++, holder = Object.getPrototypeOf(holder) as object | null
+      ) {
+        const descriptor = Object.getOwnPropertyDescriptor(holder, key);
+        if (descriptor) {
+          if (!('value' in descriptor))
+            throw new Error('Unsupported queue binding');
+          links.push({ object, key, holder, descriptor });
+          return descriptor.value as unknown;
+        }
+      }
+      throw new Error('Missing queue binding');
+    };
+    let nativeFence = () => false;
+    const owned: OwnedJob = {
+      ownership,
+      entered: false,
+      resolve,
+      reject,
+      settle,
+      dispatch: () => {},
+      fetch: () => Promise.reject(new Error('Unavailable queue fetch')),
+      fence: () => nativeFence(),
+    };
+    try {
+      const doc = document,
+        view = doc.defaultView!;
+      const intrinsic = (prototype: object, key: string) => {
+        let holder: object | null = prototype;
+        for (
+          let depth = 0;
+          holder && depth < 16;
+          depth++, holder = Object.getPrototypeOf(holder) as object | null
+        ) {
+          const d = Object.getOwnPropertyDescriptor(holder, key);
+          if (d) return d;
+        }
+        return undefined;
+      };
+      const query = intrinsic(view.Document.prototype, 'querySelector')
+        ?.value as (this: Document, selector: string) => Element | null;
+      const connectedDescriptor = intrinsic(view.Node.prototype, 'isConnected');
+      const connectedValue: unknown =
+        connectedDescriptor && Reflect.get(connectedDescriptor, 'get');
+      const connected = connectedValue as (this: Node) => boolean;
+      if (typeof query !== 'function' || typeof connected !== 'function')
+        throw new Error('Unsupported DOM proof');
+      const app = Reflect.apply(query, doc, ['ytmusic-app'])!,
+        element = Reflect.apply(query, doc, ['#queue'])!;
+      let queue: unknown;
+      let rootHolder: object | null = element;
+      while (rootHolder && !Object.hasOwn(rootHolder, 'queue'))
+        rootHolder = Object.getPrototypeOf(rootHolder) as object | null;
+      const root =
+        rootHolder && Object.getOwnPropertyDescriptor(rootHolder, 'queue');
+      if (root && 'value' in root) queue = data(element, 'queue');
+      else {
+        if (!root || !rootHolder) throw new Error('Missing queue binding');
+        links.push({
+          object: element,
+          key: 'queue',
+          holder: rootHolder,
+          descriptor: root,
+        });
+        const inst = data(element, 'inst') as object;
+        queue = data(inst, 'queue');
+        if (Reflect.get(element, 'queue') !== queue)
+          throw new Error('Retired queue binding');
+      }
+      const holder = data(queue as object, 'store') as object;
+      const store = data(holder, 'store') as object;
+      data(store, 'getState');
+      data(store, 'subscribe');
+      const dispatch = data(element, 'dispatch');
+      owned.dispatch = (action) => {
+        Reflect.apply(dispatch as (...args: unknown[]) => unknown, element, [
+          action,
+        ]);
+      };
+      const network = data(app, 'networkManager') as object;
+      const fetch = data(network, 'fetch');
+      owned.fetch = (payload) =>
+        Reflect.apply(fetch as (...args: unknown[]) => unknown, network, [
+          '/music/get_queue',
+          payload,
+        ]) as Promise<unknown>;
+      if (typeof dispatch !== 'function' || typeof fetch !== 'function')
+        throw new Error('Missing queue method');
+      nativeFence = () => {
+        if (!ownership.current() || !apiAlive() || !ownership.current())
+          return false;
+        if (
+          Reflect.apply(query, doc, ['ytmusic-app']) !== app ||
+          Reflect.apply(query, doc, ['#queue']) !== element ||
+          !Reflect.apply(connected, app, []) ||
+          !Reflect.apply(connected, element, [])
+        )
+          return false;
+        for (const link of links) {
+          let holder: object | null = link.object;
+          while (holder && !Object.hasOwn(holder, link.key))
+            holder = Object.getPrototypeOf(holder) as object | null;
+          const d = holder && Object.getOwnPropertyDescriptor(holder, link.key),
+            old = link.descriptor;
+          if (
+            holder !== link.holder ||
+            !d ||
+            d.value !== old.value ||
+            d.get !== old.get ||
+            d.set !== old.set ||
+            d.writable !== old.writable ||
+            d.configurable !== old.configurable ||
+            d.enumerable !== old.enumerable
+          )
+            return false;
+        }
+        // Descriptor reflection may itself reenter through a provider Proxy. End
+        // with captured DOM intrinsics for every native receiver, then scalar state.
+        if (
+          Reflect.apply(query, doc, ['ytmusic-app']) !== app ||
+          Reflect.apply(query, doc, ['#queue']) !== element ||
+          !Reflect.apply(connected, app, []) ||
+          !Reflect.apply(connected, element, [])
+        )
+          return false;
+        return ownership.nativeCurrent() && ownership.scalarCurrent();
+      };
+      if (!nativeFence()) throw new Error('Retired queue');
+      // The same add/process/drain engine owns all legacy and modern insertion work.
+      const job = add(input, undefined, owned);
+      return {
+        result,
+        physicalSettled,
+        cancel(this: void) {
+          if (!job || job.finished) return;
+          const index = queued.indexOf(job);
+          if (index >= 0) queued.splice(index, 1);
+          finish(job, { ok: false, reason: 'retired' });
+        },
+      };
+    } catch {
+      resolve({
+        version: 1,
+        phase: 'pre_effect_denial',
+        reason: 'unavailable',
+      });
+      settle();
+      return { result, physicalSettled, cancel(this: void) {} };
+    }
+  };
+  return { dispose, enqueueOwned, retireOwned: cancelAll };
 }

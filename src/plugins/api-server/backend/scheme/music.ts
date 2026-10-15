@@ -1,5 +1,10 @@
 import { z } from 'zod';
 
+import {
+  parseControlCommand,
+  parseQueueCommand,
+} from '@/providers/music-actions';
+import { assertMetadataWorkBudget } from '@/providers/music-metadata';
 import { isPlaylistId, isVideoId } from '@/providers/queue-playlist';
 
 import { MUSIC_LIMITS, failMusic, utf8Bytes } from '../../music-types';
@@ -249,4 +254,277 @@ export function parseNativeQueue(value: unknown) {
   )
     return failMusic('source');
   return parsed.data;
+}
+
+const metadataSelector = z.union([
+  z.object({ videoId: z.string().refine(isVideoId) }).strict(),
+  z.object({ current: z.literal(true) }).strict(),
+]);
+const relatedSelector = z.union([
+  z.object({ videoId: z.string().refine(isVideoId), limit }).strict(),
+  z.object({ current: z.literal(true), limit }).strict(),
+  cursorSchema,
+]);
+export function parseMusicLyricsInput(value: unknown) {
+  try {
+    assertMetadataWorkBudget(value);
+  } catch {
+    return failMusic('invalid');
+  }
+  const parsed = metadataSelector.safeParse(value);
+  if (!parsed.success) return failMusic('invalid');
+  return parsed.data;
+}
+export function parseMusicRelatedInput(value: unknown) {
+  try {
+    assertMetadataWorkBudget(value);
+  } catch {
+    return failMusic('invalid');
+  }
+  const parsed = relatedSelector.safeParse(value);
+  if (!parsed.success) return failMusic('invalid');
+  return parsed.data;
+}
+function metadataQuery(query: URLSearchParams, related: boolean) {
+  const value: Record<string, unknown> = {};
+  for (const [key, field] of query) {
+    if (
+      !['videoId', 'current', ...(related ? ['limit', 'cursor'] : [])].includes(
+        key,
+      ) ||
+      Object.hasOwn(value, key)
+    )
+      return failMusic('invalid');
+    if (key === 'current') {
+      if (field !== 'true') return failMusic('invalid');
+      value.current = true;
+    } else if (key === 'limit') {
+      if (!/^[1-9][0-9]{0,2}$/.test(field)) return failMusic('invalid');
+      value.limit = Number(field);
+    } else value[key] = field;
+  }
+  return value;
+}
+export const parseMusicLyricsQuery = (query: URLSearchParams) =>
+  parseMusicLyricsInput(metadataQuery(query, false));
+export const parseMusicRelatedQuery = (query: URLSearchParams) =>
+  parseMusicRelatedInput(metadataQuery(query, true));
+const metadataBinding = z
+  .object({
+    videoId: z.string().refine(isVideoId),
+    playbackEpoch: z
+      .string()
+      .regex(/^[0-9a-f]{32}:[0-9a-f]{32}$/)
+      .nullable(),
+  })
+  .strict();
+const lyricText = (bytes: number, chars?: number) =>
+  z
+    .string()
+    .refine(
+      (v) =>
+        utf8Bytes(v) <= bytes &&
+        (chars === undefined || Array.from(v).length <= chars) &&
+        Array.from(v).every(
+          (c) =>
+            c.length !== 1 ||
+            c.charCodeAt(0) < 0xd800 ||
+            c.charCodeAt(0) > 0xdfff,
+        ),
+    );
+const lyricsSchema = z
+  .object({
+    videoId: z.string().refine(isVideoId),
+    available: z.boolean(),
+    lyrics: lyricText(65536).nullable(),
+    source: lyricText(2048, 512).nullable(),
+  })
+  .strict()
+  .refine((v) =>
+    v.available
+      ? v.lyrics !== null && v.lyrics.length > 0
+      : v.lyrics === null && v.source === null,
+  );
+const lyricsMetadataSchema = z
+  .object({
+    version: z.literal(1),
+    binding: metadataBinding,
+    lyrics: lyricsSchema,
+  })
+  .strict()
+  .refine((v) => v.lyrics.videoId === v.binding.videoId);
+const relatedMetadataSchema = z
+  .object({
+    version: z.literal(1),
+    binding: metadataBinding,
+    source: catalogSchema,
+  })
+  .strict();
+const probeSchema = z
+  .object({
+    version: z.literal(1),
+    binding: metadataBinding.refine((v) => v.playbackEpoch !== null),
+  })
+  .strict();
+function nativeMetadata<T>(schema: z.ZodType<T>, value: unknown): T {
+  assertMetadataWorkBudget(value);
+  const parsed = schema.safeParse(value);
+  if (
+    !parsed.success ||
+    utf8Bytes(JSON.stringify(parsed.data)) > MUSIC_LIMITS.nativeBytes
+  )
+    return failMusic('source');
+  return parsed.data;
+}
+export const parseNativeLyricsMetadata = (value: unknown) =>
+  nativeMetadata(lyricsMetadataSchema, value);
+export const parseNativeRelatedMetadata = (value: unknown) => {
+  const result = nativeMetadata(relatedMetadataSchema, value);
+  parseNativeCatalog(result.source, 'browse');
+  return result;
+};
+export const parseNativeMetadataProbe = (value: unknown) =>
+  nativeMetadata(probeSchema, value);
+
+const navigationCommandSchema = z.discriminatedUnion('action', [
+  z
+    .object({
+      action: z.literal('play_song'),
+      videoId: z.string().refine(isVideoId),
+      playlistId: playlistId.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('play_playlist'),
+      playlistId,
+      videoId: z.string().refine(isVideoId).optional(),
+      shuffle: z.boolean().default(false),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('radio'),
+      seed: z.discriminatedUnion('kind', [
+        z
+          .object({
+            kind: z.literal('video'),
+            videoId: z.string().refine(isVideoId),
+          })
+          .strict(),
+        z.object({ kind: z.literal('playlist'), playlistId }).strict(),
+        z.object({ kind: z.literal('current') }).strict(),
+      ]),
+    })
+    .strict(),
+]);
+function navigationOwnData(value: unknown, depth = 0): boolean {
+  if (!value || typeof value !== 'object') return true;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (
+    depth > 4 ||
+    Array.isArray(value) ||
+    (prototype !== Object.prototype && prototype !== null)
+  )
+    return false;
+  return Reflect.ownKeys(value).every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return (
+      typeof key === 'string' &&
+      !!descriptor &&
+      'value' in descriptor &&
+      navigationOwnData(descriptor.value, depth + 1)
+    );
+  });
+}
+export function parseMusicPrepareInput(
+  value: unknown,
+): import('../../music-types').MusicPrepareInput {
+  if (!navigationOwnData(value)) return failMusic('invalid');
+  const parsed = navigationCommandSchema.safeParse(value);
+  if (!parsed.success) return failMusic('invalid');
+  return parsed.data;
+}
+export function parseMusicOperationId(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  )
+    return failMusic('invalid');
+  return value.toLowerCase();
+}
+export function parseMusicMutationInput(
+  value: unknown,
+): import('../../music-types').MusicMutationInput {
+  if (
+    !navigationOwnData(value) ||
+    !value ||
+    typeof value !== 'object' ||
+    !Object.hasOwn(value, 'operationId')
+  )
+    return failMusic('invalid');
+  const { operationId, ...command } = value as Record<string, unknown>;
+  return {
+    ...parseMusicPrepareInput(command),
+    operationId: parseMusicOperationId(operationId),
+  };
+}
+
+export function parseMusicQueueCommand(
+  value: unknown,
+): import('../../music-types').MusicQueueCommand {
+  return parseQueueCommand(value) ?? failMusic('invalid');
+}
+export function parseMusicQueueMutationInput(
+  value: unknown,
+): import('../../music-types').MusicQueueMutationInput {
+  if (
+    !navigationOwnData(value) ||
+    !value ||
+    typeof value !== 'object' ||
+    !Object.hasOwn(value, 'operationId')
+  )
+    return failMusic('invalid');
+  const { operationId, ...command } = value as Record<string, unknown>;
+  return {
+    ...parseMusicQueueCommand(command),
+    operationId: parseMusicOperationId(operationId),
+  };
+}
+
+export function parseMusicOperationPrepareInput(
+  value: unknown,
+): import('../../music-types').MusicOperationCommand {
+  const command = parseControlCommand(value);
+  if (command) return command;
+  if (
+    navigationOwnData(value) &&
+    value &&
+    typeof value === 'object' &&
+    [
+      'enqueue_song',
+      'enqueue_playlist',
+      'remove_from_queue',
+      'clear_queue',
+    ].includes((value as { action: string }).action)
+  )
+    return parseMusicQueueCommand(value);
+  return parseMusicPrepareInput(value);
+}
+export function parseMusicControlMutationInput(
+  value: unknown,
+): import('../../music-types').MusicControlMutationInput {
+  if (
+    !navigationOwnData(value) ||
+    !value ||
+    typeof value !== 'object' ||
+    !Object.hasOwn(value, 'operationId')
+  )
+    return failMusic('invalid');
+  const { operationId, ...data } = value as Record<string, unknown>;
+  const command = parseControlCommand(data);
+  if (!command) return failMusic('invalid');
+  return { ...command, operationId: parseMusicOperationId(operationId) };
 }

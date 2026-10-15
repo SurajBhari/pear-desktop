@@ -142,7 +142,7 @@ function thumbnail(value: unknown): string | undefined {
   }
   return result;
 }
-function assertWorkBudget(root: unknown) {
+function assertWorkBudget(root: unknown, metadata = false) {
   const stack: { value: unknown; depth: number; exit?: boolean }[] = [
     { value: root, depth: 0 },
   ];
@@ -170,6 +170,31 @@ function assertWorkBudget(root: unknown) {
     }
     if (!value || typeof value !== 'object') return failMusic('source');
     if (!Array.isArray(value)) object(value);
+    else if (metadata) {
+      if (Object.getPrototypeOf(value) !== Array.prototype)
+        return failMusic('source');
+      const length = Object.getOwnPropertyDescriptor(value, 'length');
+      const size: unknown = length?.value;
+      if (
+        !length ||
+        !('value' in length) ||
+        typeof size !== 'number' ||
+        !Number.isInteger(size) ||
+        size < 0
+      )
+        return failMusic('source');
+      if (size > MUSIC_LIMITS.sourceNodes) return failMusic('budget');
+      // Metadata-only: reject holes/accessors before the shared row parser
+      // can iterate; default catalog behavior and all budgets stay unchanged.
+      for (let index = 0; index < size; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(
+          value,
+          String(index),
+        );
+        if (!descriptor?.enumerable || !('value' in descriptor))
+          return failMusic('source');
+      }
+    }
     if (ancestors.has(value)) return failMusic('source');
     if (Object.getOwnPropertySymbols(value).length) return failMusic('source');
     const isArray = Array.isArray(value);
@@ -389,8 +414,21 @@ export function normalizeMusicSource(
   root: unknown,
   operation: CatalogOperation,
 ): NormalizedMusicSource {
+  return normalizeSource(root, operation, false);
+}
+/** Native metadata section roots use the original input budget, without a browse wrapper. */
+export function normalizeRelatedMusicSource(
+  root: unknown,
+): NormalizedMusicSource {
+  return normalizeSource(root, 'browse', true);
+}
+function normalizeSource(
+  root: unknown,
+  operation: CatalogOperation,
+  metadata: boolean,
+): NormalizedMusicSource {
   try {
-    assertWorkBudget(root);
+    assertWorkBudget(root, metadata);
     const items: MusicItem[] = [],
       shelves: MusicShelf[] = [],
       targetRecipes: MusicRecipe[] = [];
@@ -477,13 +515,42 @@ export function normalizeMusicSource(
       }
     };
     const continuationContents = field(root, 'continuationContents');
-    if (continuationContents !== undefined) {
+    if (metadata) {
+      if (field(root, 'error') !== undefined) return failMusic('source');
+      const contents = field(root, 'contents');
+      if ((contents !== undefined) === (continuationContents !== undefined))
+        return failMusic('unsupported');
+      if (contents !== undefined) {
+        if (
+          Object.keys(object(contents)).length !== 1 ||
+          field(contents, 'sectionListRenderer') === undefined
+        )
+          return failMusic('unsupported');
+      } else if (
+        Object.keys(object(continuationContents)).length !== 1 ||
+        ![
+          'sectionListContinuation',
+          'musicShelfContinuation',
+          'musicPlaylistShelfContinuation',
+        ].some((key) => field(continuationContents, key) !== undefined)
+      )
+        return failMusic('unsupported');
+    }
+    const metadataContinuation =
+      metadata && continuationContents !== undefined
+        ? field(continuationContents, 'sectionListContinuation')
+        : undefined;
+    if (metadataContinuation !== undefined) {
+      section({ sectionListRenderer: metadataContinuation });
+    } else if (continuationContents !== undefined) {
       const data =
         field(continuationContents, 'musicShelfContinuation') ??
         field(continuationContents, 'musicPlaylistShelfContinuation');
       if (data === undefined) return failMusic('unsupported');
       addRows(field(data, 'contents'));
       sourceContinuation(field(data, 'continuations'));
+    } else if (metadata) {
+      section(field(root, 'contents'));
     } else {
       const contents = field(root, 'contents');
       if (contents === undefined) return failMusic('unsupported');

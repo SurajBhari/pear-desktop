@@ -8,6 +8,8 @@ import {
 import { parseMusicBearer, type MusicGrantRecord } from '../music-grants';
 import {
   parseMusicQueueQuery,
+  parseMusicLyricsQuery,
+  parseMusicRelatedQuery,
   parseMusicCollectionQuery,
 } from '../scheme/music';
 
@@ -47,6 +49,9 @@ const codes: Record<MusicFailure, ContentfulStatusCode> = {
   budget: 502,
   unavailable: 503,
   timeout: 504,
+  unknown_operation: 404,
+  expired_operation: 409,
+  conflict: 409,
 };
 const failure = (error: unknown) => {
   if (error instanceof HttpMusicFailure)
@@ -238,22 +243,63 @@ export function registerMusicRoutes<E extends Env>(
       )
         return reject(400);
       const route = rawTarget.split('?')[0].slice(prefix.length);
+      const prepare = route === '/operations/prepare';
+      const control = route === '/control';
+      const queueIndex = /^\/queue\/(0|[1-9][0-9]*)$/.exec(route)?.[1];
+      const queueMutation =
+        route === '/queue/song' ||
+        route === '/queue/playlist' ||
+        queueIndex !== undefined ||
+        (route === '/queue' && context.req.method === 'DELETE');
+      const mutation = ['/play/song', '/play/playlist', '/radio'].includes(
+        route,
+      );
+      const operationId = /^\/operations\/([^/]+)$/.exec(route)?.[1];
+      const status = !!operationId && !prepare;
+      const navigation = prepare || mutation || control || status;
       const current = route === '/current',
-        queue = route === '/queue',
+        queue = route === '/queue' && !queueMutation,
         home = route === '/home',
         library = route === '/library/playlists',
         collection = home || library,
-        get = current || queue || collection;
-      if (rawTarget.includes('?') && !queue && !collection) return reject(400);
-      if (!get && route !== '/search' && route !== '/browse')
+        lyrics = route === '/song/lyrics',
+        related = route === '/song/related',
+        metadata = lyrics || related,
+        get = current || queue || collection || metadata || status;
+      if (rawTarget.includes('?') && !queue && !collection && !metadata)
+        return reject(400);
+      if (
+        !get &&
+        !prepare &&
+        !mutation &&
+        !control &&
+        !queueMutation &&
+        route !== '/search' &&
+        route !== '/browse'
+      )
         return reject(404, 'not_found');
-      if (context.req.method !== (get ? 'GET' : 'POST')) return reject(405);
+      if (
+        context.req.method !==
+        (queueMutation && (route === '/queue' || queueIndex !== undefined)
+          ? 'DELETE'
+          : get
+            ? 'GET'
+            : 'POST')
+      )
+        return reject(405);
       if (
         get &&
         (incoming.headers['transfer-encoding'] !== undefined ||
           Number(incoming.headers['content-length'] ?? '0') > 0)
       )
         return reject(400);
+      const deadlineAt =
+        Date.now() +
+        (prepare || mutation || control || queueMutation
+          ? 10000
+          : current || queue
+            ? 5000
+            : 15000);
       const controller = new AbortController();
       const socketLost = () => {
         if (!outgoing.writableFinished)
@@ -273,17 +319,20 @@ export function registerMusicRoutes<E extends Env>(
       ]);
       timer = setTimeout(
         () => controller.abort(new MusicServiceError('timeout')),
-        current || queue ? 5000 : 15000,
+        Math.max(0, deadlineAt - Date.now()),
       );
       timer.unref?.();
-      const scope =
-        current || queue
-          ? 'playback.read'
-          : home
-            ? 'personalized.read'
-            : library
-              ? 'library.read'
-              : 'catalog.read';
+      const scope = queueMutation
+        ? 'queue.write'
+        : navigation
+          ? 'playback.control'
+          : current || queue
+            ? 'playback.read'
+            : home
+              ? 'personalized.read'
+              : library
+                ? 'library.read'
+                : 'catalog.read';
       let principal: MusicGrantRecord | undefined;
       const live = () =>
         !signal.aborted &&
@@ -294,39 +343,107 @@ export function registerMusicRoutes<E extends Env>(
       detachGrant = service.grants.subscribe(() => {
         if (!live()) controller.abort(new MusicServiceError('retired'));
       });
-      principal = await wait(
-        service.grants.authorize(token, 'rest', transport.resource, scope),
-        signal,
-      );
+      if (!prepare && !status)
+        principal = await wait(
+          service.grants.authorize(token, 'rest', transport.resource, scope),
+          signal,
+        );
       if (!live()) return reject(409, 'retired');
       const query = rawTarget.includes('?')
         ? rawTarget.slice(rawTarget.indexOf('?') + 1)
         : '';
-      if ((queue || collection) && /[%#\\]/.test(query)) return reject(400);
-      const input = current
-        ? undefined
-        : queue
-          ? parseMusicQueueQuery(new URLSearchParams(query))
-          : collection
-            ? parseMusicCollectionQuery(new URLSearchParams(query))
-            : await jsonBody(context.req.raw, incoming, signal);
+      if ((queue || collection || metadata) && /[%#\\]/.test(query))
+        return reject(400);
+      const input = lyrics
+        ? parseMusicLyricsQuery(new URLSearchParams(query))
+        : related
+          ? parseMusicRelatedQuery(new URLSearchParams(query))
+          : current || status
+            ? undefined
+            : queue
+              ? parseMusicQueueQuery(new URLSearchParams(query))
+              : collection
+                ? parseMusicCollectionQuery(new URLSearchParams(query))
+                : await jsonBody(context.req.raw, incoming, signal);
       if (!live()) return reject(409, 'retired');
+      if (
+        (mutation || queueMutation) &&
+        input &&
+        typeof input === 'object' &&
+        Object.hasOwn(input, 'action')
+      )
+        return reject(400);
+      if (
+        queueIndex !== undefined &&
+        input &&
+        typeof input === 'object' &&
+        Object.hasOwn(input, 'index') &&
+        (input as { index: unknown }).index !== Number(queueIndex)
+      )
+        return reject(400);
       const result = await wait<
         | Awaited<ReturnType<MusicService['current']>>
         | Awaited<ReturnType<MusicService['search']>>
         | Awaited<ReturnType<MusicService['queue']>>
+        | Awaited<ReturnType<MusicService['lyrics']>>
+        | Awaited<ReturnType<MusicService['prepare']>>
       >(
-        current
-          ? service.current(token, signal)
-          : queue
-            ? service.queue(token, input, signal)
-            : home
-              ? service.home(token, input, signal)
-              : library
-                ? service.library(token, input, signal)
-                : route === '/search'
-                  ? service.search(token, input, signal)
-                  : service.browse(token, input, signal),
+        prepare
+          ? service.prepare(token, input, signal, deadlineAt)
+          : status
+            ? service.operation(token, operationId, signal, deadlineAt)
+            : queueMutation
+              ? service.mutateQueue(
+                  token,
+                  {
+                    ...(input as object),
+                    action:
+                      route === '/queue/song'
+                        ? 'enqueue_song'
+                        : route === '/queue/playlist'
+                          ? 'enqueue_playlist'
+                          : queueIndex !== undefined
+                            ? 'remove_from_queue'
+                            : 'clear_queue',
+                    ...(queueIndex !== undefined
+                      ? { index: Number(queueIndex) }
+                      : {}),
+                  },
+                  signal,
+                  deadlineAt,
+                )
+              : control
+                ? service.control(token, input, signal, deadlineAt)
+                : mutation
+                  ? service.navigate(
+                      token,
+                      {
+                        ...(input as object),
+                        action:
+                          route === '/play/song'
+                            ? 'play_song'
+                            : route === '/play/playlist'
+                              ? 'play_playlist'
+                              : 'radio',
+                      },
+                      signal,
+                      deadlineAt,
+                    )
+                  : lyrics
+                    ? service.lyrics(token, input, signal, deadlineAt)
+                    : related
+                      ? service.related(token, input, signal, deadlineAt)
+                      : current
+                        ? service.current(token, signal)
+                        : queue
+                          ? service.queue(token, input, signal)
+                          : home
+                            ? service.home(token, input, signal)
+                            : library
+                              ? service.library(token, input, signal)
+                              : route === '/search'
+                                ? service.search(token, input, signal)
+                                : service.browse(token, input, signal),
         signal,
       );
       if (!live()) return reject(409, 'retired');
