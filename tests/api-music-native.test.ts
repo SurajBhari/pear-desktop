@@ -954,8 +954,40 @@ test('N1 actual late authenticated ACK and committed/process/window termination 
       } else {
         if (mode === 'committed') await window.loadFile(f.owned + '/main.html');
         else if (mode === 'process') {
-          window.webContents.forcefullyCrashRenderer();
+          const rendererPid = window.webContents.getOSProcessId();
+          const ownedRenderer = f.app
+            .getAppMetrics()
+            .find((entry: any) => entry.pid === rendererPid && entry.type === 'Tab');
+          if (
+            !Number.isInteger(rendererPid) ||
+            rendererPid <= 0 ||
+            rendererPid === process.pid ||
+            !ownedRenderer
+          )
+            throw Error('Missing distinct owned N1 renderer process');
+          const termination: { reason?: string } = {};
+          window.webContents.once(
+            'render-process-gone',
+            (_event: any, details: any) => {
+              termination.reason = details.reason;
+            },
+          );
+          // Match the existing Linux native stimulus; require the real event.
+          if (process.platform === 'linux') process.kill(rendererPid, 'SIGKILL');
+          else window.webContents.forcefullyCrashRenderer();
           await wait(() => notices.length === 1);
+          if (
+            !termination.reason ||
+            (process.platform === 'linux'
+              ? termination.reason !== 'killed'
+              : !['crashed', 'killed'].includes(termination.reason))
+          )
+            throw Error('Missing expected native N1 renderer termination');
+          console.log('N1_TERMINATION ' + JSON.stringify({
+            mainPid: process.pid, rendererPid, windowId: window.id,
+            method: process.platform === 'linux' ? 'SIGKILL' : 'forcefullyCrashRenderer',
+            reason: termination.reason, notices, slots: broker.stats().dispatched,
+          }));
         } else window.destroy();
         await wait(() => notices.length === 1);
         results.push({ mode, logical, dispatches, before, notices });
