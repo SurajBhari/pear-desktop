@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { test, expect } from '@playwright/test';
 import { musicHttpFixture } from './helpers/api-music-http';
 
@@ -1283,9 +1284,11 @@ test('Q4 MR1 terminal descriptor callout cannot detach shadowed API before fetch
   }
 });
 
-async function nativeCleanupContract() {
+async function nativeCleanupContract(
+  fileName = 'api-music-queue-actions-native.test.ts',
+) {
   const source = await readFile(
-    path.join(import.meta.dirname, 'api-music-queue-actions-native.test.ts'),
+    path.join(import.meta.dirname, fileName),
     'utf8',
   );
   const functions = source
@@ -1296,7 +1299,7 @@ async function nativeCleanupContract() {
     .replaceAll('export ', '');
   return new Function(
     stripTypeScriptTypes(functions) +
-      ';return {cleanupOwnedNativeChild,assertNativeCleanupComplete,retireOwnedWindowsFixture,ownedWindowsCohortAbsent};',
+      ';return {cleanupOwnedNativeChild,assertNativeCleanupComplete,retireOwnedWindowsFixture,ownedWindowsCohortAbsent,planOwnedQuery,createOwnedQueryScope,ownedNativeTimingReceipt};',
   )();
 }
 function cleanupClock(
@@ -1333,6 +1336,7 @@ function cleanupClock(
     },
     closed: () => closed,
     waitClose: () => waiting,
+    queriesClosed: () => true,
     treeEmpty: async () => {
       events.push('tree');
       if (options.tree === 'throw') throw Error('query failed');
@@ -1615,6 +1619,142 @@ test('Q4 MR2 terminal descriptor callout cannot disconnect captured queue before
   }
 });
 
+for (const fileName of [
+  'api-music-comments-native.test.ts',
+  'api-music-queue-actions-native.test.ts',
+])
+  test(`${fileName} clears work timer after supplied unlaunched failure`, async () => {
+    const source = await readFile(
+      path.join(import.meta.dirname, fileName),
+      'utf8',
+    );
+    const guard = source.lastIndexOf(
+      '    if (!keepFixture',
+      source.indexOf("test('"),
+    );
+    const start =
+      source.lastIndexOf('  } finally {', guard) + '  } finally {'.length;
+    const block = source.slice(start, source.indexOf('\n  }\n}', guard));
+    let cleared = 0,
+      cleanups = 0;
+    const run = new Function(
+      'workTimer',
+      'clearTimeout',
+      'nativeTiming',
+      'keepFixture',
+      'prepared',
+      'child',
+      'queryScope',
+      'cleanupOwnedNativeChild',
+      'treeEmpty',
+      'assertNativeCleanupComplete',
+      'originalFailure',
+      'owned',
+      'return(async()=>{' + stripTypeScriptTypes(block) + '})()',
+    );
+    await run(
+      1,
+      () => {
+        cleared++;
+      },
+      { nativeStartedAtMono: null },
+      false,
+      '/owned/old-unlaunched',
+      undefined,
+      {},
+      () => {
+        cleanups++;
+      },
+      () => false,
+      () => {},
+      Error('binding mismatch'),
+      '/owned/old-unlaunched',
+    );
+    expect(cleared).toBe(1);
+    expect(cleanups).toBe(0);
+  });
+
+for (const fileName of [
+  'api-music-comments-native.test.ts',
+  'api-music-queue-actions-native.test.ts',
+])
+  test(`${fileName} shares monotonic cleanup deadline with query admission`, async () => {
+    const source = await readFile(
+      path.join(import.meta.dirname, fileName),
+      'utf8',
+    );
+    const guard = source.lastIndexOf(
+      '    if (!keepFixture',
+      source.indexOf("test('"),
+    );
+    const start =
+      source.lastIndexOf('  } finally {', guard) + '  } finally {'.length;
+    const block = source.slice(start, source.indexOf('\n  }\n}', guard));
+    const api = await nativeCleanupContract(fileName);
+    let observedDeadline = 0;
+    const nativeTiming = {
+      nativeStartedAtMono: 1000,
+      subjectClosedAtMono: 3900,
+      nativeWorkEndedAtMono: null,
+      cleanupStartedAtMono: null,
+      cleanupEndedAtMono: null,
+    };
+    const bindings = {
+      nativeTiming,
+      workTimer: undefined,
+      clearTimeout: () => {},
+      setTimeout: () => 1,
+      performance: { now: () => 4000 },
+      Date: { now: () => 1700000000000 },
+      keepFixture: false,
+      prepared: undefined,
+      child: undefined,
+      queryScope: {
+        active: () => false,
+        enterCleanup: () => true,
+        queriesClosed: () => true,
+        complete: () => {},
+      },
+      cleanupOwnedNativeChild: api.cleanupOwnedNativeChild,
+      treeEmpty: async (deadline: number) => {
+        observedDeadline = deadline;
+        return true;
+      },
+      assertNativeCleanupComplete: api.assertNativeCleanupComplete,
+      originalFailure: undefined,
+      owned: '/owned/monotonic',
+      suppliedEvidence: undefined,
+      rm: async () => {},
+    };
+    const run = new Function(
+      ...Object.keys(bindings),
+      'return(async()=>{' + stripTypeScriptTypes(block) + '})()',
+    );
+    await run(...Object.values(bindings));
+    expect(observedDeadline).toBe(6000);
+    expect(nativeTiming).toMatchObject({
+      nativeWorkEndedAtMono: 4000,
+      cleanupStartedAtMono: 4000,
+      cleanupEndedAtMono: 4000,
+    });
+    const plan = api.planOwnedQuery('absence', {
+      now: 5249,
+      nativeDeadline: 25000,
+      caseDeadline: 30000,
+      cleanupDeadline: observedDeadline,
+    });
+    expect(plan.admitted).toBe(true);
+    expect(plan.timeoutMs).toBe(1);
+    expect(
+      api.planOwnedQuery('absence', {
+        now: 5250,
+        nativeDeadline: 25000,
+        caseDeadline: 30000,
+        cleanupDeadline: observedDeadline,
+      }).admitted,
+    ).toBe(false);
+  });
+
 test('Q4 MR4 rejected supplied unlaunched fixture is preserved before child ownership exists', async () => {
   const source = await readFile(
     path.join(import.meta.dirname, 'api-music-queue-actions-native.test.ts'),
@@ -1846,3 +1986,790 @@ for (const method of ['fetch', 'dispatch'] as const)
       f.close();
     }
   });
+
+function ownedQueryClock(
+  api: any,
+  options: {
+    spawnError?: Error;
+    recordThrows?: boolean;
+    kill?: 'false' | 'throw';
+    nowSequence?: number[];
+  } = {},
+) {
+  let now = 0,
+    serial = 0;
+  const timers = new Map<number, { at: number; callback(): void }>(),
+    handles: any[] = [],
+    receipts: any[] = [],
+    retained = new Set<any>();
+  const scope = api.createOwnedQueryScope({
+    execFile(command: string, args: string[], settings: any, callback: any) {
+      if (options.spawnError) throw options.spawnError;
+      const child: any = new EventEmitter();
+      Object.assign(child, {
+        pid: 3000 + handles.length,
+        exitCode: null,
+        signalCode: null,
+        killed: false,
+        kills: 0,
+        command,
+        args,
+        settings,
+        callback,
+      });
+      child.kill = () => {
+        child.kills++;
+        if (options.kill === 'throw') throw Error('kill unavailable');
+        child.killed = options.kill !== 'false';
+        return options.kill !== 'false';
+      };
+      handles.push(child);
+      return child;
+    },
+    now: () => {
+      const next = options.nowSequence?.shift();
+      if (next !== undefined) now = next;
+      return now;
+    },
+    timer(callback: () => void, ms: number) {
+      const id = ++serial;
+      timers.set(id, { at: now + ms, callback });
+      return id;
+    },
+    clear: (id: number) => {
+      timers.delete(id);
+    },
+    record(value: any) {
+      if (options.recordThrows) throw Error('sink unavailable');
+      receipts.push(JSON.parse(JSON.stringify(value)));
+    },
+    retain: (owner: any) => {
+      retained.add(owner);
+    },
+    release: (owner: any) => {
+      retained.delete(owner);
+    },
+    onFailure() {},
+  });
+  const flush = async () => {
+    for (let n = 0; n < 20; n++) await Promise.resolve();
+  };
+  return {
+    scope,
+    handles,
+    receipts,
+    retained,
+    run(
+      phase = 'cohort',
+      context: any = { nativeDeadline: 25000, caseDeadline: 30000 },
+      admitted?: () => void,
+    ) {
+      let result: any;
+      const promise = scope.run(
+        'powershell.exe',
+        ['owned-only'],
+        'owned-cim-cohort',
+        phase,
+        context,
+        admitted,
+      );
+      promise.then(
+        (value: string) => {
+          result = { value };
+        },
+        (error: unknown) => {
+          result = { error };
+        },
+      );
+      return { promise, result: () => result };
+    },
+    reply(index = 0, error: any = null, stdout = '[]', stderr = '') {
+      handles[index].callback(error, stdout, stderr);
+    },
+    close(index = 0) {
+      handles[index].exitCode = 0;
+      handles[index].emit('close', 0, null);
+    },
+    setNow(value: number) {
+      now = value;
+    },
+    flush,
+    async advance(value: number) {
+      if (value < now) throw Error('Nonmonotonic virtual clock');
+      for (;;) {
+        const next = [...timers.entries()]
+          .filter(([, t]) => t.at <= value)
+          .sort((a, b) => a[1].at - b[1].at)[0];
+        if (!next) break;
+        timers.delete(next[0]);
+        now = next[1].at;
+        next[1].callback();
+        await flush();
+      }
+      now = value;
+      await flush();
+    },
+    pendingTimers: () => timers.size,
+  };
+}
+for (const adapter of [
+  'api-music-comments-native.test.ts',
+  'api-music-queue-actions-native.test.ts',
+]) {
+  test(`CIM budget ${adapter} caps, reserves and positive boundary admission`, async () => {
+    const { planOwnedQuery } = await nativeCleanupContract(adapter);
+    const phases: Record<
+      string,
+      { cap: number; after: number; cleanup: boolean }
+    > = {
+      cohort: { cap: 5000, after: 8000, cleanup: false },
+      leader: { cap: 5000, after: 2500, cleanup: false },
+      taskkill: { cap: 1000, after: 1000, cleanup: false },
+      absence: { cap: 1000, after: 250, cleanup: true },
+      'posix-identity': { cap: 1000, after: 1000, cleanup: false },
+      'posix-group-list': { cap: 1000, after: 250, cleanup: true },
+    };
+    for (const [phase, c] of Object.entries(phases))
+      for (const caseDeadline of [12000, 30000, 60000])
+        for (const nativeDeadline of [10000, 25000])
+          for (const now of [
+            -0.5, 0, 1000, 1749, 1750, 2499, 2500, 7499, 7500, 8499, 8500,
+            11499, 11500, 13499, 13500, 20000, 24999, 25000, 30000,
+          ]) {
+            const result = planOwnedQuery(phase, {
+              now,
+              nativeDeadline,
+              caseDeadline,
+              cleanupDeadline: 2000,
+            });
+            const end = c.cleanup
+              ? Math.min(2000, caseDeadline - 1000)
+              : Math.min(nativeDeadline, caseDeadline - 3000);
+            if (result.admitted) {
+              expect(result.timeoutMs).toBeGreaterThan(0);
+              expect(Number.isSafeInteger(result.timeoutMs)).toBe(true);
+              expect(result.timeoutMs).toBeLessThanOrEqual(c.cap);
+              expect(result.terminalAt + c.after).toBeLessThanOrEqual(end);
+            } else expect(result.reason).toBe('budget-exhausted');
+          }
+    expect(
+      planOwnedQuery('cohort', {
+        now: 11500,
+        nativeDeadline: 25000,
+        caseDeadline: 100000,
+      }).timeoutMs,
+    ).toBe(5000);
+    expect(
+      planOwnedQuery('cohort', {
+        now: 16499,
+        nativeDeadline: 25000,
+        caseDeadline: 100000,
+      }).timeoutMs,
+    ).toBe(1);
+    expect(
+      planOwnedQuery('cohort', {
+        now: 16500,
+        nativeDeadline: 25000,
+        caseDeadline: 100000,
+      }).admitted,
+    ).toBe(false);
+    expect(
+      planOwnedQuery('absence', {
+        now: 1249,
+        nativeDeadline: 25000,
+        caseDeadline: 30000,
+        cleanupDeadline: 2000,
+      }).timeoutMs,
+    ).toBe(1);
+    expect(
+      planOwnedQuery('absence', {
+        now: 1250,
+        nativeDeadline: 25000,
+        caseDeadline: 30000,
+        cleanupDeadline: 2000,
+      }).admitted,
+    ).toBe(false);
+    expect(
+      planOwnedQuery('cohort', {
+        now: 0,
+        nativeDeadline: 25000,
+        caseDeadline: 30000,
+        terminal: true,
+      }).admitted,
+    ).toBe(false);
+    expect(
+      planOwnedQuery('cohort', {
+        now: 0,
+        nativeDeadline: 25000,
+        caseDeadline: 30000,
+        active: true,
+      }).admitted,
+    ).toBe(false);
+  });
+  for (const order of ['callback-first', 'close-first', 'exit-not-close'])
+    test(`CIM budget ${adapter} observes callback AND actual close ${order}`, async () => {
+      const f = ownedQueryClock(await nativeCleanupContract(adapter)),
+        run = f.run();
+      if (order === 'close-first') f.close();
+      else f.reply(0, null, 'PRIVATE_PAYLOAD');
+      if (order === 'exit-not-close') {
+        f.handles[0].exitCode = 0;
+        f.handles[0].emit('exit', 0, null);
+      }
+      await f.flush();
+      expect(run.result()).toBeUndefined();
+      expect(f.scope.active()).toBe(true);
+      if (order === 'close-first') f.reply();
+      else {
+        expect(f.scope.queriesClosed()).toBe(false);
+        f.close();
+      }
+      await f.flush();
+      expect(run.result().error).toBeUndefined();
+      expect(f.scope.queriesClosed()).toBe(true);
+      expect(f.retained.size).toBe(0);
+      expect(f.pendingTimers()).toBe(0);
+      expect(JSON.stringify(f.receipts)).not.toContain('PRIVATE_PAYLOAD');
+    });
+  for (const missing of ['callback', 'close'])
+    test(`CIM budget ${adapter} terminal missing ${missing} remains sticky after late event`, async () => {
+      const f = ownedQueryClock(await nativeCleanupContract(adapter)),
+        run = f.run();
+      if (missing === 'callback') f.close();
+      else f.reply();
+      await f.advance(5500);
+      expect(run.result().error).toBeTruthy();
+      expect(f.scope.isTerminal()).toBe(true);
+      expect(f.retained.size).toBe(missing === 'close' ? 1 : 0);
+      if (missing === 'callback') f.reply();
+      else f.close();
+      await f.flush();
+      expect(f.scope.isTerminal()).toBe(true);
+      expect(f.retained.size).toBe(0);
+      await expect(f.run('leader').promise).rejects.toBe(run.result().error);
+      expect(f.handles).toHaveLength(1);
+    });
+  test(`CIM budget ${adapter} exact terminal equality rejects even when close precedes timer delivery`, async () => {
+    const f = ownedQueryClock(await nativeCleanupContract(adapter)),
+      run = f.run();
+    f.reply();
+    f.setNow(5500);
+    f.close();
+    await f.flush();
+    expect(run.result().error).toBeTruthy();
+    expect(f.retained.size).toBe(0);
+    expect(f.scope.isTerminal()).toBe(true);
+  });
+  for (const closes of [true, false])
+    test(`CIM budget ${adapter} cancellation bounded drain closes=${closes}`, async () => {
+      const f = ownedQueryClock(await nativeCleanupContract(adapter)),
+        run = f.run(),
+        original = Error('original native failure');
+      const drain = f.scope.cancel('native-test-cancel', original);
+      await f.flush();
+      expect(run.result()).toBeUndefined();
+      expect(f.handles[0].kills).toBe(1);
+      if (closes) {
+        f.close();
+        await f.flush();
+      } else {
+        await f.advance(499);
+        expect(run.result()).toBeUndefined();
+        await f.advance(500);
+      }
+      await drain;
+      expect(run.result().error).toBe(original);
+      expect(f.retained.size).toBe(closes ? 0 : 1);
+      expect(f.scope.enterCleanup()).toBe(false);
+      if (!closes) {
+        f.reply();
+        f.close();
+        await f.flush();
+      }
+      await expect(f.run('taskkill').promise).rejects.toBe(original);
+      expect(f.handles).toHaveLength(1);
+      expect(f.scope.isTerminal()).toBe(true);
+    });
+  for (const kill of ['false', 'throw'] as const)
+    test(`CIM budget ${adapter} kill ${kill} never proves close`, async () => {
+      const f = ownedQueryClock(await nativeCleanupContract(adapter), { kill }),
+        run = f.run();
+      void f.scope.cancel('cancel');
+      await f.advance(500);
+      expect(run.result().error).toBeTruthy();
+      expect(f.scope.queriesClosed()).toBe(false);
+      expect(f.retained.size).toBe(1);
+      expect(f.scope.snapshot()[0].physicalClosed).toBe(false);
+      f.close();
+      await f.flush();
+    });
+  test(`CIM budget ${adapter} internal timeout with physical close preserves original error`, async () => {
+    const f = ownedQueryClock(await nativeCleanupContract(adapter)),
+      run = f.run(),
+      error = Object.assign(Error('PRIVATE_ERROR'), {
+        killed: true,
+        signal: 'SIGTERM',
+        code: null,
+      });
+    f.setNow(5400);
+    f.reply(0, error, 'PRIVATE_STDOUT', 'PRIVATE_STDERR');
+    f.close();
+    await f.flush();
+    expect(run.result().error).toBe(error);
+    expect(f.retained.size).toBe(0);
+    expect(f.scope.snapshot()[0]).toMatchObject({
+      physicalClosed: true,
+      timeout: true,
+      killRequested: false,
+    });
+    expect(JSON.stringify(f.receipts)).not.toContain('PRIVATE');
+  });
+  test(`CIM budget ${adapter} reentry cancels owned first query without another spawn`, async () => {
+    const f = ownedQueryClock(await nativeCleanupContract(adapter)),
+      first = f.run(),
+      second = f.run('leader');
+    await f.advance(500);
+    expect(second.result().error).toBeTruthy();
+    expect(first.result().error).toBe(second.result().error);
+    expect(f.handles).toHaveLength(1);
+    f.close();
+    await f.flush();
+  });
+  test(`CIM budget ${adapter} exhausted admission never spawns or calls admitted hook`, async () => {
+    const f = ownedQueryClock(await nativeCleanupContract(adapter));
+    f.setNow(16500);
+    let admitted = false;
+    const run = f.run(
+      'cohort',
+      { nativeDeadline: 25000, caseDeadline: 100000 },
+      () => {
+        admitted = true;
+      },
+    );
+    await f.flush();
+    expect(run.result().error).toBeTruthy();
+    expect(f.handles).toHaveLength(0);
+    expect(admitted).toBe(false);
+  });
+  test(`CIM budget ${adapter} synchronous spawn failure preserves error and no tool admission`, async () => {
+    const original = Error('spawn unavailable'),
+      f = ownedQueryClock(await nativeCleanupContract(adapter), {
+        spawnError: original,
+      });
+    let admitted = false;
+    const run = f.run(
+      'taskkill',
+      { nativeDeadline: 25000, caseDeadline: 30000 },
+      () => {
+        admitted = true;
+      },
+    );
+    await f.flush();
+    expect(run.result().error).toBe(original);
+    expect(admitted).toBe(false);
+    expect(f.retained.size).toBe(0);
+    expect(f.pendingTimers()).toBe(0);
+  });
+  for (const failedQuery of [true, false])
+    test(`CIM budget ${adapter} receipt failure blocks success without masking error=${failedQuery}`, async () => {
+      const original = Error('original query error'),
+        f = ownedQueryClock(await nativeCleanupContract(adapter), {
+          recordThrows: true,
+        }),
+        run = f.run();
+      f.reply(0, failedQuery ? original : null);
+      f.close();
+      await f.flush();
+      expect(run.result().error).toBeTruthy();
+      if (failedQuery) expect(run.result().error).toBe(original);
+      expect(f.scope.isTerminal()).toBe(true);
+      expect(f.retained.size).toBe(0);
+    });
+  test(`CIM budget ${adapter} cleanup uses same deadline and ignores late success after terminal`, async () => {
+    const f = ownedQueryClock(await nativeCleanupContract(adapter));
+    expect(f.scope.enterCleanup()).toBe(true);
+    const run = f.run('absence', {
+      nativeDeadline: 25000,
+      caseDeadline: 30000,
+      cleanupDeadline: 2000,
+    });
+    expect(f.handles[0].settings.timeout).toBe(1000);
+    await f.advance(1500);
+    expect(run.result().error).toBeTruthy();
+    expect(f.retained.size).toBe(1);
+    f.reply();
+    f.close();
+    await f.flush();
+    expect(f.scope.isTerminal()).toBe(true);
+    expect(f.scope.snapshot()[0].logicalSettled).toBe(true);
+  });
+  for (const queryState of ['unknown', 'throw'])
+    test(`CIM budget ${adapter} cleanup ${queryState} queries never removes and preserves original`, async () => {
+      const api = await nativeCleanupContract(adapter),
+        events: string[] = [],
+        original = Error('original native failure');
+      const result = await api.cleanupOwnedNativeChild(undefined, {
+        now: () => 0,
+        timer: () => 1,
+        clear() {},
+        closed: () => true,
+        waitClose: async () => true,
+        queriesClosed: () => {
+          if (queryState === 'throw') throw Error('unknown');
+          return false;
+        },
+        treeEmpty: async () => {
+          events.push('absence');
+          return true;
+        },
+        remove: async () => {
+          events.push('remove');
+        },
+        record() {},
+        release() {},
+      });
+      expect(result).toMatchObject({
+        complete: false,
+        queriesClosed: false,
+        removed: false,
+      });
+      expect(events).toEqual([]);
+      expect(() =>
+        api.assertNativeCleanupComplete(result, original, '/owned'),
+      ).not.toThrow();
+      expect(() =>
+        api.assertNativeCleanupComplete(result, undefined, '/owned'),
+      ).toThrow('cleanup incomplete');
+    });
+  test(`CIM budget ${adapter} removal start and late completion are distinguished`, async () => {
+    const api = await nativeCleanupContract(adapter);
+    let now = 0,
+      release!: () => void;
+    const timers = new Map<number, () => void>();
+    let removed = false;
+    const pending = api.cleanupOwnedNativeChild(undefined, {
+      now: () => now,
+      timer: (fn: () => void) => {
+        timers.set(1, fn);
+        return 1;
+      },
+      clear: (id: number) => {
+        timers.delete(id);
+      },
+      closed: () => true,
+      waitClose: async () => true,
+      queriesClosed: () => true,
+      treeEmpty: async () => true,
+      remove: () =>
+        new Promise<void>((resolve) => {
+          release = () => {
+            removed = true;
+            resolve();
+          };
+        }),
+      record() {},
+      release() {},
+    });
+    for (let n = 0; n < 20; n++) await Promise.resolve();
+    now = 2000;
+    for (const fn of [...timers.values()]) fn();
+    const result = await pending;
+    expect(result).toMatchObject({
+      complete: false,
+      removed: false,
+      removalRequested: true,
+    });
+    expect(removed).toBe(false);
+    release();
+    await Promise.resolve();
+    expect(removed).toBe(true);
+    expect(result.complete).toBe(false);
+  });
+}
+for (const adapter of [
+  'api-music-comments-native.test.ts',
+  'api-music-queue-actions-native.test.ts',
+]) {
+  test(`CIM budget ${adapter} invalid finite admission poisons scope before spawn`, async () => {
+    const f = ownedQueryClock(await nativeCleanupContract(adapter));
+    const run = f.run('cohort', { nativeDeadline: NaN, caseDeadline: 30000 });
+    await f.flush();
+    expect(run.result().error).toBeTruthy();
+    expect(f.handles).toHaveLength(0);
+    expect(f.scope.isTerminal()).toBe(true);
+  });
+  test(`CIM budget ${adapter} rechecks budget after synchronous admission work`, async () => {
+    const f = ownedQueryClock(await nativeCleanupContract(adapter), {
+      nowSequence: [0, 20000, 20000],
+    });
+    const run = f.run();
+    await f.flush();
+    expect(run.result().error).toBeTruthy();
+    expect(f.handles).toHaveLength(0);
+    expect(f.scope.isTerminal()).toBe(true);
+    expect(f.pendingTimers()).toBe(0);
+  });
+}
+
+for (const adapter of [
+  'api-music-comments-native.test.ts',
+  'api-music-queue-actions-native.test.ts',
+]) {
+  test(`native timing ${adapter} rejects missing, inconsistent and exhausted receipts`, async () => {
+    const { ownedNativeTimingReceipt } = await nativeCleanupContract(adapter);
+    const timing = {
+      caseStartedAtMono: 100,
+      nativeStartedAtMono: 1100,
+      subjectClosedAtMono: 4000,
+      nativeWorkEndedAtMono: 4100,
+      cleanupStartedAtMono: 4200,
+      cleanupEndedAtMono: 5000,
+    };
+    expect(ownedNativeTimingReceipt(timing, 5500)).toMatchObject({
+      complete: true,
+      clock: 'host-performance.now',
+      caseElapsedMs: 5400,
+      nativeElapsedMs: 3000,
+      cleanupElapsedMs: 800,
+      postElapsedMs: 500,
+      remainingCaseAtCleanupEndMs: 25100,
+    });
+    expect(ownedNativeTimingReceipt(undefined, 5500).complete).toBe(false);
+    for (const changes of [
+      { nativeStartedAtMono: null },
+      { nativeWorkEndedAtMono: NaN },
+      { subjectClosedAtMono: null },
+      { subjectClosedAtMono: 4200 },
+      { cleanupStartedAtMono: 4000 },
+      { cleanupEndedAtMono: 6201 },
+      {
+        nativeWorkEndedAtMono: 27001,
+        cleanupStartedAtMono: 27001,
+        cleanupEndedAtMono: 27100,
+      },
+      {
+        nativeStartedAtMono: 100,
+        nativeWorkEndedAtMono: 25101,
+        cleanupStartedAtMono: 25101,
+        cleanupEndedAtMono: 25200,
+      },
+      {
+        nativeStartedAtMono: 26000,
+        subjectClosedAtMono: 27000,
+        nativeWorkEndedAtMono: 27050,
+        cleanupStartedAtMono: 28100,
+        cleanupEndedAtMono: 29101,
+      },
+    ])
+      expect(
+        ownedNativeTimingReceipt(
+          { ...timing, ...changes },
+          Math.max(5500, changes.cleanupEndedAtMono ?? 5000) + 100,
+        ).complete,
+      ).toBe(false);
+    expect(ownedNativeTimingReceipt(timing, 6001).complete).toBe(false);
+    expect(ownedNativeTimingReceipt(timing, 4900).complete).toBe(false);
+  });
+  test(`native timing ${adapter} actual assertion tail requires a complete bounded receipt`, async () => {
+    const source = await readFile(
+      path.join(import.meta.dirname, adapter),
+      'utf8',
+    );
+    const start = source.indexOf(
+      '  const timingReceipt = ownedNativeTimingReceipt(',
+    );
+    expect(start).toBeGreaterThan(0);
+    const body = source.slice(start, source.indexOf('\n});', start));
+    const { ownedNativeTimingReceipt } = await nativeCleanupContract(adapter);
+    const run = new Function(
+      'proof',
+      'performance',
+      'process',
+      'ownedNativeTimingReceipt',
+      stripTypeScriptTypes(body),
+    );
+    const receipts: string[] = [];
+    const processPort = {
+      stdout: { write: (line: string) => receipts.push(line) },
+    };
+    const timing = {
+      caseStartedAtMono: 0,
+      nativeStartedAtMono: 1000,
+      subjectClosedAtMono: 2000,
+      nativeWorkEndedAtMono: 2100,
+      cleanupStartedAtMono: 2200,
+      cleanupEndedAtMono: 3000,
+    };
+    run(
+      { ownedTiming: timing },
+      { now: () => 3500 },
+      processPort,
+      ownedNativeTimingReceipt,
+    );
+    expect(receipts).toHaveLength(1);
+    const prefix = adapter.includes('comments')
+      ? 'COM_OWNED_TIMING '
+      : 'Q4_OWNED_TIMING ';
+    expect(receipts[0].startsWith(prefix)).toBe(true);
+    const parsedReceipt = JSON.parse(receipts[0].slice(prefix.length)) as {
+      complete: boolean;
+    };
+    expect(parsedReceipt.complete).toBe(true);
+    for (const proof of [
+      {},
+      { ownedTiming: { ...timing, cleanupEndedAtMono: 29500 } },
+    ])
+      expect(() =>
+        run(proof, { now: () => 3500 }, processPort, ownedNativeTimingReceipt),
+      ).toThrow('Owned native timing evidence incomplete');
+  });
+}
+
+for (const adapter of [
+  'api-music-comments-native.test.ts',
+  'api-music-queue-actions-native.test.ts',
+])
+  test(`native subject close ${adapter} poisons inspection between queries but permits admitted retirement`, async () => {
+    const source = await readFile(
+      path.join(import.meta.dirname, adapter),
+      'utf8',
+    );
+    const start = source.indexOf("    child.once('close', () => {");
+    const body = source.slice(start, source.indexOf('\n    let stdout', start));
+    let listener: (() => void) | undefined,
+      cancellations = 0,
+      observedClose = false;
+    const run = new Function(
+      'child',
+      'nativeTiming',
+      'performance',
+      'childClosed',
+      'onChildClose',
+      'process',
+      'retirementRequested',
+      'queryScope',
+      stripTypeScriptTypes(body),
+    );
+    const child = {
+      once: (_name: string, callback: () => void) => {
+        listener = callback;
+      },
+    };
+    const scope = {
+      active: () => false,
+      cancel: async () => {
+        cancellations++;
+      },
+    };
+    for (const retirementRequested of [false, true]) {
+      const nativeTiming = { subjectClosedAtMono: null };
+      run(
+        child,
+        nativeTiming,
+        { now: () => 4500 },
+        false,
+        (value: boolean) => {
+          observedClose = value;
+        },
+        { platform: 'win32' },
+        retirementRequested,
+        scope,
+      );
+      listener!();
+      expect(observedClose).toBe(true);
+      expect(nativeTiming.subjectClosedAtMono).toBe(4500);
+      expect(cancellations).toBe(1);
+    }
+  });
+
+for (const adapter of [
+  'api-music-comments-native.test.ts',
+  'api-music-queue-actions-native.test.ts',
+]) {
+  for (const finishedAt of [1999, 2000, 2001])
+    test(`F2 cleanup ${adapter} observed removal at ${finishedAt} rejects delayed-timer overrun`, async () => {
+      const api = await nativeCleanupContract(adapter);
+      let now = 0,
+        serial = 0,
+        releases = 0;
+      const timers = new Map<number, () => void>();
+      const result = await api.cleanupOwnedNativeChild(undefined, {
+        now: () => now,
+        timer: (callback: () => void) => {
+          timers.set(++serial, callback);
+          return serial;
+        },
+        clear: (id: number) => {
+          timers.delete(id);
+        },
+        closed: () => true,
+        waitClose: async () => true,
+        queriesClosed: () => true,
+        treeEmpty: async () => true,
+        remove: async () => {
+          now = finishedAt;
+        },
+        record() {},
+        release: () => {
+          releases++;
+        },
+      });
+      expect(result).toMatchObject({
+        complete: finishedAt < 2000,
+        removed: true,
+        removalRequested: true,
+        deadlineExpired: finishedAt >= 2000,
+        endedAtMono: finishedAt,
+        errors: [],
+      });
+      expect(releases).toBe(finishedAt < 2000 ? 0 : 1);
+      expect(timers.size).toBe(0);
+      const original = Error('original failure');
+      expect(() =>
+        api.assertNativeCleanupComplete(result, original, '/owned'),
+      ).not.toThrow();
+      if (finishedAt >= 2000)
+        expect(() =>
+          api.assertNativeCleanupComplete(result, undefined, '/owned'),
+        ).toThrow('cleanup incomplete');
+    });
+  for (const stage of ['close', 'absence'])
+    test(`F2 cleanup ${adapter} delayed ${stage} completion cannot authorize removal`, async () => {
+      const api = await nativeCleanupContract(adapter);
+      let now = 0,
+        absenceCalls = 0,
+        removalCalls = 0;
+      const result = await api.cleanupOwnedNativeChild(
+        stage === 'close' ? { kill: () => true } : undefined,
+        {
+          now: () => now,
+          timer: () => 1,
+          clear() {},
+          closed: () => stage !== 'close',
+          waitClose: async () => {
+            now = 2001;
+            return true;
+          },
+          queriesClosed: () => true,
+          treeEmpty: async () => {
+            absenceCalls++;
+            now = 2001;
+            return true;
+          },
+          remove: async () => {
+            removalCalls++;
+          },
+          record() {},
+          release() {},
+        },
+      );
+      expect(result).toMatchObject({
+        complete: false,
+        deadlineExpired: true,
+        removalRequested: false,
+        removed: false,
+      });
+      expect(absenceCalls).toBe(stage === 'close' ? 0 : 1);
+      expect(removalCalls).toBe(0);
+    });
+}
