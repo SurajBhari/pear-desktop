@@ -86,7 +86,47 @@ export type MusicControlCommand =
   | { action: 'switch_repeat'; iterations: 1 | 2 }
   | { action: 'seek'; seconds: number; playbackEpoch: string }
   | { action: 'set_volume'; volume: number };
-export type MusicOperationCommand = MusicPrepareInput | MusicControlCommand;
+export type MusicQueueCommand =
+  | {
+      action: 'enqueue_song';
+      videoId: string;
+      insertPosition: 'INSERT_AT_END' | 'INSERT_AFTER_CURRENT_VIDEO';
+    }
+  | {
+      action: 'enqueue_playlist';
+      playlistId: string;
+      videoId?: string;
+      insertPosition: 'INSERT_AT_END' | 'INSERT_AFTER_CURRENT_VIDEO';
+    }
+  | {
+      action: 'remove_from_queue';
+      queueRevision: string;
+      index: number;
+      expectedVideoId: string;
+    }
+  | { action: 'clear_queue'; queueRevision: string };
+export type MusicQueueMutationInput = MusicQueueCommand & {
+  operationId: string;
+};
+export type MusicOperationCommand =
+  | MusicPrepareInput
+  | MusicControlCommand
+  | MusicQueueCommand;
+export const musicOperationScope = (
+  command: MusicOperationCommand,
+): 'queue.write' | 'playback.control' =>
+  [
+    'enqueue_song',
+    'enqueue_playlist',
+    'remove_from_queue',
+    'clear_queue',
+  ].includes(command.action)
+    ? 'queue.write'
+    : 'playback.control';
+export type NativeQueueActionValue =
+  | { version: 1; phase: 'owned_queue_dispatch'; count?: number }
+  | { version: 1; phase: 'owned_queue_noop'; count: 0 }
+  | { version: 1; phase: 'pre_effect_denial'; reason: MusicFailure };
 export type MusicControlMutationInput = MusicControlCommand & {
   operationId: string;
 };
@@ -96,13 +136,22 @@ export type NativeControlValue =
 export interface MusicOperationReceipt {
   operationId: string;
   status: 'pending' | 'accepted' | 'failed' | 'uncertain' | 'retired';
-  meaning?: 'owned_navigation_dispatch' | 'owned_control_dispatch';
+  meaning?:
+    | 'owned_navigation_dispatch'
+    | 'owned_control_dispatch'
+    | 'owned_queue_dispatch'
+    | 'owned_queue_noop';
   error?: MusicFailure | 'outcome_unknown';
 }
 export type NativeNavigationValue =
   | { version: 1; phase: 'owned_dispatch'; binding?: MetadataBinding }
   | { version: 1; phase: 'pre_effect_denial'; reason: MusicFailure };
 export type MusicReadInput =
+  | {
+      operation: 'mutate-queue';
+      command: MusicQueueCommand;
+      deadlineAt: number;
+    }
   | { operation: 'control'; command: MusicControlCommand; deadlineAt: number }
   | { operation: 'navigate'; command: MusicPrepareInput; deadlineAt: number }
   | { operation: 'lyrics'; target: MetadataTarget; deadlineAt: number }
@@ -140,6 +189,7 @@ export type MusicReadInput =
 export type NativeMusicValue =
   | NativeNavigationValue
   | NativeControlValue
+  | NativeQueueActionValue
   | NativeLyricsMetadata
   | NativeRelatedMetadata
   | NativeMetadataProbe

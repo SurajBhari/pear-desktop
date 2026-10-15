@@ -10,7 +10,12 @@ import {
   type NativeNavigationValue,
 } from '@/plugins/api-server/music-types';
 
-import { dispatchMusicControl, parseControlCommand } from './music-actions';
+import {
+  dispatchMusicControl,
+  parseControlCommand,
+  parseQueueCommand,
+  startMusicQueueAction,
+} from './music-actions';
 import { normalizeMusicSource } from './music-catalog';
 import {
   assertMetadataWorkBudget,
@@ -60,6 +65,8 @@ type Job = {
   currentMetadata?: boolean;
   navigationEntered?: boolean;
   controlEntered?: boolean;
+  queueEntered?: boolean;
+  queueCancel?: () => void;
 };
 const randomId = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
@@ -131,6 +138,26 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
     const command = parseControlCommand(value.command);
     return command
       ? { operation: 'control', command, deadlineAt: deadlineValue }
+      : null;
+  }
+  if (
+    Object.getOwnPropertyDescriptor(value, 'operation')?.value ===
+    'mutate-queue'
+  ) {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (
+      !own ||
+      (prototype !== Object.prototype && prototype !== null) ||
+      Reflect.ownKeys(value).length !== 3 ||
+      !keys.every((key) =>
+        ['operation', 'command', 'deadlineAt'].includes(key),
+      ) ||
+      !deadline
+    )
+      return null;
+    const command = parseQueueCommand(value.command);
+    return command
+      ? { operation: 'mutate-queue', command, deadlineAt: deadlineValue }
       : null;
   }
   if (own && value.operation === 'navigate' && keys.length === 3 && deadline) {
@@ -391,10 +418,16 @@ export function createMusicRendererController(
     sourceId = nextSource;
     owner = nextOwner;
     for (const job of active)
-      if (job.sourceId === expectedSource) job.canceled = true;
+      if (job.sourceId === expectedSource) {
+        job.canceled = true;
+        job.queueCancel?.();
+      }
     const retiredQueue = queued.splice(0);
     handshakes.clear();
-    for (const job of retiredQueue) job.canceled = true;
+    for (const job of retiredQueue) {
+      job.canceled = true;
+      job.queueCancel?.();
+    }
     send({ type: 'retire', documentId, sourceId: expectedSource });
     for (const job of retiredQueue)
       settled(job, { ok: false, reason: 'retired' });
@@ -690,7 +723,38 @@ export function createMusicRendererController(
           input.binding.playbackEpoch !== null) ||
         ((input.operation === 'browse' || input.operation === 'continuation') &&
           !!input.expectedCurrent);
-      if (input.operation === 'control') {
+      if (input.operation === 'mutate-queue') {
+        const current = () =>
+          !disposed &&
+          !job.canceled &&
+          sourceId === job.sourceId &&
+          same(job.owner, owner) &&
+          Date.now() < input.deadlineAt;
+        queueOwner ??= createMusicQueueOwner(apiOwner, getApi, document);
+        const handle = startMusicQueueAction(
+          apiOwner,
+          input.command,
+          queueOwner,
+          {
+            current,
+            valid: () => current() && valid(job),
+            enter: () => {
+              job.queueEntered = true;
+            },
+          },
+        );
+        job.queueCancel = handle.cancel;
+        let reply: NativeMusicResult;
+        try {
+          reply = { ok: true, value: await handle.result };
+        } catch {
+          reply = { ok: false, reason: 'source' };
+        }
+        // The sole authenticated settled packet is a physical witness, not the logical result.
+        await handle.physicalSettled;
+        job.queueCancel = undefined;
+        settled(job, reply);
+      } else if (input.operation === 'control') {
         let controlEpoch: string | null | undefined;
         // Scalar-only fence after native getter callouts: no DOM/API probing.
         const current = () => {
@@ -836,7 +900,8 @@ export function createMusicRendererController(
       settled(
         job,
         (job.input?.operation === 'navigate' && !job.navigationEntered) ||
-          (job.input?.operation === 'control' && !job.controlEntered)
+          (job.input?.operation === 'control' && !job.controlEntered) ||
+          (job.input?.operation === 'mutate-queue' && !job.queueEntered)
           ? {
               ok: true,
               value: { version: 1, phase: 'pre_effect_denial', reason },
@@ -937,6 +1002,7 @@ export function createMusicRendererController(
         job.sourceId === packet.sourceId
       ) {
         job.canceled = true;
+        job.queueCancel?.();
         const index = queued.indexOf(job);
         if (index >= 0) {
           queued.splice(index, 1);

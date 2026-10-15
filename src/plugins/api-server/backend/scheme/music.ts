@@ -1,6 +1,9 @@
 import { z } from 'zod';
 
-import { parseControlCommand } from '@/providers/music-actions';
+import {
+  parseControlCommand,
+  parseQueueCommand,
+} from '@/providers/music-actions';
 import { assertMetadataWorkBudget } from '@/providers/music-metadata';
 import { isPlaylistId, isVideoId } from '@/providers/queue-playlist';
 
@@ -469,11 +472,46 @@ export function parseMusicMutationInput(
   };
 }
 
+export function parseMusicQueueCommand(
+  value: unknown,
+): import('../../music-types').MusicQueueCommand {
+  return parseQueueCommand(value) ?? failMusic('invalid');
+}
+export function parseMusicQueueMutationInput(
+  value: unknown,
+): import('../../music-types').MusicQueueMutationInput {
+  if (
+    !navigationOwnData(value) ||
+    !value ||
+    typeof value !== 'object' ||
+    !Object.hasOwn(value, 'operationId')
+  )
+    return failMusic('invalid');
+  const { operationId, ...command } = value as Record<string, unknown>;
+  return {
+    ...parseMusicQueueCommand(command),
+    operationId: parseMusicOperationId(operationId),
+  };
+}
+
 export function parseMusicOperationPrepareInput(
   value: unknown,
 ): import('../../music-types').MusicOperationCommand {
   const command = parseControlCommand(value);
-  return command ?? parseMusicPrepareInput(value);
+  if (command) return command;
+  if (
+    navigationOwnData(value) &&
+    value &&
+    typeof value === 'object' &&
+    [
+      'enqueue_song',
+      'enqueue_playlist',
+      'remove_from_queue',
+      'clear_queue',
+    ].includes((value as { action: string }).action)
+  )
+    return parseMusicQueueCommand(value);
+  return parseMusicPrepareInput(value);
 }
 export function parseMusicControlMutationInput(
   value: unknown,

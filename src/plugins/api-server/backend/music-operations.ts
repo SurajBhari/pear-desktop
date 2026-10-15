@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto';
 
+import { grantMatches, type MusicGrantRecord } from './music-grants';
+
 import {
   failMusic,
+  musicOperationScope,
   utf8Bytes,
   type MusicOperationCommand,
   type MusicOperationReceipt,
 } from '../music-types';
 
-import type { MusicGrantRecord } from './music-grants';
 import type { MusicAdmission } from '@/providers/music-request';
 
 export const MUSIC_OPERATION_LIMITS = Object.freeze({
@@ -29,7 +31,7 @@ export interface MusicOperationRow {
   readonly id: string;
   readonly command: MusicOperationCommand;
   readonly canonical: string;
-  readonly requiredScope: 'playback.control';
+  readonly requiredScope: 'playback.control' | 'queue.write';
   readonly binding: MusicOperationBinding;
   readonly expires: number;
   readonly bytes: number;
@@ -99,7 +101,7 @@ export class MusicOperationLedger {
           id: uuid,
           command: immutable,
           canonical,
-          requiredScope: 'playback.control',
+          requiredScope: musicOperationScope(immutable),
           binding: {
             principal: binding.principal,
             resource: binding.resource,
@@ -135,7 +137,7 @@ export class MusicOperationLedger {
       id,
       command: immutable,
       canonical,
-      requiredScope: 'playback.control',
+      requiredScope: musicOperationScope(immutable),
       binding,
       expires,
       bytes,
@@ -144,7 +146,7 @@ export class MusicOperationLedger {
       physicalHold: false,
     };
     Object.defineProperty(row, 'requiredScope', {
-      value: 'playback.control',
+      value: musicOperationScope(immutable),
       enumerable: true,
       writable: false,
       configurable: false,
@@ -152,6 +154,15 @@ export class MusicOperationLedger {
     this.rows.set(id, row);
     this.schedule();
     return { ...receipt };
+  }
+  requiredScope(id: string, token: unknown, resource: string) {
+    const row = this.rows.get(id);
+    if (
+      !row ||
+      !grantMatches(row.binding.principal, token, 'rest', resource, this.now())
+    )
+      return undefined;
+    return row.requiredScope;
   }
   lookup(
     id: string,

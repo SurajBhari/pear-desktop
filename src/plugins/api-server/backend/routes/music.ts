@@ -245,6 +245,12 @@ export function registerMusicRoutes<E extends Env>(
       const route = rawTarget.split('?')[0].slice(prefix.length);
       const prepare = route === '/operations/prepare';
       const control = route === '/control';
+      const queueIndex = /^\/queue\/(0|[1-9][0-9]*)$/.exec(route)?.[1];
+      const queueMutation =
+        route === '/queue/song' ||
+        route === '/queue/playlist' ||
+        queueIndex !== undefined ||
+        (route === '/queue' && context.req.method === 'DELETE');
       const mutation = ['/play/song', '/play/playlist', '/radio'].includes(
         route,
       );
@@ -252,7 +258,7 @@ export function registerMusicRoutes<E extends Env>(
       const status = !!operationId && !prepare;
       const navigation = prepare || mutation || control || status;
       const current = route === '/current',
-        queue = route === '/queue',
+        queue = route === '/queue' && !queueMutation,
         home = route === '/home',
         library = route === '/library/playlists',
         collection = home || library,
@@ -267,11 +273,20 @@ export function registerMusicRoutes<E extends Env>(
         !prepare &&
         !mutation &&
         !control &&
+        !queueMutation &&
         route !== '/search' &&
         route !== '/browse'
       )
         return reject(404, 'not_found');
-      if (context.req.method !== (get ? 'GET' : 'POST')) return reject(405);
+      if (
+        context.req.method !==
+        (queueMutation && (route === '/queue' || queueIndex !== undefined)
+          ? 'DELETE'
+          : get
+            ? 'GET'
+            : 'POST')
+      )
+        return reject(405);
       if (
         get &&
         (incoming.headers['transfer-encoding'] !== undefined ||
@@ -280,7 +295,7 @@ export function registerMusicRoutes<E extends Env>(
         return reject(400);
       const deadlineAt =
         Date.now() +
-        (prepare || mutation || control
+        (prepare || mutation || control || queueMutation
           ? 10000
           : current || queue
             ? 5000
@@ -307,15 +322,17 @@ export function registerMusicRoutes<E extends Env>(
         Math.max(0, deadlineAt - Date.now()),
       );
       timer.unref?.();
-      const scope = navigation
-        ? 'playback.control'
-        : current || queue
-          ? 'playback.read'
-          : home
-            ? 'personalized.read'
-            : library
-              ? 'library.read'
-              : 'catalog.read';
+      const scope = queueMutation
+        ? 'queue.write'
+        : navigation
+          ? 'playback.control'
+          : current || queue
+            ? 'playback.read'
+            : home
+              ? 'personalized.read'
+              : library
+                ? 'library.read'
+                : 'catalog.read';
       let principal: MusicGrantRecord | undefined;
       const live = () =>
         !signal.aborted &&
@@ -326,10 +343,11 @@ export function registerMusicRoutes<E extends Env>(
       detachGrant = service.grants.subscribe(() => {
         if (!live()) controller.abort(new MusicServiceError('retired'));
       });
-      principal = await wait(
-        service.grants.authorize(token, 'rest', transport.resource, scope),
-        signal,
-      );
+      if (!prepare && !status)
+        principal = await wait(
+          service.grants.authorize(token, 'rest', transport.resource, scope),
+          signal,
+        );
       if (!live()) return reject(409, 'retired');
       const query = rawTarget.includes('?')
         ? rawTarget.slice(rawTarget.indexOf('?') + 1)
@@ -349,10 +367,18 @@ export function registerMusicRoutes<E extends Env>(
                 : await jsonBody(context.req.raw, incoming, signal);
       if (!live()) return reject(409, 'retired');
       if (
-        mutation &&
+        (mutation || queueMutation) &&
         input &&
         typeof input === 'object' &&
         Object.hasOwn(input, 'action')
+      )
+        return reject(400);
+      if (
+        queueIndex !== undefined &&
+        input &&
+        typeof input === 'object' &&
+        Object.hasOwn(input, 'index') &&
+        (input as { index: unknown }).index !== Number(queueIndex)
       )
         return reject(400);
       const result = await wait<
@@ -366,38 +392,58 @@ export function registerMusicRoutes<E extends Env>(
           ? service.prepare(token, input, signal, deadlineAt)
           : status
             ? service.operation(token, operationId, signal, deadlineAt)
-            : control
-              ? service.control(token, input, signal, deadlineAt)
-              : mutation
-                ? service.navigate(
-                    token,
-                    {
-                      ...(input as object),
-                      action:
-                        route === '/play/song'
-                          ? 'play_song'
-                          : route === '/play/playlist'
-                            ? 'play_playlist'
-                            : 'radio',
-                    },
-                    signal,
-                    deadlineAt,
-                  )
-                : lyrics
-                  ? service.lyrics(token, input, signal, deadlineAt)
-                  : related
-                    ? service.related(token, input, signal, deadlineAt)
-                    : current
-                      ? service.current(token, signal)
-                      : queue
-                        ? service.queue(token, input, signal)
-                        : home
-                          ? service.home(token, input, signal)
-                          : library
-                            ? service.library(token, input, signal)
-                            : route === '/search'
-                              ? service.search(token, input, signal)
-                              : service.browse(token, input, signal),
+            : queueMutation
+              ? service.mutateQueue(
+                  token,
+                  {
+                    ...(input as object),
+                    action:
+                      route === '/queue/song'
+                        ? 'enqueue_song'
+                        : route === '/queue/playlist'
+                          ? 'enqueue_playlist'
+                          : queueIndex !== undefined
+                            ? 'remove_from_queue'
+                            : 'clear_queue',
+                    ...(queueIndex !== undefined
+                      ? { index: Number(queueIndex) }
+                      : {}),
+                  },
+                  signal,
+                  deadlineAt,
+                )
+              : control
+                ? service.control(token, input, signal, deadlineAt)
+                : mutation
+                  ? service.navigate(
+                      token,
+                      {
+                        ...(input as object),
+                        action:
+                          route === '/play/song'
+                            ? 'play_song'
+                            : route === '/play/playlist'
+                              ? 'play_playlist'
+                              : 'radio',
+                      },
+                      signal,
+                      deadlineAt,
+                    )
+                  : lyrics
+                    ? service.lyrics(token, input, signal, deadlineAt)
+                    : related
+                      ? service.related(token, input, signal, deadlineAt)
+                      : current
+                        ? service.current(token, signal)
+                        : queue
+                          ? service.queue(token, input, signal)
+                          : home
+                            ? service.home(token, input, signal)
+                            : library
+                              ? service.library(token, input, signal)
+                              : route === '/search'
+                                ? service.search(token, input, signal)
+                                : service.browse(token, input, signal),
         signal,
       );
       if (!live()) return reject(409, 'retired');

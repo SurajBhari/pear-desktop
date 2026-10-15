@@ -218,6 +218,7 @@ export function createMusicQueueOwner(
   let disposed = false,
     reading = false,
     observing = false,
+    effecting = false,
     binding: Binding | undefined,
     release: (() => void) | undefined,
     fingerprint: string | undefined,
@@ -596,7 +597,13 @@ export function createMusicQueueOwner(
       structure: structure(finalQueue),
     };
   };
-  const snapshot = (): NativeQueueSnapshot => {
+  const sample = <T>(
+    finish: (
+      value: NativeQueueSnapshot,
+      native: Binding,
+      structure: Structure,
+    ) => T,
+  ): T => {
     if (reading || observing) {
       changedDuringRead = true;
       rotate();
@@ -626,7 +633,7 @@ export function createMusicQueueOwner(
         const subscribed = next;
         const unsub = subscribed.subscribe.call(subscribed.store, () => {
           if (disposed || binding !== subscribed) return;
-          if (reading || observing) {
+          if ((reading && !effecting) || observing) {
             changedDuringRead = true;
             rotate();
             return;
@@ -675,7 +682,7 @@ export function createMusicQueueOwner(
       scalarFence();
       fingerprint = nextFingerprint;
       observed = sampled.structure;
-      return result;
+      return finish(result, next, sampled.structure);
     } catch (error) {
       rotate();
       const unsub = release;
@@ -691,8 +698,105 @@ export function createMusicQueueOwner(
       reading = false;
     }
   };
+  const snapshot = () => sample((value) => value);
+  const prepareMutation = (input: {
+    queueRevision: string;
+    index?: number;
+    expectedVideoId?: string;
+  }) =>
+    sample((value, native, expected) => {
+      if (
+        value.queueRevision !== input.queueRevision ||
+        (input.index !== undefined &&
+          (!Number.isInteger(input.index) ||
+            input.index < 0 ||
+            expected.slots[input.index]?.videoId !== input.expectedVideoId))
+      )
+        return failMusic('retired');
+      const capturedRevision = value.queueRevision;
+      let used = false;
+      return Object.freeze({
+        commit(kind: 'remove' | 'clear', beforeEffect: () => void) {
+          if (used) return failMusic('retired');
+          used = true;
+          return sample((fresh, current, currentStructure) => {
+            if (
+              current !== native ||
+              fresh.queueRevision !== capturedRevision ||
+              !sameStructure(expected, currentStructure) ||
+              (kind === 'remove' && input.index === undefined)
+            )
+              return failMusic('retired');
+            // Only data-valued native methods can cross the final no-getter fence.
+            const dispatchFence = lookup(native.element, 'dispatch');
+            const storeFence =
+              kind === 'clear' ? lookup(native.store, 'dispatch') : undefined;
+            const dispatch = dispatchFence.descriptor?.value as unknown;
+            const storeDispatch = storeFence?.descriptor?.value as unknown;
+            if (
+              typeof dispatch !== 'function' ||
+              (kind === 'clear' && typeof storeDispatch !== 'function')
+            )
+              return failMusic('unavailable');
+            const final = () => {
+              check(native);
+              const structure = observeStructure(native);
+              if (
+                queueRevision !== capturedRevision ||
+                !sameStructure(expected, structure)
+              )
+                return failMusic('retired');
+              if (
+                !equalDescriptor(
+                  dispatchFence,
+                  lookup(native.element, 'dispatch'),
+                ) ||
+                (storeFence &&
+                  !equalDescriptor(
+                    storeFence,
+                    lookup(native.store, 'dispatch'),
+                  ))
+              )
+                return failMusic('retired');
+              nonCallingFence(native);
+              scalarFence();
+            };
+            final();
+            beforeEffect();
+            final();
+            effecting = true;
+            try {
+              if (kind === 'clear') {
+                Reflect.apply(
+                  storeDispatch as (...args: unknown[]) => unknown,
+                  native.store,
+                  [{ type: 'SET_PLAYER_PAGE_INFO', payload: { open: false } }],
+                );
+                final();
+              }
+              Reflect.apply(
+                dispatch as (...args: unknown[]) => unknown,
+                native.element,
+                [
+                  kind === 'clear'
+                    ? { type: 'CLEAR' }
+                    : { type: 'REMOVE_ITEM', payload: input.index },
+                ],
+              );
+            } finally {
+              effecting = false;
+            }
+            return {
+              version: 1 as const,
+              phase: 'owned_queue_dispatch' as const,
+            };
+          });
+        },
+      });
+    });
   return {
     snapshot,
+    prepareMutation,
     dispose() {
       if (disposed) return;
       disposed = true;

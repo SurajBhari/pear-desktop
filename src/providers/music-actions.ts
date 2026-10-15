@@ -3,8 +3,13 @@ import {
   type MetadataBinding,
   type MusicControlCommand,
   type NativeControlValue,
+  type MusicQueueCommand,
+  type NativeQueueActionValue,
 } from '@/plugins/api-server/music-types';
 
+import { isPlaylistId, isVideoId, isInsertPosition } from './queue-playlist';
+
+import type { createMusicQueueOwner } from './music-queue';
 import type { createPlaylistQueueController } from './queue-playlist-renderer';
 import type { createRepeatPreference } from './repeat-preference';
 import type { MusicPlayer } from '@/types/music-player';
@@ -395,4 +400,185 @@ export function dispatchMusicControl(
   target();
   after?.();
   return { version: 1, phase: 'owned_control_dispatch' };
+}
+
+/** Queue commands are copied from strict own-data, shared by REST and actor. */
+export function parseQueueCommand(value: unknown): MusicQueueCommand | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const data: Record<string, unknown> = Object.create(null) as Record<
+    string,
+    unknown
+  >;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') return null;
+    const d = Object.getOwnPropertyDescriptor(value, key);
+    if (!d || !('value' in d)) return null;
+    data[key] = d.value;
+  }
+  const action = data.action;
+  const only = (keys: string[]) =>
+    Object.keys(data).every((key) => keys.includes(key));
+  if (action === 'enqueue_song' || action === 'enqueue_playlist') {
+    const insertPosition =
+      data.insertPosition === undefined ? 'INSERT_AT_END' : data.insertPosition;
+    if (!isInsertPosition(insertPosition)) return null;
+    if (action === 'enqueue_song')
+      return only(['action', 'videoId', 'insertPosition']) &&
+        isVideoId(data.videoId)
+        ? { action, videoId: data.videoId, insertPosition }
+        : null;
+    if (
+      !only(['action', 'playlistId', 'videoId', 'insertPosition']) ||
+      !isPlaylistId(data.playlistId) ||
+      (data.videoId !== undefined && !isVideoId(data.videoId))
+    )
+      return null;
+    return {
+      action,
+      playlistId: data.playlistId,
+      ...(data.videoId !== undefined ? { videoId: data.videoId } : {}),
+      insertPosition,
+    };
+  }
+  const queueRevision = data.queueRevision;
+  if (
+    typeof queueRevision !== 'string' ||
+    !/^[0-9a-f]{32}$/.test(queueRevision)
+  )
+    return null;
+  if (action === 'clear_queue')
+    return only(['action', 'queueRevision']) ? { action, queueRevision } : null;
+  if (action === 'remove_from_queue') {
+    const index = data.index,
+      expectedVideoId = data.expectedVideoId;
+    return only(['action', 'queueRevision', 'index', 'expectedVideoId']) &&
+      typeof index === 'number' &&
+      Number.isInteger(index) &&
+      index >= 0 &&
+      index < 2048 &&
+      isVideoId(expectedVideoId)
+      ? { action, queueRevision, index, expectedVideoId }
+      : null;
+  }
+  return null;
+}
+
+export function startMusicQueueAction(
+  api: MusicPlayer,
+  command: MusicQueueCommand,
+  queueOwner: ReturnType<typeof createMusicQueueOwner>,
+  context: {
+    current(this: void): boolean;
+    valid(this: void): boolean;
+    enter(this: void): void;
+  },
+) {
+  const owner = getMusicActionsOwner(api);
+  if (!owner) throw new MusicServiceError('unavailable');
+  const links: Link[] = [],
+    absent: { object: object; key: string }[] = [];
+  const current = () =>
+    getMusicActionsOwner(api) === owner && context.current();
+  const fence = () => {
+    if (
+      !current() ||
+      !owner.current() ||
+      !current() ||
+      !context.valid() ||
+      !current()
+    )
+      throw new MusicServiceError('retired');
+    for (let i = links.length - 1; i >= 0; i--)
+      if (!unchanged(links[i]) || !current())
+        throw new MusicServiceError('retired');
+    for (const item of absent)
+      if (descriptor(item.object, item.key))
+        throw new MusicServiceError('retired');
+    for (const link of links)
+      if (!unchanged(link, false)) throw new MusicServiceError('retired');
+    if (!current() || !owner.nativeCurrent() || !current())
+      throw new MusicServiceError('retired');
+  };
+  const guardLink = descriptor(window, 'blockerSceneGuard')
+    ? capture(window, 'blockerSceneGuard')
+    : undefined;
+  if (guardLink) links.push(guardLink);
+  else absent.push({ object: window, key: 'blockerSceneGuard' });
+  const guard = guardLink?.value;
+  let cancel: Link | undefined;
+  if (guard !== undefined && guard !== null) {
+    if (typeof guard !== 'object') throw new MusicServiceError('unavailable');
+    cancel = method(guard, 'cancelFromUser');
+    links.push(cancel);
+  }
+  const beforeEffect = () => {
+    fence();
+    if (cancel) {
+      context.enter();
+      Reflect.apply(cancel.value as (...args: unknown[]) => unknown, guard, []);
+      fence();
+    }
+  };
+  if (
+    command.action === 'enqueue_song' ||
+    command.action === 'enqueue_playlist'
+  ) {
+    const enqueue = method(owner.playlistQueue, 'enqueueOwned');
+    links.push(enqueue);
+    fence();
+    const input =
+      command.action === 'enqueue_song'
+        ? { videoId: command.videoId, insertPosition: command.insertPosition }
+        : {
+            playlistId: command.playlistId,
+            ...(command.videoId ? { videoId: command.videoId } : {}),
+            insertPosition: command.insertPosition,
+          };
+    return Reflect.apply(
+      enqueue.value as (...args: unknown[]) => unknown,
+      owner.playlistQueue,
+      [
+        input,
+        {
+          current: () =>
+            current() &&
+            owner.current() &&
+            current() &&
+            owner.nativeCurrent() &&
+            current(),
+          scalarCurrent: current,
+          nativeCurrent: () => owner.nativeCurrent(),
+          enter: context.enter,
+          beforeEffect,
+        },
+      ],
+    ) as ReturnType<typeof owner.playlistQueue.enqueueOwned>;
+  }
+  const mutation = queueOwner.prepareMutation(command);
+  const retire =
+    command.action === 'clear_queue'
+      ? method(owner.playlistQueue, 'retireOwned')
+      : undefined;
+  if (retire) links.push(retire);
+  const value = mutation.commit(
+    command.action === 'clear_queue' ? 'clear' : 'remove',
+    () => {
+      beforeEffect();
+      context.enter();
+      if (retire)
+        Reflect.apply(
+          retire.value as (...args: unknown[]) => unknown,
+          owner.playlistQueue,
+          [],
+        );
+      fence();
+    },
+  );
+  return {
+    result: Promise.resolve(value as NativeQueueActionValue),
+    physicalSettled: Promise.resolve(),
+    cancel(this: void) {},
+  };
 }

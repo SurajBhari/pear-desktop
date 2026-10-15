@@ -26,6 +26,7 @@ import {
   parseNativeSnapshot,
   parseMusicOperationPrepareInput,
   parseMusicControlMutationInput,
+  parseMusicQueueMutationInput,
   parseMusicMutationInput,
   parseMusicOperationId,
   type MusicTarget,
@@ -36,6 +37,7 @@ import {
   MUSIC_LIMITS,
   MusicServiceError,
   failMusic,
+  musicOperationScope,
   utf8Bytes,
   type MusicScope,
   type MusicReadInput,
@@ -432,14 +434,15 @@ export class MusicService {
     deadlineAt?: number,
   ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
+    const command = parseMusicOperationPrepareInput(input),
+      scope = musicOperationScope(command);
     return this.admitted(
       token,
-      'playback.control',
+      scope,
       [],
       signal,
       false,
       (lease) => {
-        const command = parseMusicOperationPrepareInput(input);
         return Promise.resolve(
           this.operations.prepare(command, {
             principal: lease.principal,
@@ -450,7 +453,7 @@ export class MusicService {
             current: () =>
               this.enabled &&
               this.revision === lease.revision &&
-              this.grants.isCurrent(lease.principal, 'playback.control') &&
+              this.grants.isCurrent(lease.principal, scope) &&
               this.resource === lease.resource &&
               this.broker.isCurrent(lease.admission),
           }),
@@ -472,15 +475,19 @@ export class MusicService {
     )
       return failMusic('retired');
   }
-  operation(
+  async operation(
     token: unknown,
     operationId: unknown,
     signal?: AbortSignal,
     deadlineAt?: number,
   ) {
+    const id = parseMusicOperationId(operationId);
+    const scope =
+      this.operations.requiredScope(id, token, this.resource) ??
+      'playback.control';
     return this.admitted(
       token,
-      'playback.control',
+      scope,
       [],
       signal,
       false,
@@ -667,6 +674,136 @@ export class MusicService {
                 operationId,
                 status: 'accepted',
                 meaning: 'owned_control_dispatch',
+              };
+            else if (
+              value.phase === 'pre_effect_denial' &&
+              keys.length === 3 &&
+              keys.every(
+                (key) =>
+                  typeof key === 'string' &&
+                  ['version', 'phase', 'reason'].includes(key),
+              ) &&
+              [
+                'invalid',
+                'source',
+                'unsupported',
+                'budget',
+                'retired',
+                'busy',
+                'unavailable',
+                'timeout',
+              ].includes(value.reason)
+            )
+              row.receipt = {
+                operationId,
+                status: 'failed',
+                error: value.reason,
+              };
+            else throw new MusicServiceError('source');
+          } catch (error) {
+            const code =
+              error instanceof MusicServiceError ? error.code : 'source';
+            row.receipt = row.notAdmitted
+              ? { operationId, status: 'failed', error: code }
+              : { operationId, status: 'uncertain', error: 'outcome_unknown' };
+          } finally {
+            this.operations.completed(row);
+          }
+          return this.operations.receipt(row);
+        })();
+        return row.promise;
+      },
+      deadline,
+    );
+  }
+  mutateQueue(
+    token: unknown,
+    input: unknown,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ) {
+    const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
+    return this.admitted(
+      token,
+      'queue.write',
+      [],
+      signal,
+      false,
+      async (lease) => {
+        const { operationId, ...command } = parseMusicQueueMutationInput(input);
+        const row = this.operations.lookup(
+          operationId,
+          lease.principal,
+          lease.resource,
+          (row) => this.requireOperationContext(lease, row),
+        );
+        if (JSON.stringify(command) !== row.canonical)
+          return failMusic('conflict');
+        const receipt = this.operations.receipt(row);
+        if (receipt.status !== 'pending') return receipt;
+        if (row.executing) return row.promise!;
+        // Claim before the broker or any native callout can reenter. A duplicate's
+        // signal only cancels its own admitted wait, never this first caller's job.
+        row.executing = true;
+        row.physicalHold = true;
+        row.promise = (async (): Promise<MusicOperationReceipt> => {
+          try {
+            const value = await this.broker.read(
+              lease.admission,
+              {
+                operation: 'mutate-queue',
+                command,
+                deadlineAt: lease.deadline,
+              },
+              lease.principal.id,
+              {
+                signal: lease.signal,
+                deadline: lease.deadline,
+                isCurrent: () => lease.current(),
+                onPhysicalSettled: (reason) =>
+                  this.operations.settled(row, reason === 'not_admitted'),
+              },
+            );
+            const keys = Reflect.ownKeys(value);
+            const prototype: unknown = Object.getPrototypeOf(value);
+            const own =
+              (prototype === Object.prototype || prototype === null) &&
+              keys.every((key) => {
+                const d = Object.getOwnPropertyDescriptor(value, key);
+                return typeof key === 'string' && !!d && 'value' in d;
+              });
+            if (!own || !('phase' in value) || value.version !== 1)
+              throw new MusicServiceError('source');
+            const insertion =
+              command.action === 'enqueue_song' ||
+              command.action === 'enqueue_playlist';
+            const dispatch =
+              value.phase === 'owned_queue_dispatch' &&
+              (insertion
+                ? keys.length === 3 &&
+                  'count' in value &&
+                  Number.isInteger(value.count) &&
+                  value.count! >= 1 &&
+                  value.count! <= 1000
+                : keys.length === 2) &&
+              keys.every((key) =>
+                ['version', 'phase', ...(insertion ? ['count'] : [])].includes(
+                  key as string,
+                ),
+              );
+            const noop =
+              insertion &&
+              value.phase === 'owned_queue_noop' &&
+              keys.length === 3 &&
+              value.count === 0 &&
+              keys.every((key) =>
+                ['version', 'phase', 'count'].includes(key as string),
+              );
+            if (dispatch || noop)
+              row.receipt = {
+                operationId,
+                status: 'accepted',
+                meaning: noop ? 'owned_queue_noop' : 'owned_queue_dispatch',
               };
             else if (
               value.phase === 'pre_effect_denial' &&
