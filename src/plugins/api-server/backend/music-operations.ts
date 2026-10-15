@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import {
   failMusic,
   utf8Bytes,
-  type MusicPrepareInput,
+  type MusicOperationCommand,
   type MusicOperationReceipt,
 } from '../music-types';
 
@@ -27,8 +27,9 @@ export interface MusicOperationBinding {
 }
 export interface MusicOperationRow {
   readonly id: string;
-  readonly command: MusicPrepareInput;
+  readonly command: MusicOperationCommand;
   readonly canonical: string;
+  readonly requiredScope: 'playback.control';
   readonly binding: MusicOperationBinding;
   readonly expires: number;
   readonly bytes: number;
@@ -45,7 +46,7 @@ export function musicOperationLedger(now: () => number) {
   }
   return ledger;
 }
-function freezeCommand(command: MusicPrepareInput): MusicPrepareInput {
+function freezeCommand(command: MusicOperationCommand): MusicOperationCommand {
   if (command.action === 'radio')
     return Object.freeze({
       action: 'radio',
@@ -82,7 +83,7 @@ export class MusicOperationLedger {
     }
   }
   prepare(
-    command: MusicPrepareInput,
+    command: MusicOperationCommand,
     binding: MusicOperationBinding,
   ): MusicOperationReceipt {
     this.purge();
@@ -98,6 +99,7 @@ export class MusicOperationLedger {
           id: uuid,
           command: immutable,
           canonical,
+          requiredScope: 'playback.control',
           binding: {
             principal: binding.principal,
             resource: binding.resource,
@@ -129,17 +131,25 @@ export class MusicOperationLedger {
     if (!binding.current()) return failMusic('retired');
     const id = randomUUID(),
       receipt: MusicOperationReceipt = { operationId: id, status: 'pending' };
-    this.rows.set(id, {
+    const row: MusicOperationRow = {
       id,
       command: immutable,
       canonical,
+      requiredScope: 'playback.control',
       binding,
       expires,
       bytes,
       receipt,
       executing: false,
       physicalHold: false,
+    };
+    Object.defineProperty(row, 'requiredScope', {
+      value: 'playback.control',
+      enumerable: true,
+      writable: false,
+      configurable: false,
     });
+    this.rows.set(id, row);
     this.schedule();
     return { ...receipt };
   }

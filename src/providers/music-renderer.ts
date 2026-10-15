@@ -10,6 +10,7 @@ import {
   type NativeNavigationValue,
 } from '@/plugins/api-server/music-types';
 
+import { dispatchMusicControl, parseControlCommand } from './music-actions';
 import { normalizeMusicSource } from './music-catalog';
 import {
   assertMetadataWorkBudget,
@@ -58,6 +59,7 @@ type Job = {
   playbackRetired?: boolean;
   currentMetadata?: boolean;
   navigationEntered?: boolean;
+  controlEntered?: boolean;
 };
 const randomId = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
@@ -111,6 +113,26 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
     typeof deadlineValue === 'number' &&
     Number.isFinite(deadlineValue) &&
     deadlineValue > 0;
+  if (
+    Object.getOwnPropertyDescriptor(value, 'operation')?.value === 'control'
+  ) {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (
+      !own ||
+      (prototype !== Object.prototype && prototype !== null) ||
+      Reflect.ownKeys(value).length !== 3 ||
+      keys.length !== 3 ||
+      !keys.every((key) =>
+        ['operation', 'command', 'deadlineAt'].includes(key),
+      ) ||
+      !deadline
+    )
+      return null;
+    const command = parseControlCommand(value.command);
+    return command
+      ? { operation: 'control', command, deadlineAt: deadlineValue }
+      : null;
+  }
   if (own && value.operation === 'navigate' && keys.length === 3 && deadline) {
     const command = parseNavigationCommand(value.command);
     if (command)
@@ -668,7 +690,37 @@ export function createMusicRendererController(
           input.binding.playbackEpoch !== null) ||
         ((input.operation === 'browse' || input.operation === 'continuation') &&
           !!input.expectedCurrent);
-      if (input.operation === 'navigate') {
+      if (input.operation === 'control') {
+        let controlEpoch: string | null | undefined;
+        // Scalar-only fence after native getter callouts: no DOM/API probing.
+        const current = () => {
+          if (Date.now() >= input.deadlineAt)
+            throw new MusicServiceError('timeout');
+          return (
+            !disposed &&
+            !job.canceled &&
+            !job.playbackRetired &&
+            sourceId === job.sourceId &&
+            same(job.owner, owner) &&
+            (controlEpoch === undefined ||
+              controlEpoch === `${documentId}:${playbackEpoch}`)
+          );
+        };
+        const value = dispatchMusicControl(apiOwner, input.command, {
+          valid: () => current() && valid(job),
+          current,
+          probe: () => {
+            const binding = probe(job);
+            if (controlEpoch === undefined)
+              controlEpoch = binding.playbackEpoch;
+            return binding;
+          },
+          enter: () => {
+            job.controlEntered = true;
+          },
+        });
+        settled(job, { ok: true, value });
+      } else if (input.operation === 'navigate') {
         const value = await navigate(job, input);
         settled(job, { ok: true, value });
       } else if (
@@ -783,7 +835,8 @@ export function createMusicRendererController(
           : 'source';
       settled(
         job,
-        job.input?.operation === 'navigate' && !job.navigationEntered
+        (job.input?.operation === 'navigate' && !job.navigationEntered) ||
+          (job.input?.operation === 'control' && !job.controlEntered)
           ? {
               ok: true,
               value: { version: 1, phase: 'pre_effect_denial', reason },

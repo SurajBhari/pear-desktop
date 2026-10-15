@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { parseControlCommand } from '@/providers/music-actions';
 import { assertMetadataWorkBudget } from '@/providers/music-metadata';
 import { isPlaylistId, isVideoId } from '@/providers/queue-playlist';
 
@@ -466,4 +467,26 @@ export function parseMusicMutationInput(
     ...parseMusicPrepareInput(command),
     operationId: parseMusicOperationId(operationId),
   };
+}
+
+export function parseMusicOperationPrepareInput(
+  value: unknown,
+): import('../../music-types').MusicOperationCommand {
+  const command = parseControlCommand(value);
+  return command ?? parseMusicPrepareInput(value);
+}
+export function parseMusicControlMutationInput(
+  value: unknown,
+): import('../../music-types').MusicControlMutationInput {
+  if (
+    !navigationOwnData(value) ||
+    !value ||
+    typeof value !== 'object' ||
+    !Object.hasOwn(value, 'operationId')
+  )
+    return failMusic('invalid');
+  const { operationId, ...data } = value as Record<string, unknown>;
+  const command = parseControlCommand(data);
+  if (!command) return failMusic('invalid');
+  return { ...command, operationId: parseMusicOperationId(operationId) };
 }

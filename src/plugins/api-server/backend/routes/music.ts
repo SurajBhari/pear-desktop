@@ -244,12 +244,13 @@ export function registerMusicRoutes<E extends Env>(
         return reject(400);
       const route = rawTarget.split('?')[0].slice(prefix.length);
       const prepare = route === '/operations/prepare';
+      const control = route === '/control';
       const mutation = ['/play/song', '/play/playlist', '/radio'].includes(
         route,
       );
       const operationId = /^\/operations\/([^/]+)$/.exec(route)?.[1];
       const status = !!operationId && !prepare;
-      const navigation = prepare || mutation || status;
+      const navigation = prepare || mutation || control || status;
       const current = route === '/current',
         queue = route === '/queue',
         home = route === '/home',
@@ -265,6 +266,7 @@ export function registerMusicRoutes<E extends Env>(
         !get &&
         !prepare &&
         !mutation &&
+        !control &&
         route !== '/search' &&
         route !== '/browse'
       )
@@ -278,7 +280,11 @@ export function registerMusicRoutes<E extends Env>(
         return reject(400);
       const deadlineAt =
         Date.now() +
-        (prepare || mutation ? 10000 : current || queue ? 5000 : 15000);
+        (prepare || mutation || control
+          ? 10000
+          : current || queue
+            ? 5000
+            : 15000);
       const controller = new AbortController();
       const socketLost = () => {
         if (!outgoing.writableFinished)
@@ -360,36 +366,38 @@ export function registerMusicRoutes<E extends Env>(
           ? service.prepare(token, input, signal, deadlineAt)
           : status
             ? service.operation(token, operationId, signal, deadlineAt)
-            : mutation
-              ? service.navigate(
-                  token,
-                  {
-                    ...(input as object),
-                    action:
-                      route === '/play/song'
-                        ? 'play_song'
-                        : route === '/play/playlist'
-                          ? 'play_playlist'
-                          : 'radio',
-                  },
-                  signal,
-                  deadlineAt,
-                )
-              : lyrics
-                ? service.lyrics(token, input, signal, deadlineAt)
-                : related
-                  ? service.related(token, input, signal, deadlineAt)
-                  : current
-                    ? service.current(token, signal)
-                    : queue
-                      ? service.queue(token, input, signal)
-                      : home
-                        ? service.home(token, input, signal)
-                        : library
-                          ? service.library(token, input, signal)
-                          : route === '/search'
-                            ? service.search(token, input, signal)
-                            : service.browse(token, input, signal),
+            : control
+              ? service.control(token, input, signal, deadlineAt)
+              : mutation
+                ? service.navigate(
+                    token,
+                    {
+                      ...(input as object),
+                      action:
+                        route === '/play/song'
+                          ? 'play_song'
+                          : route === '/play/playlist'
+                            ? 'play_playlist'
+                            : 'radio',
+                    },
+                    signal,
+                    deadlineAt,
+                  )
+                : lyrics
+                  ? service.lyrics(token, input, signal, deadlineAt)
+                  : related
+                    ? service.related(token, input, signal, deadlineAt)
+                    : current
+                      ? service.current(token, signal)
+                      : queue
+                        ? service.queue(token, input, signal)
+                        : home
+                          ? service.home(token, input, signal)
+                          : library
+                            ? service.library(token, input, signal)
+                            : route === '/search'
+                              ? service.search(token, input, signal)
+                              : service.browse(token, input, signal),
         signal,
       );
       if (!live()) return reject(409, 'retired');

@@ -73,16 +73,37 @@ export type MusicPrepareInput =
         | { kind: 'current' };
     };
 export type MusicMutationInput = MusicPrepareInput & { operationId: string };
+export type MusicControlCommand =
+  | {
+      action:
+        | 'previous'
+        | 'next'
+        | 'play'
+        | 'pause'
+        | 'toggle_playback'
+        | 'toggle_shuffle';
+    }
+  | { action: 'switch_repeat'; iterations: 1 | 2 }
+  | { action: 'seek'; seconds: number; playbackEpoch: string }
+  | { action: 'set_volume'; volume: number };
+export type MusicOperationCommand = MusicPrepareInput | MusicControlCommand;
+export type MusicControlMutationInput = MusicControlCommand & {
+  operationId: string;
+};
+export type NativeControlValue =
+  | { version: 1; phase: 'owned_control_dispatch' }
+  | { version: 1; phase: 'pre_effect_denial'; reason: MusicFailure };
 export interface MusicOperationReceipt {
   operationId: string;
   status: 'pending' | 'accepted' | 'failed' | 'uncertain' | 'retired';
-  meaning?: 'owned_navigation_dispatch';
+  meaning?: 'owned_navigation_dispatch' | 'owned_control_dispatch';
   error?: MusicFailure | 'outcome_unknown';
 }
 export type NativeNavigationValue =
   | { version: 1; phase: 'owned_dispatch'; binding?: MetadataBinding }
   | { version: 1; phase: 'pre_effect_denial'; reason: MusicFailure };
 export type MusicReadInput =
+  | { operation: 'control'; command: MusicControlCommand; deadlineAt: number }
   | { operation: 'navigate'; command: MusicPrepareInput; deadlineAt: number }
   | { operation: 'lyrics'; target: MetadataTarget; deadlineAt: number }
   | { operation: 'related'; target: MetadataTarget; deadlineAt: number }
@@ -118,6 +139,7 @@ export type MusicReadInput =
     };
 export type NativeMusicValue =
   | NativeNavigationValue
+  | NativeControlValue
   | NativeLyricsMetadata
   | NativeRelatedMetadata
   | NativeMetadataProbe

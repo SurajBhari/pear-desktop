@@ -45,6 +45,12 @@ async function entry() {
       'utf8',
     ),
   );
+  const actions = strip(
+    await readFile(
+      new URL('../src/providers/music-actions.ts', import.meta.url),
+      'utf8',
+    ),
+  );
   const audio = strip(
     await readFile(
       new URL('../src/providers/renderer-audio.ts', import.meta.url),
@@ -64,7 +70,7 @@ async function entry() {
   const boundary = `const fixture=globalThis[${JSON.stringify(key)}];const window=fixture.dom;const document=window.document;const {Element,HTMLElement,Event,CustomEvent}=window;const createPlaylistQueueController=fixture.make;const setTheme=()=>{};const registerWindowDefaultTrustedTypePolicy=()=>{};const LoggerPrefix='fixture';const retireLanguageRequests=()=>{};const i18t=x=>x;const getAllLoadedRendererPlugins=()=>({});const startingPages={};class AudioContext extends window.EventTarget{destination={};createGain(){return{gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return{mediaElement:element,connect(){},disconnect(){}}}};`;
   const source = await import(
     'data:text/javascript;base64,' +
-      Buffer.from(boundary + repeat + audio + raw).toString('base64')
+      Buffer.from(boundary + actions + repeat + audio + raw).toString('base64')
   );
   await source.listenForApiLoad();
   return {
