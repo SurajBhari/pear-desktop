@@ -9,6 +9,7 @@ import { parseMusicBearer, type MusicGrantRecord } from '../music-grants';
 import {
   parseMusicQueueQuery,
   parseMusicLyricsQuery,
+  parseMusicCommentsQuery,
   parseMusicRelatedQuery,
   parseMusicCollectionQuery,
 } from '../scheme/music';
@@ -263,8 +264,9 @@ export function registerMusicRoutes<E extends Env>(
         library = route === '/library/playlists',
         collection = home || library,
         lyrics = route === '/song/lyrics',
+        comments = route === '/song/comments',
         related = route === '/song/related',
-        metadata = lyrics || related,
+        metadata = lyrics || related || comments,
         get = current || queue || collection || metadata || status;
       if (rawTarget.includes('?') && !queue && !collection && !metadata)
         return reject(400);
@@ -328,11 +330,13 @@ export function registerMusicRoutes<E extends Env>(
           ? 'playback.control'
           : current || queue
             ? 'playback.read'
-            : home
-              ? 'personalized.read'
-              : library
-                ? 'library.read'
-                : 'catalog.read';
+            : comments
+              ? 'comments.read'
+              : home
+                ? 'personalized.read'
+                : library
+                  ? 'library.read'
+                  : 'catalog.read';
       let principal: MusicGrantRecord | undefined;
       const live = () =>
         !signal.aborted &&
@@ -354,17 +358,19 @@ export function registerMusicRoutes<E extends Env>(
         : '';
       if ((queue || collection || metadata) && /[%#\\]/.test(query))
         return reject(400);
-      const input = lyrics
-        ? parseMusicLyricsQuery(new URLSearchParams(query))
-        : related
-          ? parseMusicRelatedQuery(new URLSearchParams(query))
-          : current || status
-            ? undefined
-            : queue
-              ? parseMusicQueueQuery(new URLSearchParams(query))
-              : collection
-                ? parseMusicCollectionQuery(new URLSearchParams(query))
-                : await jsonBody(context.req.raw, incoming, signal);
+      const input = comments
+        ? parseMusicCommentsQuery(new URLSearchParams(query))
+        : lyrics
+          ? parseMusicLyricsQuery(new URLSearchParams(query))
+          : related
+            ? parseMusicRelatedQuery(new URLSearchParams(query))
+            : current || status
+              ? undefined
+              : queue
+                ? parseMusicQueueQuery(new URLSearchParams(query))
+                : collection
+                  ? parseMusicCollectionQuery(new URLSearchParams(query))
+                  : await jsonBody(context.req.raw, incoming, signal);
       if (!live()) return reject(409, 'retired');
       if (
         (mutation || queueMutation) &&
@@ -386,6 +392,7 @@ export function registerMusicRoutes<E extends Env>(
         | Awaited<ReturnType<MusicService['search']>>
         | Awaited<ReturnType<MusicService['queue']>>
         | Awaited<ReturnType<MusicService['lyrics']>>
+        | Awaited<ReturnType<MusicService['comments']>>
         | Awaited<ReturnType<MusicService['prepare']>>
       >(
         prepare
@@ -429,21 +436,23 @@ export function registerMusicRoutes<E extends Env>(
                       signal,
                       deadlineAt,
                     )
-                  : lyrics
-                    ? service.lyrics(token, input, signal, deadlineAt)
-                    : related
-                      ? service.related(token, input, signal, deadlineAt)
-                      : current
-                        ? service.current(token, signal)
-                        : queue
-                          ? service.queue(token, input, signal)
-                          : home
-                            ? service.home(token, input, signal)
-                            : library
-                              ? service.library(token, input, signal)
-                              : route === '/search'
-                                ? service.search(token, input, signal)
-                                : service.browse(token, input, signal),
+                  : comments
+                    ? service.comments(token, input, signal, deadlineAt)
+                    : lyrics
+                      ? service.lyrics(token, input, signal, deadlineAt)
+                      : related
+                        ? service.related(token, input, signal, deadlineAt)
+                        : current
+                          ? service.current(token, signal)
+                          : queue
+                            ? service.queue(token, input, signal)
+                            : home
+                              ? service.home(token, input, signal)
+                              : library
+                                ? service.library(token, input, signal)
+                                : route === '/search'
+                                  ? service.search(token, input, signal)
+                                  : service.browse(token, input, signal),
         signal,
       );
       if (!live()) return reject(409, 'retired');

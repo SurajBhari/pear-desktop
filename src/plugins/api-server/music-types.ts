@@ -37,6 +37,40 @@ export interface MetadataBinding {
   videoId: string;
   playbackEpoch: string | null;
 }
+export type CommentsSort = 'top' | 'newest';
+export interface MusicComment {
+  id: string;
+  author: string | null;
+  text: string;
+  publishedTime: string | null;
+  likeCount: string | null;
+  replyCount: string | null;
+  pinned: boolean;
+  verified: boolean;
+  creator: boolean;
+}
+export interface CommentsSource {
+  available: boolean;
+  comments: MusicComment[];
+  commentCount: string | null;
+  continuation: string | null;
+}
+export interface NativeCommentsMetadata {
+  version: 1;
+  binding: MetadataBinding;
+  comments: CommentsSource;
+  requests: number;
+}
+export interface CommentPage {
+  version: 1;
+  videoId: string;
+  sort: CommentsSort;
+  source: 'music' | 'public-web';
+  available: boolean;
+  comments: MusicComment[];
+  commentCount: string | null;
+  nextCursor: string | null;
+}
 export interface LyricsResult {
   videoId: string;
   available: boolean;
@@ -148,6 +182,19 @@ export type NativeNavigationValue =
   | { version: 1; phase: 'pre_effect_denial'; reason: MusicFailure };
 export type MusicReadInput =
   | {
+      operation: 'comments';
+      target: MetadataTarget;
+      sort: CommentsSort;
+      deadlineAt: number;
+    }
+  | {
+      operation: 'comments-continuation';
+      token: string;
+      binding: MetadataBinding;
+      sort: CommentsSort;
+      deadlineAt: number;
+    }
+  | {
       operation: 'mutate-queue';
       command: MusicQueueCommand;
       deadlineAt: number;
@@ -191,6 +238,7 @@ export type NativeMusicValue =
   | NativeControlValue
   | NativeQueueActionValue
   | NativeLyricsMetadata
+  | NativeCommentsMetadata
   | NativeRelatedMetadata
   | NativeMetadataProbe
   | PlaybackSnapshot

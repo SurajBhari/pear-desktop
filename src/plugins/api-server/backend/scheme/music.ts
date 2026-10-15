@@ -4,6 +4,7 @@ import {
   parseControlCommand,
   parseQueueCommand,
 } from '@/providers/music-actions';
+import { commentsToken } from '@/providers/music-comments';
 import { assertMetadataWorkBudget } from '@/providers/music-metadata';
 import { isPlaylistId, isVideoId } from '@/providers/queue-playlist';
 
@@ -385,6 +386,120 @@ export const parseNativeRelatedMetadata = (value: unknown) => {
 };
 export const parseNativeMetadataProbe = (value: unknown) =>
   nativeMetadata(probeSchema, value);
+
+const commentsSort = z.enum(['top', 'newest']).default('top');
+const fallbackConsent = z.boolean().default(false);
+const commentsSelector = z.union([
+  z
+    .object({
+      videoId: z.string().refine(isVideoId),
+      sort: commentsSort,
+      limit,
+      allowPublicWebFallback: fallbackConsent,
+    })
+    .strict(),
+  z
+    .object({
+      current: z.literal(true),
+      sort: commentsSort,
+      limit,
+      allowPublicWebFallback: fallbackConsent,
+    })
+    .strict(),
+  cursorSchema,
+]);
+export function parseMusicCommentsInput(value: unknown) {
+  try {
+    assertMetadataWorkBudget(value);
+  } catch {
+    return failMusic('invalid');
+  }
+  const result = commentsSelector.safeParse(value);
+  if (!result.success) return failMusic('invalid');
+  return result.data;
+}
+export function parseMusicCommentsQuery(query: URLSearchParams) {
+  const value: Record<string, unknown> = {};
+  for (const [key, field] of query) {
+    if (
+      ![
+        'videoId',
+        'current',
+        'sort',
+        'limit',
+        'cursor',
+        'allowPublicWebFallback',
+      ].includes(key) ||
+      Object.hasOwn(value, key)
+    )
+      return failMusic('invalid');
+    if (key === 'current') {
+      if (field !== 'true') return failMusic('invalid');
+      value.current = true;
+    } else if (key === 'allowPublicWebFallback') {
+      if (field !== 'true' && field !== 'false') return failMusic('invalid');
+      value[key] = field === 'true';
+    } else if (key === 'limit') {
+      if (!/^[1-9][0-9]{0,2}$/.test(field)) return failMusic('invalid');
+      value.limit = Number(field);
+    } else value[key] = field;
+  }
+  return parseMusicCommentsInput(value);
+}
+const commentText = (budget: number) =>
+  lyricText(budget).refine((value) =>
+    Array.from(value).every(
+      (c) => c.charCodeAt(0) >= 32 || ['\n', '\r', '\t'].includes(c),
+    ),
+  );
+const commentSchema = z
+  .object({
+    id: z.string().regex(/^[A-Za-z0-9_.:-]{1,256}$/),
+    author: commentText(512).nullable(),
+    text: commentText(4096),
+    publishedTime: commentText(512).nullable(),
+    likeCount: commentText(512).nullable(),
+    replyCount: commentText(512).nullable(),
+    pinned: z.boolean(),
+    verified: z.boolean(),
+    creator: z.boolean(),
+  })
+  .strict();
+const commentsSourceSchema = z
+  .object({
+    available: z.boolean(),
+    comments: z.array(commentSchema).max(MUSIC_LIMITS.sourceItems),
+    commentCount: commentText(512).nullable(),
+    continuation: z
+      .string()
+      .refine((value) => {
+        try {
+          commentsToken(value);
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .nullable(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.available ||
+      (!value.comments.length &&
+        value.commentCount === null &&
+        value.continuation === null),
+  );
+const commentsMetadataSchema = z
+  .object({
+    version: z.literal(1),
+    binding: metadataBinding,
+    comments: commentsSourceSchema,
+    requests: z.number().int().min(1).max(5),
+  })
+  .strict();
+export const parseNativeCommentsMetadata = (value: unknown) =>
+  nativeMetadata(commentsMetadataSchema, value);
 
 const navigationCommandSchema = z.discriminatedUnion('action', [
   z

@@ -17,6 +17,7 @@ import {
   startMusicQueueAction,
 } from './music-actions';
 import { normalizeMusicSource } from './music-catalog';
+import { loadComments, commentsToken } from './music-comments';
 import {
   assertMetadataWorkBudget,
   parseWatchNextTabs,
@@ -98,7 +99,14 @@ const browseId = (value: unknown) =>
 export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
   if (!isRecord(value)) return null;
   if (
-    ['lyrics', 'related', 'metadata-current', 'related-continuation'].includes(
+    [
+      'lyrics',
+      'related',
+      'metadata-current',
+      'related-continuation',
+      'comments',
+      'comments-continuation',
+    ].includes(
       Object.getOwnPropertyDescriptor(value, 'operation')?.value as string,
     ) ||
     Object.hasOwn(value, 'expectedCurrent')
@@ -175,6 +183,43 @@ export function parseNativeMusicInput(value: unknown): MusicReadInput | null {
     (v.playbackEpoch === null ||
       (typeof v.playbackEpoch === 'string' &&
         /^[0-9a-f]{32}:[0-9a-f]{32}$/.test(v.playbackEpoch)));
+  if (
+    value.operation === 'comments' ||
+    value.operation === 'comments-continuation'
+  ) {
+    if (!own || !deadline || !['top', 'newest'].includes(value.sort as string))
+      return null;
+    if (
+      value.operation === 'comments' &&
+      keys.length === 4 &&
+      keys.every((key) =>
+        ['operation', 'target', 'sort', 'deadlineAt'].includes(key),
+      ) &&
+      isRecord(value.target) &&
+      Object.keys(value.target).length === 1 &&
+      ((Object.hasOwn(value.target, 'videoId') &&
+        isVideoId(value.target.videoId)) ||
+        (Object.hasOwn(value.target, 'current') &&
+          value.target.current === true))
+    )
+      return value as unknown as MusicReadInput;
+    if (
+      value.operation === 'comments-continuation' &&
+      keys.length === 5 &&
+      keys.every((key) =>
+        ['operation', 'binding', 'token', 'sort', 'deadlineAt'].includes(key),
+      ) &&
+      metadataBinding(value.binding)
+    ) {
+      try {
+        commentsToken(value.token);
+        return value as unknown as MusicReadInput;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
   if (
     own &&
     deadline &&
@@ -643,6 +688,41 @@ export function createMusicRendererController(
     metadataValid(job, input.deadlineAt);
     return value;
   };
+  const comments = async (
+    job: Job,
+    input: Extract<
+      MusicReadInput,
+      { operation: 'comments' | 'comments-continuation' }
+    >,
+  ) => {
+    metadataValid(job, input.deadlineAt);
+    const binding =
+      input.operation === 'comments-continuation'
+        ? input.binding
+        : 'videoId' in input.target
+          ? { videoId: input.target.videoId, playbackEpoch: null }
+          : probe(job);
+    if (binding.playbackEpoch !== null) job.currentBinding = binding;
+    metadataValid(job, input.deadlineAt);
+    const result = await loadComments(
+      async (body) => {
+        metadataValid(job, input.deadlineAt);
+        return job.owner.fetch.call(job.owner.network, '/next', body);
+      },
+      {
+        videoId: binding.videoId,
+        sort: input.sort,
+        source: 'music',
+        ...(input.operation === 'comments-continuation'
+          ? { continuation: input.token }
+          : {}),
+        check: () => metadataValid(job, input.deadlineAt),
+      },
+    );
+    metadataValid(job, input.deadlineAt);
+    const { requests, ...source } = result;
+    return { version: 1 as const, binding, comments: source, requests };
+  };
   const navigate = async (
     job: Job,
     input: Extract<MusicReadInput, { operation: 'navigate' }>,
@@ -717,9 +797,12 @@ export function createMusicRendererController(
           input.command.action === 'radio' &&
           input.command.seed.kind === 'current') ||
         input.operation === 'metadata-current' ||
-        ((input.operation === 'lyrics' || input.operation === 'related') &&
+        ((input.operation === 'lyrics' ||
+          input.operation === 'related' ||
+          input.operation === 'comments') &&
           'current' in input.target) ||
-        (input.operation === 'related-continuation' &&
+        ((input.operation === 'related-continuation' ||
+          input.operation === 'comments-continuation') &&
           input.binding.playbackEpoch !== null) ||
         ((input.operation === 'browse' || input.operation === 'continuation') &&
           !!input.expectedCurrent);
@@ -783,6 +866,12 @@ export function createMusicRendererController(
             job.controlEntered = true;
           },
         });
+        settled(job, { ok: true, value });
+      } else if (
+        input.operation === 'comments' ||
+        input.operation === 'comments-continuation'
+      ) {
+        const value = await comments(job, input);
         settled(job, { ok: true, value });
       } else if (input.operation === 'navigate') {
         const value = await navigate(job, input);
