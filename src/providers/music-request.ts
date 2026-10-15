@@ -28,17 +28,25 @@ export interface MusicAdmission {
   readonly generation: number;
 }
 export type MusicPhysicalSettlementReason =
+  | 'owned_settled'
   | 'authenticated_ack'
   | 'not_admitted'
   | 'authoritative_termination';
 interface Pending {
   id: string;
   nonce: string;
-  admission: MusicAdmission;
+  readonly admission: MusicAdmission;
   principal: string;
-  input: MusicReadInput;
+  input?: MusicReadInput;
+  execute?: (context: {
+    signal: AbortSignal;
+    deadline: number;
+    current(): boolean;
+  }) => Promise<NativeMusicValue>;
+  mainController?: AbortController;
+  deadlineAt: number;
   binding?: PlaybackBinding;
-  phase: 'queued' | 'owner' | 'read';
+  phase: 'queued' | 'owner' | 'read' | 'main';
   documentId?: string;
   sourceId?: string;
   done: boolean;
@@ -118,6 +126,16 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       return false;
     }
   };
+  // Separate factory: cursor ownership must not retain a completed Pending,
+  // its resolved value or its request callbacks through a closure environment.
+  const resultOwnerFor = (
+    state: { retired: boolean },
+    epoch: string,
+    admission: MusicAdmission,
+  ) => ({
+    epoch,
+    current: () => !state.retired && current(admission),
+  });
   const active = () =>
     [...records.values()].filter((r) => r.phase !== 'queued');
   const owned = (r: Pending) =>
@@ -141,6 +159,10 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     r.done = true;
     cleanupCaller(r);
     if (result.ok) {
+      if (r.execute) {
+        r.resolve(result.value);
+        return;
+      }
       const owners = r.binding ? clockSourceOwners : sourceOwners;
       const epoch = `${r.documentId}:${r.sourceId}`;
       let owner = owners.get(epoch);
@@ -155,11 +177,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
           }
         }
       }
-      const captured = owner;
-      resultOwners.set(result.value, {
-        epoch,
-        current: () => !captured.retired && current(r.admission),
-      });
+      resultOwners.set(result.value, resultOwnerFor(owner, epoch, r.admission));
       r.resolve(result.value);
     } else r.reject(new MusicServiceError(result.reason));
   };
@@ -182,6 +200,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     }
   };
   const release = (r: Pending, reason: MusicPhysicalSettlementReason) => {
+    if (records.get(r.id) !== r) return;
     const callback = r.onPhysicalSettled;
     r.onPhysicalSettled = undefined;
     records.delete(r.id);
@@ -191,10 +210,12 @@ function buildMusicRequestBroker(window: BrowserWindow) {
   };
   const retire = (r: Pending, reason: MusicFailure = 'retired') => {
     complete(r, { ok: false, reason });
+    r.mainController?.abort(new MusicServiceError(reason));
     if (r.phase === 'queued') {
       release(r, 'not_admitted');
       return;
     }
+    if (r.phase === 'main') return;
     try {
       send(r.binding ? 'peard:legacy-clock-cancel' : 'peard:music-cancel', r, {
         phase: r.phase,
@@ -205,6 +226,34 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     // Owner queries have no dispatched read. Retire their native challenge
     // before releasing/pumping; read-phase work keeps its physical tombstone.
     if (r.phase === 'owner') release(r, 'not_admitted');
+  };
+  const executeMain = async (r: Pending) => {
+    let entered = false;
+    try {
+      if (!owned(r) || r.done || records.get(r.id) !== r) return;
+      const execute = r.execute!;
+      const context = {
+        signal: r.mainController!.signal,
+        deadline: r.deadlineAt,
+        current: () => owned(r) && !r.done && records.get(r.id) === r,
+      };
+      if (!context.current() || r.done || records.get(r.id) !== r) return;
+      entered = true;
+      const value = await execute(context);
+      if (!r.done)
+        complete(
+          r,
+          owned(r) ? { ok: true, value } : { ok: false, reason: 'retired' },
+        );
+    } catch (error) {
+      complete(r, {
+        ok: false,
+        reason: error instanceof MusicServiceError ? error.code : 'source',
+      });
+    } finally {
+      if (!r.done) complete(r, { ok: false, reason: 'retired' });
+      release(r, entered ? 'owned_settled' : 'not_admitted');
+    }
   };
   const pump = () => {
     if (!alive()) return;
@@ -218,6 +267,11 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       if (slots.length >= 4) break;
       // Strict FIFO: a blocked principal cannot be bypassed by later callers.
       if (slots.filter((x) => x.principal === r.principal).length >= 2) break;
+      if (r.execute) {
+        r.phase = 'main';
+        executeMain(r).catch(() => {});
+        continue;
+      }
       r.phase = 'owner';
       try {
         send(
@@ -250,15 +304,17 @@ function buildMusicRequestBroker(window: BrowserWindow) {
   };
   const destroyed = () => {
     retireAll();
-    const callbacks = [...records.values()].map((r) => {
-      cleanupCaller(r);
-      const callback = r.onPhysicalSettled;
-      r.onPhysicalSettled = undefined;
-      return callback;
-    });
-    records.clear();
+    const callbacks = [...records.values()]
+      .filter((r) => r.phase !== 'main')
+      .map((r) => {
+        cleanupCaller(r);
+        const callback = r.onPhysicalSettled;
+        r.onPhysicalSettled = undefined;
+        records.delete(r.id);
+        return callback;
+      });
     disposed = true;
-    brokers.delete(window);
+    if (!records.size) brokers.delete(window);
     detach();
     for (const callback of callbacks)
       notify(callback, 'authoritative_termination');
@@ -268,7 +324,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     // Electron did-navigate is a committed main-document replacement, not an in-page navigation.
     // The old document's JS context has terminated; only its exact old-generation entries are released.
     for (const r of [...records.values()])
-      if (r.admission.generation !== generation) {
+      if (r.phase !== 'main' && r.admission.generation !== generation) {
         complete(r, { ok: false, reason: 'retired' });
         release(r, 'authoritative_termination');
       }
@@ -278,7 +334,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     navigating = true;
     retireAll();
     for (const r of [...records.values()])
-      release(r, 'authoritative_termination');
+      if (r.phase !== 'main') release(r, 'authoritative_termination');
   };
   const navigationFailed = (
     _event: Electron.Event,
@@ -325,7 +381,8 @@ function buildMusicRequestBroker(window: BrowserWindow) {
         return;
       }
       for (const r of [...records.values()])
-        if (
+        if (r.execute && !owned(r)) retire(r);
+        else if (
           !!r.binding === clock &&
           rawSender(event, r.admission.frame) &&
           r.documentId === packet.documentId &&
@@ -448,7 +505,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
   };
   const read = (
     admission: MusicAdmission,
-    input: MusicReadInput,
+    input: MusicReadInput | undefined,
     principal: string,
     options: {
       signal?: AbortSignal;
@@ -457,6 +514,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       onPhysicalSettled?: (reason: MusicPhysicalSettlementReason) => void;
     } = {},
     binding?: PlaybackBinding,
+    execute?: Pending['execute'],
   ): Promise<NativeMusicValue> => {
     const refused = (reason: MusicFailure) => {
       notify(options.onPhysicalSettled, 'not_admitted');
@@ -468,13 +526,24 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       !guardCurrent(options.isCurrent)
     )
       return refused('retired');
+    // A server-owned guard can retire this coordinator synchronously. Main work
+    // must not allocate an orphan waiter after that pre-admission callout.
+    if (
+      execute &&
+      (!current(admission) ||
+        options.signal?.aborted ||
+        disposed ||
+        navigating ||
+        admission.generation !== generation)
+    )
+      return refused('retired');
     if (
       records.size >= 12 ||
       [...records.values()].filter((r) => r.phase === 'queued').length >= 8
     )
       return refused('busy');
     const lifetime = Math.min(
-      input.operation === 'current' ? 5000 : 15000,
+      input?.operation === 'current' ? 5000 : 15000,
       (options.deadline ?? Infinity) - Date.now(),
     );
     if (lifetime <= 0) return refused('timeout');
@@ -486,6 +555,9 @@ function buildMusicRequestBroker(window: BrowserWindow) {
         principal,
         input,
         binding,
+        execute,
+        ...(execute ? { mainController: new AbortController() } : {}),
+        deadlineAt: Date.now() + lifetime,
         phase: 'queued',
         done: false,
         resolve,
@@ -546,6 +618,26 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       options: Parameters<typeof read>[3] = {},
     ) {
       return read(admission, input, principal, options);
+    },
+    /** Server-only execution on the exact native scheduler, not an IPC callback. */
+    runOwned<T extends NativeMusicValue>(
+      admission: MusicAdmission,
+      principal: string,
+      execute: (context: {
+        signal: AbortSignal;
+        deadline: number;
+        current(): boolean;
+      }) => Promise<T>,
+      options: Parameters<typeof read>[3] = {},
+    ): Promise<T> {
+      return read(
+        admission,
+        undefined,
+        principal,
+        options,
+        undefined,
+        execute,
+      ) as Promise<T>;
     },
     readClock(
       admission: MusicAdmission,
