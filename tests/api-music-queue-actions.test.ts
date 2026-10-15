@@ -1483,8 +1483,9 @@ test('Q4 MR4 new fixture canonicalizes tmp alias once before deriving owned path
     },
   );
   expect(canonicalizations).toBe(1);
+  expect(owned).toBe('/private/var/owned-fixture');
   expect(path.join(owned, 'profile')).toBe(
-    '/private/var/owned-fixture/profile',
+    path.join('/private/var/owned-fixture', 'profile'),
   );
 });
 

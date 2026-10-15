@@ -292,13 +292,68 @@ export async function queueActionsNative<T>(
   quiescent.catch(() => {});
   // These OS queries run only after actual native admission, never in preparation.
   // Only numeric process/group ownership is read; no parent command lines are dumped.
-  const query = (command: string, args: string[]) =>
+  const query = (
+    command: string,
+    args: string[],
+    commandKind:
+      | 'owned-cim-cohort'
+      | 'owned-cim-identities'
+      | 'owned-posix-group-list'
+      | 'owned-taskkill'
+      | 'owned-posix-group-identity',
+  ) =>
     new Promise<string>((resolve, reject) => {
+      const started = performance.now();
       execFile(
         command,
         args,
         { timeout: 1000, maxBuffer: 256 * 1024, windowsHide: true },
-        (error, stdout) => (error ? reject(error) : resolve(stdout)),
+        (error, stdout, stderr) => {
+          const rawCode = error?.code;
+          const code =
+            typeof rawCode === 'number' && Number.isSafeInteger(rawCode)
+              ? rawCode
+              : typeof rawCode === 'string' &&
+                  [
+                    'ENOENT',
+                    'EACCES',
+                    'EPERM',
+                    'ESRCH',
+                    'ETIMEDOUT',
+                    'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+                  ].includes(rawCode)
+                ? rawCode
+                : rawCode == null
+                  ? null
+                  : 'other';
+          const rawSignal = error?.signal;
+          const signal =
+            rawSignal == null
+              ? null
+              : ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGABRT'].includes(rawSignal)
+                ? rawSignal
+                : 'other';
+          // Numeric/fixed metadata only: never command, argv, environment or output.
+          try {
+            process.stdout.write(
+              'Q4_OWNED_QUERY ' +
+                JSON.stringify({
+                  commandKind,
+                  elapsedMs: Math.round(performance.now() - started),
+                  killed: error?.killed === true,
+                  signal,
+                  code,
+                  timeoutMs: 1000,
+                  stdoutBytes: Buffer.byteLength(stdout),
+                  stderrBytes: Buffer.byteLength(stderr),
+                }) +
+                '\n',
+            );
+          } catch {
+            // Diagnostic output must not replace the original query result/error.
+          }
+          error ? reject(error) : resolve(stdout);
+        },
       );
     });
   const cim = async (ids: number[], descendants = false) => {
@@ -309,13 +364,11 @@ export async function queueActionsNative<T>(
       throw Error('Invalid owned CIM request');
     const script = `$ErrorActionPreference='Stop';$pending=[System.Collections.Generic.Queue[int]]::new();${ids.map((pid) => `$pending.Enqueue(${pid});`).join('')}$seen=@{};$rows=@();while($pending.Count -gt 0){$id=$pending.Dequeue();if($seen.ContainsKey($id)){continue};$seen[$id]=$true;$p=Get-CimInstance Win32_Process -Filter ("ProcessId = "+$id);if($null -ne $p){$rows+=@{pid=[int]$p.ProcessId;parent=[int]$p.ParentProcessId;creation=$p.CreationDate.ToUniversalTime().ToString('o')};${descendants ? 'foreach($c in @(Get-CimInstance Win32_Process -Filter ("ParentProcessId = "+$id))){$pending.Enqueue([int]$c.ProcessId)}' : ''}}};ConvertTo-Json -InputObject @($rows) -Compress`;
     const value: unknown = JSON.parse(
-      await query('powershell.exe', [
-        '-NoLogo',
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        script,
-      ]),
+      await query(
+        'powershell.exe',
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+        descendants ? 'owned-cim-cohort' : 'owned-cim-identities',
+      ),
     );
     if (
       !Array.isArray(value) ||
@@ -347,7 +400,9 @@ export async function queueActionsNative<T>(
     }
     if (qualifiedGroup === undefined) return false;
     try {
-      const rows = (await query('ps', ['-A', '-o', 'pgid=']))
+      const rows = (
+        await query('ps', ['-A', '-o', 'pgid='], 'owned-posix-group-list')
+      )
         .trim()
         .split(/\s+/);
       if (!rows.length || !rows.every((value) => /^\d+$/.test(value)))
@@ -692,12 +747,11 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
           leader: () => cim([child!.pid!]),
           terminate: async () => {
             retirementRequested = true;
-            await query('taskkill.exe', [
-              '/PID',
-              String(child!.pid),
-              '/T',
-              '/F',
-            ]);
+            await query(
+              'taskkill.exe',
+              ['/PID', String(child!.pid), '/T', '/F'],
+              'owned-taskkill',
+            );
           },
         },
       );
@@ -707,7 +761,11 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
     if (process.platform !== 'win32' && !childClosed && child.pid) {
       try {
         const row = (
-          await query('ps', ['-p', String(child.pid), '-o', 'pid=,pgid='])
+          await query(
+            'ps',
+            ['-p', String(child.pid), '-o', 'pid=,pgid='],
+            'owned-posix-group-identity',
+          )
         )
           .trim()
           .split(/\s+/);
