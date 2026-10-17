@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { sliceMusicSource } from '@/providers/music-catalog';
+import { loadComments } from '@/providers/music-comments';
 import {
   createMusicRequestBroker,
   type MusicRequestBroker,
@@ -8,12 +9,18 @@ import {
 } from '@/providers/music-request';
 
 import {
+  createPublicCommentsWeb,
+  type PublicCommentsWeb,
+} from './music-comments-web';
+import {
   musicOperationLedger,
   type MusicOperationLedger,
   type MusicOperationRow,
 } from './music-operations';
 import {
   parseMusicInput,
+  parseMusicCommentsInput,
+  parseNativeCommentsMetadata,
   parseMusicLyricsInput,
   parseMusicRelatedInput,
   parseNativeLyricsMetadata,
@@ -40,6 +47,9 @@ import {
   musicOperationScope,
   utf8Bytes,
   type MusicScope,
+  type CommentsSource,
+  type CommentsSort,
+  type CommentPage,
   type MusicReadInput,
   type MusicItem,
   type MusicShelf,
@@ -102,6 +112,15 @@ type Cursor = CursorBase &
         replay?: MusicPage;
       }
     | {
+        kind: 'comments';
+        source: CommentsSource;
+        channel: 'music' | 'public-web';
+        sort: CommentsSort;
+        binding: MetadataBinding;
+        admission: MusicAdmission;
+        replay?: CommentPage;
+      }
+    | {
         kind: 'queue';
         source: NativeQueueSnapshot;
         replay?: QueuePage;
@@ -139,6 +158,7 @@ export interface MusicRuntime {
   grants: MusicGrantStore;
   broker?: MusicRequestBroker;
   now?: () => number;
+  commentsWeb?: PublicCommentsWeb;
 }
 const services = new WeakMap<BrowserWindow, MusicService>();
 export function getMusicService(window: BrowserWindow) {
@@ -190,6 +210,7 @@ function waitOwned<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 export class MusicService {
   readonly grants: MusicGrantStore;
   private readonly broker: MusicRequestBroker;
+  private readonly commentsWeb: PublicCommentsWeb;
   private readonly now: () => number;
   private readonly operations: MusicOperationLedger;
   private readonly detachNativeRetirement: () => void;
@@ -206,6 +227,7 @@ export class MusicService {
     this.config = { ...runtime.config };
     this.grants = runtime.grants;
     this.broker = runtime.broker ?? createMusicRequestBroker(runtime.window);
+    this.commentsWeb = runtime.commentsWeb ?? createPublicCommentsWeb();
     this.releaseBroker = this.broker.retain?.() ?? (() => {});
     this.now = runtime.now ?? Date.now;
     this.operations = musicOperationLedger(this.now);
@@ -317,57 +339,69 @@ export class MusicService {
       controller.signal,
       ...(signal ? [signal] : []),
     ]);
-    const currentOwner = () =>
+    const ownerCurrent = () =>
       !joined.aborted &&
       !signal?.aborted &&
       !this.stopped &&
       this.enabled &&
       revision === this.revision &&
       this.resource === resource &&
-      this.broker.isCurrent(admission) &&
-      this.now() < deadline;
+      this.broker.isCurrent(admission);
+    const currentOwner = () => ownerCurrent() && this.now() < deadline;
+    const principalCurrent = (principal: MusicGrantRecord) =>
+      this.grants.isCurrent(principal, scope) &&
+      extra.every((permission) => this.grants.isCurrent(principal, permission));
+    const invalidReason = (
+      principal?: MusicGrantRecord,
+      fallback: 'retired' | 'timeout' = 'timeout',
+    ) => {
+      // Preserve an observed abort. Otherwise actual retirement takes precedence
+      // over a coincident request deadline, even before its timer callback runs.
+      if (joined.reason instanceof MusicServiceError) return joined.reason;
+      return new MusicServiceError(
+        !ownerCurrent() || (principal && !principalCurrent(principal))
+          ? 'retired'
+          : fallback,
+      );
+    };
     let detach = () => {},
       timer: ReturnType<typeof setTimeout> | undefined;
     try {
       timer = setTimeout(
-        () => controller.abort(new MusicServiceError('timeout')),
+        () => controller.abort(invalidReason()),
         Math.max(0, deadline - this.now()),
       );
       timer.unref?.();
-      if (!currentOwner()) return failMusic('retired');
+      if (!currentOwner()) throw invalidReason();
       const principal = await waitOwned(
         this.grants.authorize(token, 'rest', resource, scope),
         joined,
       );
-      if (!currentOwner()) return failMusic('retired');
+      if (!currentOwner()) throw invalidReason(principal);
       for (const permission of extra) {
         await waitOwned(
           this.grants.authorize(token, 'rest', resource, permission),
           joined,
         );
-        if (!currentOwner()) return failMusic('retired');
+        if (!currentOwner()) throw invalidReason(principal);
       }
-      const current = () =>
-        currentOwner() &&
-        this.grants.isCurrent(principal, scope) &&
-        extra.every((permission) =>
-          this.grants.isCurrent(principal, permission),
-        );
+      const current = () => currentOwner() && principalCurrent(principal);
       detach = this.grants.subscribe(() => {
-        if (!current()) controller.abort();
+        if (!current()) controller.abort(invalidReason(principal));
       });
       clearTimeout(timer);
       timer = setTimeout(
         () =>
           controller.abort(
-            new MusicServiceError(
-              principal.expiresAt < deadline ? 'retired' : 'timeout',
+            invalidReason(
+              principal,
+              principal.expiresAt <= deadline ? 'retired' : 'timeout',
             ),
           ),
         Math.max(0, Math.min(deadline, principal.expiresAt) - this.now()),
       );
       timer.unref?.();
-      if (!current()) return failMusic('retired');
+      if (!current()) throw invalidReason(principal);
       const result = await waitOwned(
         action({
           principal,
@@ -382,7 +416,7 @@ export class MusicService {
         }),
         joined,
       );
-      if (!current()) return failMusic('retired');
+      if (!current()) throw invalidReason(principal);
       return result;
     } catch (error) {
       if (error instanceof MusicServiceError) throw error;
@@ -871,9 +905,10 @@ export class MusicService {
       other?.videoId === binding.videoId;
     for (const [id, cursor] of this.cursors)
       if (
-        cursor.kind === 'catalog' &&
-        'binding' in cursor.context &&
-        matches(cursor.context.binding)
+        (cursor.kind === 'comments' && matches(cursor.binding)) ||
+        (cursor.kind === 'catalog' &&
+          'binding' in cursor.context &&
+          matches(cursor.context.binding))
       )
         this.cursors.delete(id);
     for (const [id, reference] of this.references)
@@ -968,6 +1003,276 @@ export class MusicService {
       },
       deadlineAt,
     );
+  }
+  /** Public WEB work uses the same physical broker pool as all native reads. */
+  private async publicComments(
+    lease: Lease,
+    binding: MetadataBinding,
+    owner: SourceOwner,
+    sort: CommentsSort,
+    continuation?: string,
+    maxRequests = 5,
+  ) {
+    await this.probeMetadata(lease, binding, owner);
+    if (!lease.current() || !owner.current()) return failMusic('retired');
+    const result = await this.broker.runOwned(
+      lease.admission,
+      lease.principal.id,
+      async (context) => {
+        const check = () => {
+          if (this.now() >= lease.deadline) return failMusic('timeout');
+          if (!context.current() || !lease.current() || !owner.current())
+            return failMusic('retired');
+        };
+        check();
+        const response = await loadComments(
+          (body) =>
+            this.commentsWeb.request(body, {
+              signal: context.signal,
+              deadline: lease.deadline,
+            }),
+          {
+            videoId: binding.videoId,
+            sort,
+            source: 'public-web',
+            ...(continuation ? { continuation } : {}),
+            maxRequests,
+            check,
+          },
+        );
+        check();
+        const { requests, ...source } = response;
+        return { version: 1 as const, binding, comments: source, requests };
+      },
+      {
+        signal: lease.signal,
+        deadline: lease.deadline,
+        isCurrent: () => lease.current() && owner.current(),
+      },
+    );
+    if (!lease.current() || !owner.current()) return failMusic('retired');
+    await this.probeMetadata(lease, binding, owner);
+    return parseNativeCommentsMetadata(result);
+  }
+  comments(
+    token: unknown,
+    value: unknown,
+    signal?: AbortSignal,
+    deadlineAt?: number,
+  ): Promise<CommentPage> {
+    const input = parseMusicCommentsInput(value);
+    const deadline = Math.min(this.now() + 15000, deadlineAt ?? Infinity);
+    return this.admitted(
+      token,
+      'comments.read',
+      [],
+      signal,
+      false,
+      async (lease) => {
+        if ('cursor' in input)
+          return this.nextComments(lease, input.cursor, input.limit);
+        const target: MetadataTarget =
+          'videoId' in input ? { videoId: input.videoId } : { current: true };
+        const captured = await this.native(lease, {
+          operation: 'comments',
+          target,
+          sort: input.sort,
+          deadlineAt: lease.deadline,
+        });
+        let result = parseNativeCommentsMetadata(captured.value),
+          channel: 'music' | 'public-web' = 'music';
+        this.metadataBinding(result.binding, captured.owner, target);
+        // Only an authenticated, supported native absence and explicit consent may switch source.
+        if (!result.comments.available && input.allowPublicWebFallback) {
+          result = await this.publicComments(
+            lease,
+            result.binding,
+            captured.owner,
+            input.sort,
+            undefined,
+            5 - result.requests,
+          );
+          channel = 'public-web';
+        }
+        return this.commentsPage(
+          lease,
+          result.comments,
+          captured.owner,
+          result.binding,
+          channel,
+          input.sort,
+          0,
+          input.limit,
+        );
+      },
+      deadline,
+    );
+  }
+  private commentsPage(
+    lease: Lease,
+    source: CommentsSource,
+    owner: SourceOwner,
+    binding: MetadataBinding,
+    channel: 'music' | 'public-web',
+    sort: CommentsSort,
+    offset: number,
+    limit: number,
+  ): CommentPage {
+    if (!lease.current() || !owner.current()) return failMusic('retired');
+    const comments = source.comments.slice(offset, offset + limit);
+    let page: CommentPage;
+    for (;;) {
+      page = {
+        version: 1,
+        videoId: binding.videoId,
+        sort,
+        source: channel,
+        available: source.available,
+        comments,
+        commentCount: source.commentCount,
+        nextCursor:
+          offset + comments.length < source.comments.length ||
+          source.continuation
+            ? opaque('mcur')
+            : null,
+      };
+      if (utf8Bytes(JSON.stringify(page)) <= MUSIC_LIMITS.pageBytes) break;
+      if (!comments.length) return failMusic('budget');
+      comments.pop();
+    }
+    if (!comments.length && offset < source.comments.length)
+      return failMusic('budget');
+    if (page.nextCursor) {
+      const cursor: Cursor = {
+        kind: 'comments',
+        id: page.nextCursor,
+        principal: lease.principal,
+        scope: lease.scope,
+        resource: lease.resource,
+        revision: lease.revision,
+        owner,
+        offset: 0,
+        limit,
+        expires: this.now() + MUSIC_LIMITS.cursorMs,
+        busy: false,
+        bytes: 0,
+        source: {
+          ...source,
+          comments: source.comments.slice(offset + comments.length),
+        },
+        channel,
+        sort,
+        binding,
+        admission: lease.admission,
+      };
+      cursor.bytes =
+        utf8Bytes(
+          JSON.stringify({
+            ...cursor,
+            owner: { epoch: owner.epoch },
+            admission: { generation: cursor.admission.generation },
+          }),
+        ) + 64;
+      this.allocate(cursor);
+    }
+    this.scheduleCacheCleanup();
+    return structuredClone(page);
+  }
+  private async nextComments(
+    lease: Lease,
+    id: string,
+    limit: number,
+  ): Promise<CommentPage> {
+    const cursor = this.cursors.get(id);
+    if (
+      !cursor ||
+      cursor.kind !== 'comments' ||
+      cursor.scope !== lease.scope ||
+      cursor.resource !== lease.resource ||
+      cursor.principal.id !== lease.principal.id ||
+      cursor.principal.digest !== lease.principal.digest ||
+      cursor.principal.transport !== lease.principal.transport ||
+      cursor.expires <= this.now()
+    )
+      return failMusic('not_found');
+    if (
+      cursor.revision !== this.revision ||
+      cursor.admission.frame !== lease.admission.frame ||
+      cursor.admission.generation !== lease.admission.generation ||
+      !cursor.owner.current() ||
+      !this.grants.isCurrent(cursor.principal, cursor.scope)
+    )
+      return failMusic('retired');
+    if (limit !== cursor.limit) return failMusic('invalid');
+    if (cursor.busy) return failMusic('busy');
+    cursor.busy = true;
+    try {
+      await this.probeMetadata(lease, cursor.binding, cursor.owner);
+      if (cursor.replay) return structuredClone(cursor.replay);
+      let source = cursor.source,
+        offset = cursor.offset;
+      if (offset === source.comments.length) {
+        if (!source.continuation) return failMusic('not_found');
+        let result;
+        if (cursor.channel === 'public-web')
+          result = await this.publicComments(
+            lease,
+            cursor.binding,
+            cursor.owner,
+            cursor.sort,
+            source.continuation,
+          );
+        else {
+          const captured = await this.native(lease, {
+            operation: 'comments-continuation',
+            token: source.continuation,
+            binding: cursor.binding,
+            sort: cursor.sort,
+            deadlineAt: lease.deadline,
+          });
+          if (
+            captured.owner.epoch !== cursor.owner.epoch ||
+            !cursor.owner.current()
+          )
+            return failMusic('retired');
+          result = parseNativeCommentsMetadata(captured.value);
+        }
+        if (JSON.stringify(result.binding) !== JSON.stringify(cursor.binding))
+          return failMusic('retired');
+        source = result.comments;
+        offset = 0;
+      }
+      const page = this.commentsPage(
+          lease,
+          source,
+          cursor.owner,
+          cursor.binding,
+          cursor.channel,
+          cursor.sort,
+          offset,
+          limit,
+        ),
+        bytes = utf8Bytes(JSON.stringify(page)) + 32;
+      if (this.bytes() + bytes > MUSIC_LIMITS.cacheBytes) {
+        if (page.nextCursor) this.cursors.delete(page.nextCursor);
+        return failMusic('budget');
+      }
+      // A replay receipt replaces this consumed remainder; the newly issued cursor
+      // owns only its remaining rows. Do not duplicate a whole source per local page.
+      cursor.source = { ...cursor.source, comments: [], continuation: null };
+      cursor.replay = structuredClone(page);
+      cursor.bytes =
+        utf8Bytes(
+          JSON.stringify({
+            ...cursor,
+            owner: { epoch: cursor.owner.epoch },
+            admission: { generation: cursor.admission.generation },
+          }),
+        ) + 64;
+      return page;
+    } finally {
+      cursor.busy = false;
+    }
   }
   current(token: unknown, signal?: AbortSignal) {
     return this.admitted(

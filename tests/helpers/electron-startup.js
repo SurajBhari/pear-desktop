@@ -32,35 +32,60 @@ export async function runNativePidQuery(
     windowsHide: true,
     signal: controller.signal,
   });
+  let result;
+  let failed = false;
+  let failure;
+  let validatingLauncher = false;
+  /** @type {{ phase: string, error: unknown }[]} */
+  const diagnosticErrors = [];
   try {
-    const result = await execution;
+    result = await execution;
+    validatingLauncher = true;
     if (launcher) assertRunning(launcher);
-    return result;
   } catch (error) {
-    if (launcher) assertRunning(launcher);
-    if (!(error instanceof Error)) throw error;
-    const value = 'code' in error ? error.code : undefined;
-    const code =
-      value === null
-        ? 'null'
-        : typeof value === 'number' && Number.isSafeInteger(value)
-          ? String(value)
-          : typeof value === 'string' && /^[A-Z0-9_]{1,32}$/.test(value)
-            ? value
+    failed = true;
+    failure = error;
+    diagnosticErrors.push({
+      phase: validatingLauncher ? 'launcher-validation' : 'query',
+      error,
+    });
+    // Keep the original launcher assertion outermost, including its identity.
+    // A post-success assertion is already the launcher failure, not a query.
+    if (launcher && !validatingLauncher) {
+      try {
+        assertRunning(launcher);
+      } catch (launcherError) {
+        failure = launcherError;
+        diagnosticErrors.push({
+          phase: 'launcher-validation',
+          error: launcherError,
+        });
+      }
+    }
+    if (failure === error && !validatingLauncher && error instanceof Error) {
+      const value = 'code' in error ? error.code : undefined;
+      const code =
+        value === null
+          ? 'null'
+          : typeof value === 'number' && Number.isSafeInteger(value)
+            ? String(value)
+            : typeof value === 'string' && /^[A-Z0-9_]{1,32}$/.test(value)
+              ? value
+              : 'unknown';
+      const killed = 'killed' in error && error.killed === true;
+      const signalValue = 'signal' in error ? error.signal : undefined;
+      const signal =
+        signalValue === null
+          ? 'null'
+          : typeof signalValue === 'string' &&
+              /^SIG[A-Z0-9]{1,16}$/.test(signalValue)
+            ? signalValue
             : 'unknown';
-    const killed = 'killed' in error && error.killed === true;
-    const signalValue = 'signal' in error ? error.signal : undefined;
-    const signal =
-      signalValue === null
-        ? 'null'
-        : typeof signalValue === 'string' &&
-            /^SIG[A-Z0-9]{1,16}$/.test(signalValue)
-          ? signalValue
-          : 'unknown';
-    throw new Error(
-      `Native Electron PID query failed: code=${code} killed=${killed} signal=${signal} elapsedMs=${Math.round(performance.now() - started)} timeoutMs=${timeout}`,
-      { cause: error },
-    );
+      failure = new Error(
+        `Native Electron PID query failed: code=${code} killed=${killed} signal=${signal} elapsedMs=${Math.round(performance.now() - started)} timeoutMs=${timeout}`,
+        { cause: error },
+      );
+    }
   } finally {
     launcher?.off('exit', abort);
     // Abort terminates the owned query; wait for its exit before yielding the
@@ -70,10 +95,37 @@ export async function runNativePidQuery(
       execution.child.exitCode === null &&
       execution.child.signalCode === null
     )
-      await once(execution.child, 'exit', {
-        signal: AbortSignal.timeout(1000),
-      });
+      try {
+        await once(execution.child, 'exit', {
+          signal: AbortSignal.timeout(1000),
+        });
+      } catch (error) {
+        diagnosticErrors.push({ phase: 'owned-query-close', error });
+        if (!failed) failure = error;
+        else if (!(failure instanceof Error))
+          failure = new AggregateError(
+            [failure, error],
+            'Native query and close failed',
+          );
+        failed = true;
+      }
   }
+  if (failed) {
+    if (failure instanceof Error) {
+      // Additive metadata: never overwrite an existing cause or outer message.
+      // A frozen foreign Error must still be thrown unchanged.
+      try {
+        Object.defineProperty(failure, 'diagnosticErrors', {
+          value: Object.freeze(
+            diagnosticErrors.map((entry) => Object.freeze(entry)),
+          ),
+          configurable: true,
+        });
+      } catch {}
+    }
+    throw failure;
+  }
+  return result;
 }
 
 /** @typedef {{ pid: number, userData: string, visibleWindow: boolean }} StartupFacts */

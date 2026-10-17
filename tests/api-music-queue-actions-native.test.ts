@@ -14,6 +14,7 @@ import { spawn, execFile } from 'node:child_process';
 import { build, normalizePath } from 'vite';
 const root = path.resolve(import.meta.dirname, '..'),
   requireRoot = createRequire(path.join(root, 'package.json'));
+const nativeQueryQuarantine = new Set<any>();
 /** Bounded cleanup contract. A signal request or main close alone never permits deletion. */
 export async function cleanupOwnedNativeChild(
   child: any,
@@ -23,7 +24,8 @@ export async function cleanupOwnedNativeChild(
     clear(timer: any): void;
     closed(): boolean;
     waitClose(): Promise<boolean>;
-    treeEmpty(): Promise<boolean>;
+    queriesClosed(): boolean;
+    treeEmpty(deadline: number): Promise<boolean>;
     remove(): Promise<void>;
     record(result: any): void;
     release(): void;
@@ -39,12 +41,13 @@ export async function cleanupOwnedNativeChild(
     if (remaining <= 0) return fallback;
     let timer: any;
     try {
-      return await Promise.race([
+      const value = await Promise.race([
         action(),
         new Promise<T>((resolve) => {
           timer = ports.timer(() => resolve(fallback), remaining);
         }),
       ]);
+      return ports.now() < deadline ? value : fallback;
     } catch {
       errors.push('owned cleanup action failed');
       return fallback;
@@ -55,7 +58,9 @@ export async function cleanupOwnedNativeChild(
   let closed = ports.closed(),
     killRequested: boolean | null = null,
     treeEmpty = false,
-    removed = false;
+    removed = false,
+    removalObserved = false,
+    removalRequested = false;
   if (child && !closed) {
     try {
       killRequested = child.kill('SIGKILL');
@@ -65,18 +70,39 @@ export async function cleanupOwnedNativeChild(
     }
     closed = await bounded(ports.waitClose, false);
   }
-  if (closed) treeEmpty = await bounded(ports.treeEmpty, false);
-  if (closed && treeEmpty)
+  const queryClosure = () => {
+    try {
+      return ports.queriesClosed();
+    } catch {
+      errors.push('owned query closure failed');
+      return false;
+    }
+  };
+  let queriesClosed = queryClosure();
+  if (closed && queriesClosed)
+    treeEmpty = await bounded(() => ports.treeEmpty(deadline), false);
+  queriesClosed = queryClosure();
+  if (closed && queriesClosed && treeEmpty)
     removed = await bounded(async () => {
+      removalRequested = true;
       await ports.remove();
+      removalObserved = true;
       return true;
     }, false);
+  const endedAtMono = ports.now();
+  const deadlineExpired = endedAtMono >= deadline;
   const result = {
-    complete: closed && treeEmpty && removed,
+    startedAtMono: deadline - 2000,
+    endedAtMono,
+    complete:
+      closed && queriesClosed && treeEmpty && removed && !deadlineExpired,
+    deadlineExpired,
+    queriesClosed,
+    removalRequested,
     closed,
     killRequested,
     treeEmpty,
-    removed,
+    removed: removalObserved,
     errors,
   };
   try {
@@ -172,20 +198,518 @@ export function ownedWindowsCohortAbsent(
 }
 
 export function assertNativeCleanupComplete(
-  result: { complete: boolean },
+  result: { complete: boolean; removalRequested?: boolean },
   originalFailure: unknown,
   owned: string,
 ) {
   if (!result.complete && originalFailure === undefined)
     throw Error(
-      'Owned native cleanup incomplete; profile and evidence retained: ' +
+      'Owned native cleanup incomplete; cleanup/removal evidence is not complete: ' +
         owned,
     );
+}
+
+export type OwnedQueryPhase =
+  | 'cohort'
+  | 'leader'
+  | 'taskkill'
+  | 'absence'
+  | 'posix-identity'
+  | 'posix-group-list';
+export function planOwnedQuery(
+  phase: OwnedQueryPhase,
+  state: {
+    now: number;
+    nativeDeadline: number;
+    caseDeadline: number;
+    cleanupDeadline?: number;
+    terminal?: boolean;
+    active?: boolean;
+  },
+) {
+  const phases = {
+    cohort: { cap: 5000, after: 8000, cleanup: false },
+    leader: { cap: 5000, after: 2500, cleanup: false },
+    taskkill: { cap: 1000, after: 1000, cleanup: false },
+    absence: { cap: 1000, after: 250, cleanup: true },
+    'posix-identity': { cap: 1000, after: 1000, cleanup: false },
+    'posix-group-list': { cap: 1000, after: 250, cleanup: true },
+  };
+  const selected = phases[phase];
+  if (
+    !selected ||
+    ![state.now, state.nativeDeadline, state.caseDeadline].every(
+      Number.isFinite,
+    ) ||
+    (selected.cleanup && !Number.isFinite(state.cleanupDeadline))
+  )
+    throw Error('Invalid owned query budget');
+  if (state.terminal) return { admitted: false as const, reason: 'terminal' };
+  if (state.active)
+    return { admitted: false as const, reason: 'owned-query-active' };
+  const operationDeadline = selected.cleanup
+    ? Math.min(state.cleanupDeadline!, state.caseDeadline - 1000)
+    : Math.min(state.nativeDeadline, state.caseDeadline - 3000);
+  const available = Math.floor(
+    operationDeadline - state.now - selected.after - 500,
+  );
+  if (available < 1)
+    return { admitted: false as const, reason: 'budget-exhausted' };
+  const timeoutMs = Math.min(selected.cap, available);
+  return {
+    admitted: true as const,
+    capMs: selected.cap,
+    timeoutMs,
+    terminalAt: state.now + timeoutMs + 500,
+    operationDeadline,
+    reserveAfterMs: selected.after,
+    closeGraceMs: 500,
+  };
+}
+export function createOwnedQueryScope(ports: {
+  execFile(
+    command: string,
+    args: string[],
+    options: { timeout: number; maxBuffer: number; windowsHide: boolean },
+    callback: (error: any, stdout: string, stderr: string) => void,
+  ): any;
+  now(): number;
+  timer(callback: () => void, ms: number): any;
+  clear(timer: any): void;
+  record(receipt: any): void;
+  retain(owner: any): void;
+  release(owner: any): void;
+  onFailure(reason: string, error: unknown): void;
+}) {
+  let state: 'native' | 'cleanup' | 'failed' | 'complete' = 'native';
+  let firstError: unknown,
+    failureReason: string | undefined,
+    active: any,
+    notified = false;
+  const owners: any[] = [];
+  const code = (value: any) =>
+    value == null
+      ? null
+      : Number.isSafeInteger(value)
+        ? value
+        : [
+              'ENOENT',
+              'EACCES',
+              'EPERM',
+              'ESRCH',
+              'ETIMEDOUT',
+              'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+            ].includes(value)
+          ? value
+          : 'other';
+  const signal = (value: any) =>
+    value == null
+      ? null
+      : ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGABRT'].includes(value)
+        ? value
+        : 'other';
+  const receipt = (owner: any) => ({
+    ...owner.facts,
+    elapsedMs: Math.round(ports.now() - owner.started),
+    failureReason: failureReason ?? null,
+    pending: owner.facts.spawned && !owner.facts.physicalClosed,
+  });
+  const publish = (owner: any) => {
+    try {
+      ports.record(receipt(owner));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const notify = () => {
+    if (state === 'failed' && !active && !notified) {
+      notified = true;
+      try {
+        ports.onFailure(failureReason!, firstError);
+      } catch {
+        /* Preserve the original query failure. */
+      }
+    }
+  };
+  const requestKill = (owner: any) => {
+    if (!owner.child || owner.facts.physicalClosed || owner.facts.killRequested)
+      return;
+    owner.facts.killRequested = true;
+    try {
+      if (owner.child.kill('SIGTERM') === false)
+        owner.facts.killRequestFailed = true;
+    } catch {
+      owner.facts.killRequestFailed = true;
+    }
+  };
+  let finish!: (owner: any, forced?: boolean) => void;
+  const fail = (reason: string, error: unknown) => {
+    if (state !== 'failed') {
+      state = 'failed';
+      firstError = error;
+      failureReason = reason;
+    }
+    if (active && !active.settled) {
+      const owner = active;
+      owner.facts.cancelled = true;
+      requestKill(owner);
+      if (owner.facts.physicalClosed || ports.now() >= owner.plan.terminalAt)
+        finish(owner, true);
+      else if (owner.drainTimer === undefined)
+        owner.drainTimer = ports.timer(
+          () => finish(owner, true),
+          Math.max(0, Math.min(500, owner.plan.terminalAt - ports.now())),
+        );
+    }
+    notify();
+  };
+  finish = (owner: any, forced = false) => {
+    if (
+      owner.settled ||
+      (!forced && !(owner.facts.callbackObserved && owner.facts.physicalClosed))
+    )
+      return;
+    owner.settled = true;
+    ports.clear(owner.timer);
+    if (owner.drainTimer !== undefined) ports.clear(owner.drainTimer);
+    if (active === owner) active = undefined;
+    const error = owner.callbackError ?? owner.eventError;
+    if (state !== 'failed' && (ports.now() >= owner.plan.terminalAt || forced))
+      fail('query-terminal', Error('Owned query terminal deadline'));
+    if (state !== 'failed' && error) fail('query-error', error);
+    owner.facts.logicalSettled = true;
+    owner.facts.settledElapsedMs = ports.now() - owner.started;
+    owner.facts.killed =
+      owner.child?.killed === true || owner.callbackError?.killed === true;
+    owner.facts.timeout =
+      owner.callbackError?.killed === true &&
+      owner.facts.callbackElapsedMs >= owner.plan.timeoutMs;
+    owner.facts.closeUncertain = !owner.facts.physicalClosed;
+    if (!publish(owner) && state !== 'failed')
+      fail('receipt-failed', Error('Owned query receipt persistence failed'));
+    const output = owner.stdout;
+    owner.stdout = '';
+    owner.stderr = '';
+    if (state === 'failed') owner.reject(firstError);
+    else owner.resolve(output);
+    owner.resolveSettled();
+    notify();
+  };
+  const cancel = (
+    reason: string,
+    error: unknown = Error('Owned native query cancelled'),
+  ): Promise<void> => {
+    const waiting = active?.settledPromise;
+    fail(reason, error);
+    return waiting ?? Promise.resolve();
+  };
+  const run = (
+    command: string,
+    args: string[],
+    commandKind: string,
+    phase: OwnedQueryPhase,
+    context: {
+      nativeDeadline: number;
+      caseDeadline: number;
+      cleanupDeadline?: number;
+    },
+    onAdmitted?: () => void,
+  ): Promise<string> =>
+    new Promise((resolve, reject) => {
+      if (state === 'failed' || state === 'complete') {
+        reject(firstError ?? Error('Owned query scope is terminal'));
+        return;
+      }
+      const cleanupPhase = phase === 'absence' || phase === 'posix-group-list';
+      if ((state === 'cleanup') !== cleanupPhase || active) {
+        void cancel(
+          'query-reentry',
+          Error('Owned query phase or reentry rejected'),
+        );
+        reject(firstError);
+        return;
+      }
+      let plan: ReturnType<typeof planOwnedQuery>;
+      try {
+        plan = planOwnedQuery(phase, {
+          ...context,
+          now: ports.now(),
+          terminal: false,
+          active: false,
+        });
+      } catch (error) {
+        fail('invalid-query-budget', error);
+        reject(firstError);
+        return;
+      }
+      if (!plan.admitted) {
+        fail(plan.reason, Error('Owned query budget exhausted'));
+        reject(firstError);
+        return;
+      }
+      const owner: any = {
+        started: ports.now(),
+        plan,
+        resolve,
+        reject,
+        settled: false,
+        stdout: '',
+        stderr: '',
+        callbackError: undefined,
+        eventError: undefined,
+      };
+      owner.settledPromise = new Promise<void>((yes) => {
+        owner.resolveSettled = yes;
+      });
+      owner.facts = {
+        id: owners.length + 1,
+        commandKind,
+        phase,
+        spawned: false,
+        pid: null,
+        capMs: plan.capMs,
+        timeoutMs: plan.timeoutMs,
+        closeGraceMs: 500,
+        terminalAt: plan.terminalAt,
+        remainingNativeMs: context.nativeDeadline - owner.started,
+        remainingCaseMs: context.caseDeadline - owner.started,
+        remainingCleanupMs:
+          context.cleanupDeadline === undefined
+            ? null
+            : context.cleanupDeadline - owner.started,
+        callbackObserved: false,
+        callbackElapsedMs: null,
+        closeElapsedMs: null,
+        settledElapsedMs: null,
+        physicalClosed: false,
+        exitObserved: false,
+        exitCode: null,
+        exitSignal: null,
+        closeCode: null,
+        closeSignal: null,
+        code: null,
+        signal: null,
+        errorObserved: false,
+        killRequested: false,
+        killRequestFailed: false,
+        killed: false,
+        timeout: false,
+        cancelled: false,
+        closeUncertain: false,
+        logicalSettled: false,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+      };
+      active = owner;
+      try {
+        const launchNow = ports.now();
+        const fresh = planOwnedQuery(phase, {
+          ...context,
+          now: launchNow,
+          terminal: false,
+          active: false,
+        });
+        if (!fresh.admitted) {
+          fail(
+            fresh.reason,
+            Error('Owned query budget exhausted before launch'),
+          );
+          finish(owner, true);
+          return;
+        }
+        owner.started = launchNow;
+        owner.plan = fresh;
+        Object.assign(owner.facts, {
+          capMs: fresh.capMs,
+          timeoutMs: fresh.timeoutMs,
+          terminalAt: fresh.terminalAt,
+          remainingNativeMs: context.nativeDeadline - launchNow,
+          remainingCaseMs: context.caseDeadline - launchNow,
+          remainingCleanupMs:
+            context.cleanupDeadline === undefined
+              ? null
+              : context.cleanupDeadline - launchNow,
+        });
+        owner.child = ports.execFile(
+          command,
+          args,
+          {
+            timeout: fresh.timeoutMs,
+            maxBuffer: 256 * 1024,
+            windowsHide: true,
+          },
+          (error, stdout, stderr) => {
+            if (owner.facts.callbackObserved) return;
+            owner.facts.callbackObserved = true;
+            owner.facts.callbackElapsedMs = ports.now() - owner.started;
+            owner.facts.code = code(error?.code);
+            owner.facts.signal = signal(error?.signal);
+            owner.facts.stdoutBytes = Buffer.byteLength(stdout ?? '');
+            owner.facts.stderrBytes = Buffer.byteLength(stderr ?? '');
+            if (!owner.settled) {
+              owner.callbackError = error;
+              owner.stdout = stdout;
+              owner.stderr = stderr;
+              finish(owner);
+            } else publish(owner);
+          },
+        );
+        owner.facts.spawned = true;
+        owner.facts.pid = Number.isSafeInteger(owner.child.pid)
+          ? owner.child.pid
+          : null;
+        owners.push(owner);
+        owner.child.on('error', (error: unknown) => {
+          owner.facts.errorObserved = true;
+          owner.eventError = error;
+        });
+        owner.child.on('exit', (value: any, sig: any) => {
+          owner.facts.exitObserved = true;
+          owner.facts.exitCode = code(value);
+          owner.facts.exitSignal = signal(sig);
+        });
+        owner.child.once('close', (value: any, sig: any) => {
+          owner.facts.physicalClosed = true;
+          owner.facts.closeElapsedMs = ports.now() - owner.started;
+          owner.facts.closeCode = code(value);
+          owner.facts.closeSignal = signal(sig);
+          try {
+            ports.release(owner);
+          } catch {
+            fail(
+              'ownership-release-failed',
+              Error('Owned query release failed'),
+            );
+          }
+          if (owner.settled) publish(owner);
+          else finish(owner, state === 'failed');
+        });
+        ports.retain(owner);
+        owner.timer = ports.timer(
+          () => {
+            fail('query-terminal', Error('Owned query terminal deadline'));
+            finish(owner, true);
+          },
+          Math.max(0, owner.plan.terminalAt - ports.now()),
+        );
+        onAdmitted?.();
+      } catch (error) {
+        fail('query-spawn-failed', error);
+        if (!owner.child) finish(owner, true);
+      }
+    });
+  return {
+    run,
+    cancel,
+    active: () => !!active,
+    isTerminal: () => state === 'failed' || state === 'complete',
+    enterCleanup: () => {
+      if (
+        state !== 'native' ||
+        active ||
+        owners.some((o) => !o.facts.physicalClosed)
+      )
+        return false;
+      state = 'cleanup';
+      return true;
+    },
+    complete: () => {
+      if (
+        state === 'cleanup' &&
+        !active &&
+        owners.every((o) => o.facts.physicalClosed)
+      )
+        state = 'complete';
+    },
+    queriesClosed: () => owners.every((o) => o.facts.physicalClosed),
+    snapshot: () => owners.map(receipt),
+  };
+}
+
+export function ownedNativeTimingReceipt(
+  timing:
+    | {
+        caseStartedAtMono: number;
+        nativeStartedAtMono: number | null;
+        subjectClosedAtMono: number | null;
+        nativeWorkEndedAtMono: number | null;
+        cleanupStartedAtMono: number | null;
+        cleanupEndedAtMono: number | null;
+      }
+    | undefined,
+  assertionsEndedAtMono: number,
+) {
+  const number = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0
+      ? value
+      : null;
+  const caseStart = number(timing?.caseStartedAtMono),
+    nativeStart = number(timing?.nativeStartedAtMono),
+    subjectClose = number(timing?.subjectClosedAtMono),
+    workEnd = number(timing?.nativeWorkEndedAtMono),
+    cleanupStart = number(timing?.cleanupStartedAtMono),
+    cleanupEnd = number(timing?.cleanupEndedAtMono),
+    assertionEnd = number(assertionsEndedAtMono);
+  const present =
+    caseStart !== null &&
+    nativeStart !== null &&
+    subjectClose !== null &&
+    workEnd !== null &&
+    cleanupStart !== null &&
+    cleanupEnd !== null &&
+    assertionEnd !== null;
+  const ordered =
+    present &&
+    caseStart <= nativeStart &&
+    nativeStart <= subjectClose &&
+    subjectClose <= workEnd &&
+    workEnd <= cleanupStart &&
+    cleanupStart <= cleanupEnd &&
+    cleanupEnd <= assertionEnd;
+  const complete =
+    ordered &&
+    workEnd < Math.min(nativeStart + 25000, caseStart + 27000) &&
+    cleanupEnd - cleanupStart <= 2000 &&
+    assertionEnd - cleanupEnd <= 1000 &&
+    caseStart + 30000 - cleanupEnd >= 1000 &&
+    assertionEnd < caseStart + 30000;
+  return {
+    schema: 1,
+    clock: 'host-performance.now',
+    complete,
+    reason: !present
+      ? 'missing-or-invalid-timing'
+      : !ordered
+        ? 'inconsistent-timing'
+        : !complete
+          ? 'timing-budget-exhausted'
+          : null,
+    caseStartedAtMono: caseStart,
+    nativeStartedAtMono: nativeStart,
+    subjectClosedAtMono: subjectClose,
+    nativeWorkEndedAtMono: workEnd,
+    cleanupStartedAtMono: cleanupStart,
+    cleanupEndedAtMono: cleanupEnd,
+    assertionsEndedAtMono: assertionEnd,
+    caseElapsedMs: present ? assertionEnd - caseStart : null,
+    nativeElapsedMs: present ? workEnd - nativeStart : null,
+    cleanupElapsedMs: present ? cleanupEnd - cleanupStart : null,
+    postElapsedMs: present ? assertionEnd - cleanupEnd : null,
+    remainingCaseAtCleanupEndMs: present
+      ? caseStart + 30000 - cleanupEnd
+      : null,
+    remainingCaseAtAssertionsEndMs: present
+      ? caseStart + 30000 - assertionEnd
+      : null,
+    postReserveMs: 1000,
+  };
 }
 
 /** Actual broker/controller and Electron IPC; only native getters and service responses are synthetic. */
 export async function queueActionsNative<T>(
   task: () => Promise<T>,
+  caseStartedAtMono: number,
 ): Promise<T> {
   const suppliedEvidence = process.env.PEAR_Q4_EVIDENCE_DIRECTORY;
   const prepared = process.env.PEAR_Q4_PREPARED_FIXTURE;
@@ -290,6 +814,44 @@ export async function queueActionsNative<T>(
     rejectQuiescent = reject;
   });
   quiescent.catch(() => {});
+  const nativeTiming = {
+    caseStartedAtMono,
+    nativeStartedAtMono: null as number | null,
+    subjectClosedAtMono: null as number | null,
+    nativeWorkEndedAtMono: null as number | null,
+    cleanupStartedAtMono: null as number | null,
+    cleanupEndedAtMono: null as number | null,
+  };
+  let nativeDeadlineMono = 0;
+  const caseDeadlineMono = caseStartedAtMono + 30000;
+  let workTimer: ReturnType<typeof setTimeout> | undefined;
+  let rejectWork!: (error: unknown) => void;
+  const workAborted = new Promise<never>((_resolve, reject) => {
+    rejectWork = reject;
+  });
+  workAborted.catch(() => {});
+  const queryScope = createOwnedQueryScope({
+    execFile,
+    now: () => performance.now(),
+    timer: (callback, ms) => setTimeout(callback, ms),
+    clear: (timer) => clearTimeout(timer),
+    record: (receipt) => {
+      process.stdout.write('Q4_OWNED_QUERY ' + JSON.stringify(receipt) + '\n');
+    },
+    retain: (owner) => {
+      nativeQueryQuarantine.add(owner);
+    },
+    release: (owner) => {
+      nativeQueryQuarantine.delete(owner);
+    },
+    onFailure: (_reason, error) => {
+      rejectWork(error);
+      rejectQuiescent(error);
+    },
+  });
+  const guarded = <U>(operation: Promise<U>): Promise<U> =>
+    Promise.race([operation, workAborted]);
+
   // These OS queries run only after actual native admission, never in preparation.
   // Only numeric process/group ownership is read; no parent command lines are dumped.
   const query = (
@@ -301,62 +863,30 @@ export async function queueActionsNative<T>(
       | 'owned-posix-group-list'
       | 'owned-taskkill'
       | 'owned-posix-group-identity',
+    phase: OwnedQueryPhase,
+    cleanupDeadline?: number,
+    onAdmitted?: () => void,
   ) =>
-    new Promise<string>((resolve, reject) => {
-      const started = performance.now();
-      execFile(
-        command,
-        args,
-        { timeout: 1000, maxBuffer: 256 * 1024, windowsHide: true },
-        (error, stdout, stderr) => {
-          const rawCode = error?.code;
-          const code =
-            typeof rawCode === 'number' && Number.isSafeInteger(rawCode)
-              ? rawCode
-              : typeof rawCode === 'string' &&
-                  [
-                    'ENOENT',
-                    'EACCES',
-                    'EPERM',
-                    'ESRCH',
-                    'ETIMEDOUT',
-                    'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
-                  ].includes(rawCode)
-                ? rawCode
-                : rawCode == null
-                  ? null
-                  : 'other';
-          const rawSignal = error?.signal;
-          const signal =
-            rawSignal == null
-              ? null
-              : ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGABRT'].includes(rawSignal)
-                ? rawSignal
-                : 'other';
-          // Numeric/fixed metadata only: never command, argv, environment or output.
-          try {
-            process.stdout.write(
-              'Q4_OWNED_QUERY ' +
-                JSON.stringify({
-                  commandKind,
-                  elapsedMs: Math.round(performance.now() - started),
-                  killed: error?.killed === true,
-                  signal,
-                  code,
-                  timeoutMs: 1000,
-                  stdoutBytes: Buffer.byteLength(stdout),
-                  stderrBytes: Buffer.byteLength(stderr),
-                }) +
-                '\n',
-            );
-          } catch {
-            // Diagnostic output must not replace the original query result/error.
-          }
-          error ? reject(error) : resolve(stdout);
-        },
-      );
-    });
-  const cim = async (ids: number[], descendants = false) => {
+    queryScope.run(
+      command,
+      args,
+      commandKind,
+      phase,
+      {
+        nativeDeadline: nativeDeadlineMono,
+        caseDeadline: caseDeadlineMono,
+        cleanupDeadline,
+      },
+      onAdmitted,
+    );
+  const cim = async (
+    ids: number[],
+    descendants: boolean,
+    phase: 'cohort' | 'leader' | 'absence',
+    cleanupDeadline?: number,
+  ) => {
+    if (process.platform !== 'win32')
+      throw Error('Windows CIM phase on another platform');
     if (
       !ids.length ||
       !ids.every((pid) => Number.isSafeInteger(pid) && pid > 0)
@@ -368,6 +898,8 @@ export async function queueActionsNative<T>(
         'powershell.exe',
         ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
         descendants ? 'owned-cim-cohort' : 'owned-cim-identities',
+        phase,
+        cleanupDeadline,
       ),
     );
     if (
@@ -385,14 +917,20 @@ export async function queueActionsNative<T>(
       throw Error('Invalid owned CIM response');
     return value as { pid: number; parent: number; creation: string }[];
   };
-  const treeEmpty = async () => {
+  const treeEmpty = async (cleanupDeadline: number) => {
+    if (queryScope.isTerminal() || !queryScope.queriesClosed()) return false;
     if (!child) return true;
     if (process.platform === 'win32') {
       if (!forcedFixtureRetirement || !windowsCohort) return false;
       try {
         return ownedWindowsCohortAbsent(
           windowsCohort,
-          await cim(windowsCohort.map((row) => row.pid)),
+          await cim(
+            windowsCohort.map((row) => row.pid),
+            false,
+            'absence',
+            cleanupDeadline,
+          ),
         );
       } catch {
         return false;
@@ -401,7 +939,13 @@ export async function queueActionsNative<T>(
     if (qualifiedGroup === undefined) return false;
     try {
       const rows = (
-        await query('ps', ['-A', '-o', 'pgid='], 'owned-posix-group-list')
+        await query(
+          'ps',
+          ['-A', '-o', 'pgid='],
+          'owned-posix-group-list',
+          'posix-group-list',
+          cleanupDeadline,
+        )
       )
         .trim()
         .split(/\s+/);
@@ -632,7 +1176,27 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
     env.PEAR_TEST_STARTUP_FACTS = factsPath;
     runId = crypto.randomUUID();
     env.PEAR_Q4_RUN_ID = runId;
+    if (
+      !Number.isFinite(caseStartedAtMono) ||
+      performance.now() >= caseDeadlineMono - 3000
+    )
+      throw Error('Owned native case budget exhausted before spawn');
     const launchDeadline = Date.now() + 25000;
+    nativeTiming.nativeStartedAtMono = performance.now();
+    nativeDeadlineMono = nativeTiming.nativeStartedAtMono + 25000;
+    workTimer = setTimeout(
+      () => {
+        void queryScope.cancel(
+          'native-work-deadline',
+          Error('Owned native work deadline'),
+        );
+      },
+      Math.max(
+        0,
+        Math.min(nativeDeadlineMono, caseDeadlineMono - 3000) -
+          performance.now(),
+      ),
+    );
     child = spawn(
       realpathSync(requireRoot('electron') as string),
       [
@@ -650,8 +1214,14 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
       },
     );
     child.once('close', () => {
+      nativeTiming.subjectClosedAtMono = performance.now();
       childClosed = true;
       onChildClose(true);
+      if (process.platform === 'win32' && !retirementRequested)
+        void queryScope.cancel(
+          'subject-closed',
+          Error('Owned Windows leader closed during query'),
+        );
     });
     let stdout = '',
       stderr = '';
@@ -710,14 +1280,17 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
     });
     completion.catch((error) => {
       completionFailure = error;
+      if (queryScope.active())
+        void queryScope.cancel('native-completion', error);
+      else rejectWork(error);
     });
     completion.then(() => {
       if (!quiescentSeen && process.platform === 'win32')
         rejectQuiescent(Error('Owned Windows leader closed before quiescence'));
     }, rejectQuiescent);
     if (process.platform === 'win32') {
-      const packet = await quiescent;
-      const facts = JSON.parse(await readFile(factsPath, 'utf8'));
+      const packet = await guarded(quiescent);
+      const facts = JSON.parse(await guarded(readFile(factsPath, 'utf8')));
       const proofLine = stdout
         .split('\n')
         .find((value) => value.startsWith('MUSIC_NATIVE '));
@@ -734,26 +1307,33 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
         packet.runId !== runId
       )
         throw Error('Unqualified F3 Windows fixture retirement');
-      const retired = await retireOwnedWindowsFixture(
-        child,
-        { pid: child.pid!, parent: process.pid },
-        {
-          live: () =>
-            !childClosed &&
-            child!.exitCode === null &&
-            child!.signalCode === null &&
-            Date.now() < launchDeadline,
-          cohort: () => cim([child!.pid!], true),
-          leader: () => cim([child!.pid!]),
-          terminate: async () => {
-            retirementRequested = true;
-            await query(
-              'taskkill.exe',
-              ['/PID', String(child!.pid), '/T', '/F'],
-              'owned-taskkill',
-            );
+      const retired = await guarded(
+        retireOwnedWindowsFixture(
+          child,
+          { pid: child.pid!, parent: process.pid },
+          {
+            live: () =>
+              !childClosed &&
+              child!.exitCode === null &&
+              child!.signalCode === null &&
+              Date.now() < launchDeadline &&
+              !queryScope.isTerminal(),
+            cohort: () => cim([child!.pid!], true, 'cohort'),
+            leader: () => cim([child!.pid!], false, 'leader'),
+            terminate: async () => {
+              await query(
+                'taskkill.exe',
+                ['/PID', String(child!.pid), '/T', '/F'],
+                'owned-taskkill',
+                'taskkill',
+                undefined,
+                () => {
+                  retirementRequested = true;
+                },
+              );
+            },
           },
-        },
+        ),
       );
       windowsCohort = retired.cohort;
       forcedFixtureRetirement = true;
@@ -765,6 +1345,7 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
             'ps',
             ['-p', String(child.pid), '-o', 'pid=,pgid='],
             'owned-posix-group-identity',
+            'posix-identity',
           )
         )
           .trim()
@@ -780,7 +1361,7 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
         /* No qualification means no deletion, never a guessed group. */
       }
     }
-    await completion;
+    await guarded(completion);
     if (process.env.PEAR_MUSIC_NATIVE_TRACE === '1')
       process.stdout.write(stdout);
     const line = stdout
@@ -788,7 +1369,7 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
       .find((line) => line.startsWith('MUSIC_NATIVE '));
     if (!line) throw Error('Missing native music witness');
     const proof = JSON.parse(line.slice('MUSIC_NATIVE '.length));
-    const facts = JSON.parse(await readFile(factsPath, 'utf8'));
+    const facts = JSON.parse(await guarded(readFile(factsPath, 'utf8')));
     if (
       proof.mainPid !== child.pid ||
       proof.guardFacts?.pid !== child.pid ||
@@ -814,32 +1395,47 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
           ? 'fixed fixture tree retirement and sampled identity absence'
           : 'normal fixture quit and qualified group absence',
     };
+    Object.assign(proof as object, { ownedTiming: nativeTiming });
     return proof;
   } catch (error) {
     originalFailure = completionFailure ?? error;
     throw originalFailure;
   } finally {
+    if (workTimer !== undefined) clearTimeout(workTimer);
+    if (nativeTiming.nativeStartedAtMono !== null)
+      nativeTiming.nativeWorkEndedAtMono = performance.now();
     if (!keepFixture && (!prepared || child)) {
+      if (queryScope.active())
+        await queryScope.cancel(
+          'native-failure',
+          originalFailure ?? Error('Owned native failure'),
+        );
+      queryScope.enterCleanup();
       const cleanup = await cleanupOwnedNativeChild(child, {
-        now: Date.now,
+        now: () => performance.now(),
         timer: (callback, ms) => setTimeout(callback, ms),
         clear: (timer) => clearTimeout(timer),
         closed: () => !child || childClosed,
         waitClose: () => childClose,
+        queriesClosed: () => queryScope.queriesClosed(),
         treeEmpty,
         remove: () => rm(owned, { recursive: true, force: true }),
         record: (result) => {
+          nativeTiming.cleanupStartedAtMono = result.startedAtMono;
+          nativeTiming.cleanupEndedAtMono = result.endedAtMono;
           if (!result.complete || suppliedEvidence)
             writeFileSync(
               path.join(evidence, 'CLEANUP-FACTS.json'),
               JSON.stringify(
                 {
                   ...result,
+                  nativeTiming,
                   owned,
                   spawnedPID: child?.pid ?? null,
                   qualifiedGroup: qualifiedGroup ?? null,
                   forcedFixtureRetirement,
                   windowsCohort: windowsCohort ?? null,
+                  queryFacts: queryScope.snapshot(),
                   witnessMeaning:
                     process.platform === 'win32'
                       ? 'confirmed fixed taskkill and sampled same-identity cohort absence; not unseen-tree proof'
@@ -850,7 +1446,10 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
                       : originalFailure === undefined
                         ? null
                         : 'original native failure',
-                  profileRetained: !result.removed,
+                  profileRetained:
+                    result.removalRequested && !result.removed
+                      ? null
+                      : !result.removed,
                 },
                 null,
                 2,
@@ -865,12 +1464,23 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
           child?.unref();
         },
       });
+      if (queryScope.active()) {
+        await queryScope.cancel(
+          'cleanup-ended',
+          originalFailure ?? Error('Owned cleanup query incomplete'),
+        );
+        cleanup.complete = false;
+      }
+      if (cleanup.complete) queryScope.complete();
       assertNativeCleanupComplete(cleanup, originalFailure, owned);
     }
   }
 }
 
 test('Q4 actual REST IPC canonical queue native dispatch and physical cancellation', async () => {
+  const caseStartedAtMono = performance.now();
+  if (test.info().timeout !== 30000)
+    throw Error('Unexpected owned native case timeout');
   const proof: any = await queueActionsNative(async () => {
     const f = (globalThis as any).MusicNativeProof,
       http = require('node:http'),
@@ -1097,12 +1707,21 @@ test('Q4 actual REST IPC canonical queue native dispatch and physical cancellati
       restBeforeRemove: current.body.items.map((row: any) => row.item.id),
       restAfterRemove: next.body.items.map((row: any) => row.item.id),
     };
-  });
+  }, caseStartedAtMono);
   if (process.env.PEAR_Q4_PREPARE_ONLY === '1') {
     expect(proof.prepared).toBe(true);
     return;
   }
   assertQueueNativeProof(proof);
+  const timingReceipt = ownedNativeTimingReceipt(
+    proof.ownedTiming,
+    performance.now(),
+  );
+  process.stdout.write(
+    'Q4_OWNED_TIMING ' + JSON.stringify(timingReceipt) + '\n',
+  );
+  if (!timingReceipt.complete)
+    throw Error('Owned native timing evidence incomplete');
 });
 
 /** Independent literals: CLEAR cannot mask earlier incorrect queue mutations. */

@@ -538,6 +538,370 @@ function until(check: () => boolean) {
   return expect.poll(check).toBe(true);
 }
 
+// These boundaries use the fixture clock, so no real deadline timer can win.
+for (const elapsed of [10000, 10001]) {
+  test(`N1 deadline-only lost ACK rejects timeout at elapsed ${elapsed} and preserves the physical hold`, async () => {
+    const f = await operationFixture();
+    try {
+      const prepared = await f.service.prepare(f.grant.token, song),
+        command = { ...song, operationId: prepared.operationId },
+        deadline = (f.service as any).now() + 10000,
+        row = (f.service as any).operations.lookup(
+          prepared.operationId,
+          f.grant.record,
+          f.resource,
+        );
+      const execution = f.service.navigate(
+        f.grant.token,
+        command,
+        undefined,
+        deadline,
+      );
+      await until(() => f.calls.length === 1);
+      f.advance(elapsed);
+      f.calls[0].reject(Error('Owned dispatch ACK lost at deadline'));
+      await expect(execution).rejects.toMatchObject({ code: 'timeout' });
+      const receipt = {
+        operationId: prepared.operationId,
+        status: 'uncertain',
+        error: 'outcome_unknown',
+      };
+      expect(row.physicalHold).toBe(true);
+      expect(
+        await f.service.operation(f.grant.token, prepared.operationId),
+      ).toEqual(receipt);
+      expect(await f.service.navigate(f.grant.token, command)).toEqual(receipt);
+      expect(f.calls).toHaveLength(1);
+      f.calls[0].options.onPhysicalSettled('authenticated_ack');
+      expect(row.physicalHold).toBe(false);
+      expect(
+        await f.service.operation(f.grant.token, prepared.operationId),
+      ).toEqual(receipt);
+      expect(await f.service.navigate(f.grant.token, command)).toEqual(receipt);
+      expect(f.calls).toHaveLength(1);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test('N1 deadline crossed during authorization rejects timeout without broker admission', async () => {
+  const f = await operationFixture();
+  try {
+    const prepared = await f.service.prepare(f.grant.token, song);
+    f.authHold();
+    const execution = f.service.navigate(
+      f.grant.token,
+      { ...song, operationId: prepared.operationId },
+      undefined,
+      (f.service as any).now() + 10000,
+    );
+    f.advance(10000);
+    f.authRelease();
+    await expect(execution).rejects.toMatchObject({ code: 'timeout' });
+    expect(f.calls).toHaveLength(0);
+    expect(
+      await f.service.operation(f.grant.token, prepared.operationId),
+    ).toEqual(prepared);
+  } finally {
+    await f.close();
+  }
+});
+
+test('N1 deadline crossed at grant subscription rejects timeout without broker admission', async () => {
+  const f = await operationFixture();
+  try {
+    const prepared = await f.service.prepare(f.grant.token, song),
+      subscribe = f.store.subscribe.bind(f.store);
+    f.store.subscribe = (listener: () => void) => {
+      const detach = subscribe(listener);
+      f.advance(10000);
+      return detach;
+    };
+    const execution = f.service.navigate(
+      f.grant.token,
+      { ...song, operationId: prepared.operationId },
+      undefined,
+      (f.service as any).now() + 10000,
+    );
+    await expect(execution).rejects.toMatchObject({ code: 'timeout' });
+    expect(f.calls).toHaveLength(0);
+    f.store.subscribe = subscribe;
+    expect(
+      await f.service.operation(f.grant.token, prepared.operationId),
+    ).toEqual(prepared);
+  } finally {
+    await f.close();
+  }
+});
+
+test('N1 grant expiry after completed authorization takes precedence over deadline', async () => {
+  const f = await operationFixture();
+  try {
+    const prepared = await f.service.prepare(f.grant.token, song),
+      authorize = f.store.authorize.bind(f.store);
+    f.store.authorize = async (...args: any[]) => {
+      const principal = await authorize(...args);
+      f.advance(86400000);
+      return principal;
+    };
+    await expect(
+      f.service.navigate(
+        f.grant.token,
+        { ...song, operationId: prepared.operationId },
+        undefined,
+        (f.service as any).now() + 10000,
+      ),
+    ).rejects.toMatchObject({ code: 'retired' });
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});
+
+test('N1 deadline-only grant notification preserves a typed timeout abort', async () => {
+  const f = await operationFixture();
+  try {
+    const prepared = await f.service.prepare(f.grant.token, song),
+      command = { ...song, operationId: prepared.operationId },
+      subscribe = f.store.subscribe.bind(f.store);
+    let notify: (() => void) | undefined;
+    f.store.subscribe = (listener: () => void) => {
+      notify = listener;
+      return subscribe(listener);
+    };
+    const execution = f.service
+      .navigate(
+        f.grant.token,
+        command,
+        undefined,
+        (f.service as any).now() + 10000,
+      )
+      .catch((error: any) => error.code);
+    await until(() => f.calls.length === 1);
+    f.advance(10000);
+    notify!();
+    f.calls[0].reject(Error('Delayed ACK after unrelated grant notification'));
+    expect(await execution).toBe('timeout');
+    f.store.subscribe = subscribe;
+    expect(
+      await f.service.operation(f.grant.token, prepared.operationId),
+    ).toMatchObject({
+      status: 'uncertain',
+      error: 'outcome_unknown',
+    });
+    expect(f.calls).toHaveLength(1);
+    f.calls[0].options.onPhysicalSettled('authenticated_ack');
+  } finally {
+    await f.close();
+  }
+});
+
+for (const retirement of [
+  'native',
+  'grant-expiry',
+  'grant-revocation',
+  'revision',
+]) {
+  test(`N1 actual ${retirement} retirement takes precedence over coincident deadline`, async () => {
+    const f = await operationFixture();
+    try {
+      const prepared = await f.service.prepare(f.grant.token, song),
+        command = { ...song, operationId: prepared.operationId };
+      const execution = f.service
+        .navigate(
+          f.grant.token,
+          command,
+          undefined,
+          (f.service as any).now() + 10000,
+        )
+        .catch((error: any) => error.code);
+      await until(() => f.calls.length === 1);
+      f.advance(retirement === 'grant-expiry' ? 86400000 : 10000);
+      if (retirement === 'native') f.retire();
+      if (retirement === 'grant-revocation')
+        await f.store.revoke(f.grant.record.id, () => true);
+      if (retirement === 'revision') f.service.configure(f.config);
+      f.calls[0].reject(Error('ACK lost with actual retirement'));
+      expect(await execution).toBe('retired');
+      await expect(
+        f.service.navigate(f.grant.token, command),
+      ).rejects.toMatchObject({
+        code: retirement.startsWith('grant-') ? 'unauthorized' : 'retired',
+      });
+      expect(f.calls).toHaveLength(1);
+      f.calls[0].options.onPhysicalSettled('authenticated_ack');
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+// Capture the actual installed callbacks; only the fixture clock/state changes.
+for (const condition of [
+  'deadline-only',
+  'expired-grant',
+  'lost-native-owner',
+  'grant-timer-before-clock-expiry',
+]) {
+  test(`N1 final deadline callback classifies actual ${condition} state`, async () => {
+    const f = await operationFixture();
+    const callbacks: (() => void)[] = [],
+      original = globalThis.setTimeout;
+    let execution: Promise<any> | undefined;
+    try {
+      if (condition === 'expired-grant')
+        f.advance(f.grant.record.expiresAt - (f.service as any).now() - 10001);
+      if (condition === 'grant-timer-before-clock-expiry')
+        f.advance(f.grant.record.expiresAt - (f.service as any).now() - 1000);
+      const prepared = await f.service.prepare(f.grant.token, song);
+      try {
+        globalThis.setTimeout = ((callback: any, ...args: any[]) => {
+          callbacks.push(callback);
+          return (original as any)(callback, ...args);
+        }) as any;
+        execution = f.service
+          .navigate(
+            f.grant.token,
+            { ...song, operationId: prepared.operationId },
+            undefined,
+            (f.service as any).now() + 10000,
+          )
+          .catch((error: any) => error.code);
+        for (let turn = 0; turn < 100 && f.calls.length === 0; turn++)
+          await Promise.resolve();
+      } finally {
+        globalThis.setTimeout = original;
+      }
+      expect(f.calls).toHaveLength(1);
+      expect(callbacks).toHaveLength(2);
+      f.advance(
+        condition === 'expired-grant'
+          ? 10001
+          : condition === 'grant-timer-before-clock-expiry'
+            ? 0
+            : 10000,
+      );
+      if (condition === 'lost-native-owner') f.retire();
+      callbacks[1]();
+      expect(await execution).toBe(
+        condition === 'deadline-only' ? 'timeout' : 'retired',
+      );
+    } finally {
+      globalThis.setTimeout = original;
+      if (f.calls.length) {
+        f.calls[0].reject(Error('Late ACK after controlled final callback'));
+        f.calls[0].options.onPhysicalSettled('authenticated_ack');
+      }
+      await f.close();
+    }
+  });
+}
+
+for (const condition of ['deadline-only', 'lost-native-owner']) {
+  test(`N1 initial deadline callback classifies actual ${condition} state`, async () => {
+    const f = await operationFixture();
+    const callbacks: (() => void)[] = [],
+      original = globalThis.setTimeout;
+    try {
+      const prepared = await f.service.prepare(f.grant.token, song);
+      f.authHold();
+      let execution: Promise<any>;
+      try {
+        globalThis.setTimeout = ((callback: any, ...args: any[]) => {
+          callbacks.push(callback);
+          return (original as any)(callback, ...args);
+        }) as any;
+        execution = f.service
+          .navigate(
+            f.grant.token,
+            { ...song, operationId: prepared.operationId },
+            undefined,
+            (f.service as any).now() + 10000,
+          )
+          .catch((error: any) => error.code);
+      } finally {
+        globalThis.setTimeout = original;
+      }
+      expect(callbacks).toHaveLength(1);
+      f.advance(10000);
+      if (condition === 'lost-native-owner') f.retire();
+      callbacks[0]();
+      expect(await execution).toBe(
+        condition === 'deadline-only' ? 'timeout' : 'retired',
+      );
+      expect(f.calls).toHaveLength(0);
+    } finally {
+      globalThis.setTimeout = original;
+      f.authRelease();
+      await f.close();
+    }
+  });
+}
+
+test('N1 equal grant and request deadline timer retires the grant', async () => {
+  const f = await operationFixture();
+  try {
+    f.advance(f.grant.record.expiresAt - (f.service as any).now() - 50);
+    const prepared = await f.service.prepare(f.grant.token, song),
+      row = (f.service as any).operations.lookup(
+        prepared.operationId,
+        f.grant.record,
+        f.resource,
+      ),
+      execution = f.service
+        .navigate(
+          f.grant.token,
+          { ...song, operationId: prepared.operationId },
+          undefined,
+          f.grant.record.expiresAt,
+        )
+        .catch((error: any) => error.code);
+    for (let turn = 0; turn < 100 && f.calls.length === 0; turn++)
+      await Promise.resolve();
+    expect(f.calls).toHaveLength(1);
+    f.advance(50);
+    expect(await execution).toBe('retired');
+    expect(row.physicalHold).toBe(true);
+    f.calls[0].reject(Error('Late ACK after grant expiry'));
+    f.calls[0].options.onPhysicalSettled('authenticated_ack');
+    await expect(
+      f.service.operation(f.grant.token, prepared.operationId),
+    ).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(f.calls).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test('N1 typed timeout abort remains an error when native ownership also retires', async () => {
+  const f = await operationFixture();
+  try {
+    const prepared = await f.service.prepare(f.grant.token, song),
+      command = { ...song, operationId: prepared.operationId },
+      timeout = await f.service
+        .navigate(f.grant.token, command, undefined, (f.service as any).now())
+        .catch((error: any) => error);
+    expect(timeout).toMatchObject({ code: 'timeout' });
+    const controller = new AbortController(),
+      execution = f.service
+        .navigate(f.grant.token, command, controller.signal)
+        .catch((error: any) => error.code);
+    await until(() => f.calls.length === 1);
+    controller.abort(timeout);
+    f.retire();
+    f.calls[0].reject(Error('Late ACK failure'));
+    expect(await execution).toBe('timeout');
+    await expect(
+      f.service.operation(f.grant.token, prepared.operationId),
+    ).rejects.toMatchObject({ code: 'retired' });
+    expect(f.calls).toHaveLength(1);
+    f.calls[0].options.onPhysicalSettled('authenticated_ack');
+  } finally {
+    await f.close();
+  }
+});
+
 test('N1 duplicate cancellation cannot cancel original execution and status remains private', async () => {
   const f = await operationFixture();
   try {

@@ -15,8 +15,10 @@ test.afterEach(async () => {
   }
 });
 
-test('native auth windows use distinct ephemeral sessions and secure child flags, then clear only owned state', async () => {
+test('native auth windows use distinct ephemeral sessions and secure child flags, then clear only owned state', async ({}, testInfo) => {
   const fixture = await scrobblerAuthNative();
+  let hasBodyFailure = false;
+  let bodyFailure: unknown;
   try {
     const result = await fixture.evaluate(async ({ BrowserWindow }) => {
       const f = (globalThis as any).AuthWindowFixture;
@@ -191,9 +193,52 @@ test('native auth windows use distinct ephemeral sessions and secure child flags
       ownedClearOnly: true,
       parentHooks: true,
     });
+  } catch (error) {
+    hasBodyFailure = true;
+    bodyFailure = error;
+    throw error;
   } finally {
-    console.log(await fixture.trace());
-    await fixture.close();
+    let hasCleanupFailure = false;
+    let cleanupFailure: unknown;
+    try {
+      console.log(await fixture.trace());
+      await fixture.close();
+    } catch (error) {
+      hasCleanupFailure = true;
+      cleanupFailure = error;
+    }
+    try {
+      const packet = {
+        schema: 1,
+        body: hasBodyFailure ? 'failed' : 'passed',
+        cleanup: hasCleanupFailure ? 'failed' : 'passed',
+        fixture: fixture.diagnostics(),
+      };
+      const body = Buffer.from(JSON.stringify(packet));
+      if (body.length <= 4096) {
+        console.log(body.toString());
+        await testInfo.attach('scrobbler-native-diagnostics', {
+          body,
+          contentType: 'application/json',
+        });
+      }
+    } catch {
+      // Diagnostic emission must not replace the body or cleanup outcome.
+    }
+    if (hasCleanupFailure) {
+      if (!hasBodyFailure) throw cleanupFailure;
+      const error = new AggregateError(
+        [bodyFailure, cleanupFailure],
+        'Native auth test body and cleanup failed',
+      );
+      Object.defineProperty(error, 'diagnosticErrors', {
+        value: Object.freeze([
+          Object.freeze({ phase: 'body', error: bodyFailure }),
+          Object.freeze({ phase: 'cleanup', error: cleanupFailure }),
+        ]),
+      });
+      throw error;
+    }
   }
 });
 
