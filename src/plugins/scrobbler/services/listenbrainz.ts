@@ -5,6 +5,7 @@ import { APPLICATION_NAME } from '@/i18n';
 import {
   ScrobblerBase,
   projectSong,
+  readProjectedSong,
   type ServiceRuntime,
   type SubmissionOwner,
 } from './base';
@@ -73,7 +74,10 @@ export class ListenbrainzScrobbler extends ScrobblerBase {
     kind: string,
   ): Promise<boolean> {
     const account = this.capture(),
-      song = projectSong(info, config);
+      song =
+        owner.metadata === undefined
+          ? projectSong(info, config)
+          : readProjectedSong(owner.metadata);
     if (!account || !song || owner.signal.aborted) return false;
     const scope = new AbortController();
     this.requests.add(scope);

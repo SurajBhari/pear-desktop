@@ -52,7 +52,7 @@ export async function scrobblerBundle(boundary: unknown) {
           },
           load(id) {
             if (id === '\0scrobbler:electron')
-              return 'const b=globalThis.__scrobblerBoundary;export const net={fetch:(...a)=>b.fetcher(...a)};export const ipcMain=b.ipcMain;export const BrowserWindow=b.BrowserWindow;export const dialog={showMessageBox:async()=>({response:1})};';
+              return 'const b=globalThis.__scrobblerBoundary;export const app={getVersion:()=>"TEST"};export const net={fetch:(...a)=>b.fetcher(...a)};export const ipcMain=b.ipcMain;export const BrowserWindow=b.BrowserWindow;export const dialog={showMessageBox:async()=>({response:1})};';
             if (id === '\0scrobbler:@/utils')
               return 'export const createBackend=v=>v;export const createPlugin=v=>v;';
             if (id === '\0scrobbler:@/i18n')
