@@ -339,57 +339,69 @@ export class MusicService {
       controller.signal,
       ...(signal ? [signal] : []),
     ]);
-    const currentOwner = () =>
+    const ownerCurrent = () =>
       !joined.aborted &&
       !signal?.aborted &&
       !this.stopped &&
       this.enabled &&
       revision === this.revision &&
       this.resource === resource &&
-      this.broker.isCurrent(admission) &&
-      this.now() < deadline;
+      this.broker.isCurrent(admission);
+    const currentOwner = () => ownerCurrent() && this.now() < deadline;
+    const principalCurrent = (principal: MusicGrantRecord) =>
+      this.grants.isCurrent(principal, scope) &&
+      extra.every((permission) => this.grants.isCurrent(principal, permission));
+    const invalidReason = (
+      principal?: MusicGrantRecord,
+      fallback: 'retired' | 'timeout' = 'timeout',
+    ) => {
+      // Preserve an observed abort. Otherwise actual retirement takes precedence
+      // over a coincident request deadline, even before its timer callback runs.
+      if (joined.reason instanceof MusicServiceError) return joined.reason;
+      return new MusicServiceError(
+        !ownerCurrent() || (principal && !principalCurrent(principal))
+          ? 'retired'
+          : fallback,
+      );
+    };
     let detach = () => {},
       timer: ReturnType<typeof setTimeout> | undefined;
     try {
       timer = setTimeout(
-        () => controller.abort(new MusicServiceError('timeout')),
+        () => controller.abort(invalidReason()),
         Math.max(0, deadline - this.now()),
       );
       timer.unref?.();
-      if (!currentOwner()) return failMusic('retired');
+      if (!currentOwner()) throw invalidReason();
       const principal = await waitOwned(
         this.grants.authorize(token, 'rest', resource, scope),
         joined,
       );
-      if (!currentOwner()) return failMusic('retired');
+      if (!currentOwner()) throw invalidReason(principal);
       for (const permission of extra) {
         await waitOwned(
           this.grants.authorize(token, 'rest', resource, permission),
           joined,
         );
-        if (!currentOwner()) return failMusic('retired');
+        if (!currentOwner()) throw invalidReason(principal);
       }
-      const current = () =>
-        currentOwner() &&
-        this.grants.isCurrent(principal, scope) &&
-        extra.every((permission) =>
-          this.grants.isCurrent(principal, permission),
-        );
+      const current = () => currentOwner() && principalCurrent(principal);
       detach = this.grants.subscribe(() => {
-        if (!current()) controller.abort();
+        if (!current()) controller.abort(invalidReason(principal));
       });
       clearTimeout(timer);
       timer = setTimeout(
         () =>
           controller.abort(
-            new MusicServiceError(
-              principal.expiresAt < deadline ? 'retired' : 'timeout',
+            invalidReason(
+              principal,
+              principal.expiresAt <= deadline ? 'retired' : 'timeout',
             ),
           ),
         Math.max(0, Math.min(deadline, principal.expiresAt) - this.now()),
       );
       timer.unref?.();
-      if (!current()) return failMusic('retired');
+      if (!current()) throw invalidReason(principal);
       const result = await waitOwned(
         action({
           principal,
@@ -404,7 +416,7 @@ export class MusicService {
         }),
         joined,
       );
-      if (!current()) return failMusic('retired');
+      if (!current()) throw invalidReason(principal);
       return result;
     } catch (error) {
       if (error instanceof MusicServiceError) throw error;
