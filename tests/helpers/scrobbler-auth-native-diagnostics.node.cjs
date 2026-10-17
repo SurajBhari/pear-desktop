@@ -4,7 +4,9 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { readFileSync } = require('node:fs');
 const { resolve } = require('node:path');
-const path = require('node:path');
+// Synthetic fixture paths and Map keys use POSIX on every host. Source-file
+// reads above/below keep the real host's resolve; no actual path is emulated.
+const path = require('node:path').posix;
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const { stripTypeScriptTypes } = require('node:module');
@@ -859,5 +861,66 @@ for (const [property, initial] of [
       else assert.equal(facts[property], initial);
     }
     assert.deepEqual(observed.reads, [1, 1]);
+  });
+}
+
+// Portability facade controls: replay every preceding pure case with host-native
+// source resolution and either default path flavour. Never load real app tools.
+async function runPathFacade(defaultPath) {
+  const actualPath = require('node:path');
+  const source = readFileSync(
+    resolve(__dirname, 'scrobbler-auth-native-diagnostics.node.cjs'),
+    'utf8',
+  );
+  const marker = '// Portability ' + 'facade controls:';
+  assert.equal(source.split(marker).length, 2, 'unique facade boundary');
+  const cases = [];
+  const allowed = new Set([
+    'node:assert/strict',
+    'node:fs',
+    'node:crypto',
+    'node:events',
+    'node:module',
+    'node:vm',
+  ]);
+  const context = vm.createContext({
+    require(name) {
+      if (name === 'node:test')
+        return { test: (title, callback) => cases.push({ title, callback }) };
+      if (name === 'node:path')
+        return {
+          ...defaultPath,
+          // Source reads must use real host paths, even in the Win32 facade.
+          resolve: actualPath.resolve,
+          posix: actualPath.posix,
+          win32: actualPath.win32,
+        };
+      assert.ok(allowed.has(name), 'unexpected portability dependency');
+      return require(name);
+    },
+    __dirname,
+    Buffer,
+    Error,
+    AggregateError,
+    AbortController,
+    URL,
+    Response,
+    queueMicrotask,
+  });
+  vm.runInContext(source.slice(0, source.indexOf(marker)), context);
+  assert.equal(cases.length, 30, 'complete original pure-control pipeline');
+  const failed = [];
+  for (const entry of cases) {
+    try {
+      await entry.callback();
+    } catch {
+      failed.push(entry.title);
+    }
+  }
+  assert.deepEqual(failed, [], 'all pure fake pipelines must pass');
+}
+for (const flavour of ['posix', 'win32']) {
+  test(`full pure pipeline passes with ${flavour} default path facade`, async () => {
+    await runPathFacade(require('node:path')[flavour]);
   });
 }
