@@ -10,6 +10,8 @@ import {
   type WsServiceName,
 } from './config';
 import { backend } from './main';
+import { validMusicBrainzEmail } from './services/musicbrainz';
+import { RegexFilters } from './services/regex-filters';
 
 import type { MenuTemplate } from '@/menu';
 import type { MenuContext } from '@/types/contexts';
@@ -44,6 +46,98 @@ export const onMenu = async ({
   if (!current()) return [];
   const write = (patch: ScrobblerConfigPatch) =>
     current() ? applyScrobblerPatch(setConfig, patch) : undefined;
+  const contact = async (enable = false) => {
+    const original = await getConfig();
+    if (!current()) return false;
+    const originalEmail = original.musicBrainzEmail,
+      originalEnabled = original.useMusicBrainz;
+    const output: unknown = await prompt(
+      {
+        title: t('plugins.scrobbler.prompt.musicbrainz-email.title'),
+        label: t('plugins.scrobbler.prompt.musicbrainz-email.label'),
+        type: 'input',
+        value: original.musicBrainzEmail ?? '',
+        inputAttrs: { type: 'email', maxLength: 254 },
+        ...promptOptions(),
+      },
+      window,
+    );
+    if (!current() || typeof output !== 'string') return false;
+    const email = output.trim();
+    if ((email !== '' && !validMusicBrainzEmail(email)) || (enable && !email))
+      return false;
+    const latest = await getConfig();
+    if (
+      !current() ||
+      latest.musicBrainzEmail !== originalEmail ||
+      (enable && latest.useMusicBrainz !== originalEnabled)
+    )
+      return false;
+    await write({
+      musicBrainzEmail: email,
+      ...(enable
+        ? { useMusicBrainz: true }
+        : !email
+          ? { useMusicBrainz: false }
+          : {}),
+    });
+    return current();
+  };
+  const editFilter = async (index: number) => {
+    const original = await getConfig();
+    if (!current()) return;
+    const snapshot = JSON.stringify(original.customRegexFilters ?? []);
+    const patterns = original.customRegexFilters ?? [];
+    if (
+      !Array.isArray(patterns) ||
+      patterns.length > 32 ||
+      patterns.some((value) => typeof value !== 'string') ||
+      index > patterns.length
+    )
+      return;
+    const output: unknown = await prompt(
+      {
+        title: t('plugins.scrobbler.menu.regex-filters'),
+        label: t('plugins.scrobbler.prompt.regex-filter.label'),
+        type: 'input',
+        value: patterns[index] ?? '',
+        inputAttrs: { type: 'text', maxLength: 256 },
+        ...promptOptions(),
+      },
+      window,
+    );
+    if (!current() || typeof output !== 'string' || /[\r\n]/.test(output))
+      return;
+    const next = [...patterns];
+    if (output.trim()) next[index] = output.trim();
+    else next.splice(index, 1);
+    const validator = new RegexFilters();
+    let result;
+    try {
+      result = await validator.validate(next.join('\n'));
+    } finally {
+      validator.stop();
+    }
+    if (!current()) return;
+    if (!result.ok) {
+      const { dialog } = await import('electron');
+      if (current())
+        await dialog.showMessageBox(window, {
+          type: 'error',
+          title: t('plugins.scrobbler.dialog.invalid-regex.title'),
+          message: t('plugins.scrobbler.dialog.invalid-regex.message', {
+            line: result.line ?? index + 1,
+          }),
+        });
+      return;
+    }
+    const latest = await getConfig();
+    if (
+      current() &&
+      JSON.stringify(latest.customRegexFilters ?? []) === snapshot
+    )
+      await write({ customRegexFilters: result.patterns });
+  };
   const tuple = (value: ScrobblerPluginConfig, name: WsServiceName) => {
     const account = value.scrobblers?.[name];
     return JSON.stringify([account?.apiRoot, account?.apiKey, account?.secret]);
@@ -178,6 +272,45 @@ export const onMenu = async ({
       checked: config.artistSource === 'first-tag',
       click: (item) =>
         write({ artistSource: item.checked ? 'first-tag' : 'primary' }),
+    },
+    {
+      label: t('plugins.scrobbler.menu.regex-filters'),
+      submenu: [
+        {
+          label: t('main.menu.plugins.enabled'),
+          type: 'checkbox',
+          checked: config.regexFiltersEnabled === true,
+          click: (item) => write({ regexFiltersEnabled: item.checked }),
+        },
+        ...(Array.isArray(config.customRegexFilters)
+          ? config.customRegexFilters.slice(0, 32)
+          : []
+        ).map((pattern, index) => ({
+          label: `${index + 1}. ${String(pattern).slice(0, 100)}`,
+          click: () => editFilter(index),
+        })),
+        {
+          label: t('plugins.scrobbler.menu.add-regex-filter'),
+          enabled: (config.customRegexFilters?.length ?? 0) < 32,
+          click: () => editFilter(config.customRegexFilters?.length ?? 0),
+        },
+      ],
+    },
+    {
+      label: t('plugins.scrobbler.menu.use-musicbrainz'),
+      type: 'checkbox',
+      checked: config.useMusicBrainz === true,
+      async click(item) {
+        const original = await getConfig();
+        if (!current()) return;
+        if (item.checked && !validMusicBrainzEmail(original.musicBrainzEmail)) {
+          item.checked = await contact(true);
+        } else await write({ useMusicBrainz: item.checked });
+      },
+    },
+    {
+      label: t('plugins.scrobbler.menu.musicbrainz-email'),
+      click: () => contact(),
     },
     compatible('lastfm'),
     compatible('librefm'),

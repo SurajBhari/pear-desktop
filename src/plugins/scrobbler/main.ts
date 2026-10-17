@@ -28,11 +28,22 @@ import {
   type ScrobblerConfigPatch,
   type WsServiceName,
 } from './config';
+import {
+  projectSong,
+  readProjectedSong,
+  type ProjectedSong,
+  type ScrobblerBase,
+  type ServiceRuntime,
+} from './services/base';
 import { createLastFmService } from './services/lastfm';
 import { createLibreFmService } from './services/librefm';
 import { createListenbrainzService } from './services/listenbrainz';
+import {
+  Metadata,
+  metadataEnabled,
+  type MetadataPreparer,
+} from './services/metadata';
 
-import type { ScrobblerBase, ServiceRuntime } from './services/base';
 import type { BackendContext } from '@/types/contexts';
 
 export type SetConfType = (conf: ScrobblerConfigPatch) => void | Promise<void>;
@@ -42,6 +53,12 @@ type Track = {
   token: SongInfoProvenance;
   scope: AbortController;
   submitted: boolean;
+  preparation?: {
+    revision: number;
+    promise: Promise<ProjectedSong>;
+    freeze: () => ProjectedSong;
+    cancel: () => void;
+  };
 };
 const merge = deepmergeCustom({ mergeArrays: false });
 export class ScrobblerManager {
@@ -56,7 +73,12 @@ export class ScrobblerManager {
   private latest?: SongInfo;
   private timer?: NodeJS.Timeout;
   private cleanup: (() => void)[] = [];
-  constructor(private readonly context: BackendContext<ScrobblerPluginConfig>) {
+  private readonly metadata: MetadataPreparer;
+  constructor(
+    private readonly context: BackendContext<ScrobblerPluginConfig>,
+    dependencies: { metadata?: MetadataPreparer } = {},
+  ) {
+    this.metadata = dependencies.metadata ?? new Metadata();
     this.contents = context.window.webContents;
     try {
       this.frame = this.contents.mainFrame;
@@ -203,6 +225,8 @@ export class ScrobblerManager {
     clearTimeout(this.timer);
     this.timer = undefined;
     this.track?.scope.abort();
+    this.track?.preparation?.cancel();
+    if (this.track) this.track.preparation = undefined;
     if (clear) this.track = undefined;
     else if (this.track) this.track.scope = new AbortController();
   }
@@ -211,6 +235,7 @@ export class ScrobblerManager {
     this.active = false;
     this.retireTrack();
     this.retireServices();
+    this.metadata.stop();
     this.latest = undefined;
     for (const dispose of this.cleanup.splice(0)) dispose();
   }
@@ -330,8 +355,9 @@ export class ScrobblerManager {
       !info ||
       !token ||
       !this.current(info, token)
-    )
+    ) {
       return;
+    }
     if (!this.track || this.track.token !== token) {
       this.retireTrack();
       this.track = {
@@ -349,8 +375,10 @@ export class ScrobblerManager {
       (!config.scrobbleOtherMedia &&
         info.mediaType !== MediaType.Audio &&
         info.mediaType !== MediaType.OriginalMusicVideo)
-    )
+    ) {
+      track.preparation?.freeze();
       return;
+    }
     const revision = this.configRevision,
       epoch = this.viewEpoch;
     const owner = {
@@ -363,10 +391,86 @@ export class ScrobblerManager {
         !track.scope.signal.aborted &&
         this.current(track.info, track.token),
     };
-    for (const service of this.services.values())
-      service.setNowPlaying(info, config, owner).catch(() => {});
     const elapsed = info.elapsedSeconds ?? 0,
       duration = info.songDuration;
+    const validTiming =
+      Number.isFinite(elapsed) &&
+      elapsed >= 0 &&
+      Number.isFinite(duration) &&
+      duration >= 0;
+    const threshold = Math.min(Math.ceil(duration / 2), 4 * 60);
+    const delay =
+      validTiming && threshold > elapsed
+        ? (threshold - elapsed) * 1000
+        : undefined;
+    const input = projectSong(info, config);
+    if (!input) return;
+    if (!track.preparation || track.preparation.revision !== revision) {
+      const scope = new AbortController();
+      const signal = AbortSignal.any([owner.signal, scope.signal]);
+      let best = input,
+        frozen = false;
+      let settle!: (value: ProjectedSong) => void;
+      let deadline: NodeJS.Timeout | undefined;
+      const promise = new Promise<ProjectedSong>((resolve) => {
+        settle = resolve;
+      });
+      const freeze = () => {
+        if (!frozen) {
+          frozen = true;
+          clearTimeout(deadline);
+          scope.abort();
+          settle(Object.freeze(best));
+        }
+        return best;
+      };
+      track.preparation = {
+        revision,
+        promise,
+        freeze,
+        cancel: () => {
+          freeze();
+        },
+      };
+      if (metadataEnabled(config)) {
+        const budget = Math.min(2500, delay ?? 2500);
+        if (delay === undefined || budget < delay)
+          deadline = setTimeout(freeze, budget);
+        const snapshot = {
+          ...config,
+          customRegexFilters: Array.isArray(config.customRegexFilters)
+            ? [...config.customRegexFilters]
+            : config.customRegexFilters,
+        };
+        this.metadata
+          .prepare(input, snapshot, signal, budget, (fallback) => {
+            const accepted = readProjectedSong(fallback);
+            if (!frozen && owner.isCurrent() && accepted) best = accepted;
+          })
+          .then((result) => {
+            const accepted = readProjectedSong(result);
+            if (!frozen && owner.isCurrent() && accepted) best = accepted;
+            freeze();
+          }, freeze);
+      } else freeze();
+    }
+    const preparation = track.preparation;
+    let announced = false;
+    const announce = (metadata: ProjectedSong) => {
+      if (
+        announced ||
+        !owner.isCurrent() ||
+        track.info.isPaused ||
+        track.preparation !== preparation
+      )
+        return;
+      announced = true;
+      for (const service of this.services.values())
+        service
+          .setNowPlaying(info, config, { ...owner, metadata })
+          .catch(() => {});
+    };
+    preparation.promise.then(announce);
     if (
       !Number.isFinite(elapsed) ||
       elapsed < 0 ||
@@ -375,7 +479,6 @@ export class ScrobblerManager {
       track.submitted
     )
       return;
-    const threshold = Math.min(Math.ceil(duration / 2), 4 * 60);
     // Preserve the existing threshold/elapsed branch; TimeChanged mutates info.
     if (threshold > elapsed)
       this.timer = setTimeout(
@@ -383,10 +486,12 @@ export class ScrobblerManager {
           this.timer = undefined;
           if (!owner.isCurrent() || track.info.isPaused || track.submitted)
             return;
+          const metadata = preparation.freeze();
+          announce(metadata);
           track.submitted = true;
           for (const service of this.services.values())
             service
-              .addScrobble(track.info, this.config!, owner)
+              .addScrobble(track.info, this.config!, { ...owner, metadata })
               .catch(() => {});
         },
         (threshold - elapsed) * 1000,
@@ -395,7 +500,8 @@ export class ScrobblerManager {
 }
 export const createScrobblerManager = (
   context: BackendContext<ScrobblerPluginConfig>,
-) => new ScrobblerManager(context);
+  dependencies?: { metadata?: MetadataPreparer },
+) => new ScrobblerManager(context, dependencies);
 export const backend = createBackend<
   {
     manager?: ScrobblerManager;

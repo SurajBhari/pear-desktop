@@ -994,6 +994,10 @@
             "message": "Failed to authenticate with Last.fm\nHide the popup until the next restart.",
             "title": "Authentication Failed"
           }
+        },
+        "invalid-regex": {
+          "title": "Invalid or unavailable regular expression",
+          "message": "Filter {{line}} could not be validated within its limits."
         }
       },
       "menu": {
@@ -1005,7 +1009,11 @@
         },
         "scrobble-alternative-title": "Use alternative titles",
         "scrobble-alternative-artist": "Prefer first tag as artist (legacy)",
-        "scrobble-other-media": "Scrobble other media"
+        "scrobble-other-media": "Scrobble other media",
+        "regex-filters": "Regular expression filters",
+        "add-regex-filter": "Add filter",
+        "use-musicbrainz": "Use MusicBrainz to correct metadata",
+        "musicbrainz-email": "MusicBrainz contact email"
       },
       "name": "Scrobbler",
       "prompt": {
@@ -1018,6 +1026,13 @@
             "label": "Enter your ListenBrainz user token:",
             "title": "ListenBrainz token"
           }
+        },
+        "regex-filter": {
+          "label": "Enter one regex (blank removes it). Filters run in order; enabled filters affect title and artist."
+        },
+        "musicbrainz-email": {
+          "title": "MusicBrainz contact email",
+          "label": "Contact email sent to MusicBrainz with lookup requests. Blank disables correction."
         }
       }
     },
