@@ -1,6 +1,6 @@
 import { keysClash } from './key';
 
-import type { TrackAnalysis } from './analysis';
+import type { TempoSection, TrackAnalysis } from './analysis';
 
 export type TransitionStyle = 'blend' | 'segue' | 'cut' | 'smooth';
 export type TransitionPreference = 'auto' | TransitionStyle;
@@ -66,6 +66,11 @@ export interface TransitionPlan {
   /** Camelot keys at the mix point, when detected (e.g. "8A") */
   fromKey?: string;
   toKey?: string;
+  /**
+   * How tonal both songs are at once through a blend (0..1): clashing keys
+   * are only heard where both play chords, melody or vocals
+   */
+  tonalOverlap?: number;
 }
 
 /**
@@ -77,6 +82,14 @@ const MAX_EARLY_SECONDS = 12;
 const PHRASE_BARS = 4;
 /** How far a blend may move earlier to start on a phrase instead of a bar */
 const PHRASE_SNAP_SECONDS = 5;
+
+/**
+ * Over clashing keys, blends where both songs are this tonal at once are
+ * kept short (to these lengths); over drums the full length is fine
+ */
+const TONAL_CLASH = 0.12;
+const CLASH_BLEND_BEATS = 8;
+const CLASH_ENDING_BEATS = 4;
 
 /** Seconds of run-up the player needs to lock a blend's incoming song */
 const BLEND_RUN_UP = 2;
@@ -170,19 +183,58 @@ const latestGridPoint = (grid: number[], min: number, max: number) => {
   return undefined;
 };
 
+/** Tonal share of a section at a track time; unknown counts as tonal */
+const tonalAt = (section: TempoSection, time: number) => {
+  const profile = section.tonal;
+  if (!profile) return 1;
+  return profile.values[Math.floor((time - profile.start) / profile.step)] ?? 1;
+};
+
+/**
+ * How tonal both songs are at once through a blend: the less tonal of the
+ * two at each moment, weighted by how loud both are then
+ */
+const tonalOverlap = (
+  out: TempoSection,
+  into: TempoSection,
+  plan: TransitionPlan,
+) => {
+  const steps = Math.max(1, Math.ceil(plan.duration / 0.25));
+  let sum = 0;
+  let weights = 0;
+  for (let i = 0; i < steps; i++) {
+    const x = (i + 0.5) / steps;
+    const time = x * plan.duration;
+    const weight = Math.min(
+      Math.sin((x * Math.PI) / 2),
+      plan.holdOutgoing ? 1 : Math.cos((x * Math.PI) / 2),
+    );
+    sum +=
+      weight *
+      Math.min(
+        tonalAt(out, plan.mixOut + time),
+        tonalAt(into, plan.mixIn + (time * plan.rate)),
+      );
+    weights += weight;
+  }
+  return weights > 0 ? sum / weights : 0;
+};
+
+/** Whether a blend would be heard clashing, if the keys clash */
+type ClashCheck = (plan: TransitionPlan) => boolean;
+
 const planBlend = (
   from: TrackAnalysis,
   to: TrackAnalysis,
   options: PlannerOptions,
-  clash = false,
+  clashes: ClashCheck = () => false,
 ): TransitionPlan | null => {
   const rate = tempoRatio(from.bpm, to.bpm);
   if (!Number.isFinite(rate)) return null;
 
   // Try the requested length first, then shorter blends if we're out of
-  // room. Clashing keys get a short overlap
-  const longest = clash ? Math.min(options.blendBeats, 8) : options.blendBeats;
-  for (let beats = longest; beats >= 4; beats /= 2) {
+  // room. Clashing keys get a short overlap, unless one side is just drums
+  for (let beats = options.blendBeats; beats >= 4; beats /= 2) {
     const duration = beats * from.beatPeriod;
     const latestStart = from.trailingSilenceStart - duration;
     // Start in the outro, but never so late that the blend runs past the end
@@ -213,7 +265,7 @@ const planBlend = (
       continue;
     }
 
-    return {
+    const plan: TransitionPlan = {
       style: 'blend',
       reason: 'fallback',
       mixOut,
@@ -224,6 +276,8 @@ const planBlend = (
       fromBpm: from.bpm,
       toBpm: to.bpm,
     };
+    if (beats > CLASH_BLEND_BEATS && clashes(plan)) continue;
+    return plan;
   }
 
   return null;
@@ -238,18 +292,17 @@ const planEndingBlend = (
   from: TrackAnalysis,
   to: TrackAnalysis,
   options: PlannerOptions,
-  clash = false,
+  clashes: ClashCheck = () => false,
 ): TransitionPlan | null => {
   const rate = tempoRatio(from.bpm, to.bpm);
   const hit = finalHit(from);
   if (!Number.isFinite(rate) || hit === undefined) return null;
 
-  const longest = Math.min(options.blendBeats, clash ? 4 : 8);
-  for (let beats = longest; beats >= 4; beats /= 2) {
+  for (let beats = options.blendBeats; beats >= 4; beats /= 2) {
     const duration = beats * from.beatPeriod;
     const mixOut = hit - duration;
     if (mixOut < options.earliestMixOut) continue;
-    return {
+    const plan: TransitionPlan = {
       style: 'blend',
       reason: 'fallback',
       mixOut,
@@ -261,6 +314,8 @@ const planEndingBlend = (
       toBpm: to.bpm,
       holdOutgoing: true,
     };
+    if (beats > CLASH_ENDING_BEATS && clashes(plan)) continue;
+    return plan;
   }
   return null;
 };
@@ -428,8 +483,13 @@ export const planTransition = (
   const steadyEdges =
     Math.abs(outgoing.end.drift) <= MAX_EDGE_DRIFT &&
     Math.abs(incoming.start.drift) <= MAX_EDGE_DRIFT;
-  // Overlapping clashing keys sounds wrong however good the beat match is
+  // Overlapping clashing keys sounds wrong however good the beat match is,
+  // but only where both songs are tonal: over drums alone it's fine
   const clash = keysClash(outgoing.end.key, incoming.start.key);
+  const overlap = (plan: TransitionPlan) =>
+    tonalOverlap(outgoing.end, incoming.start, plan);
+  const clashes = (plan: TransitionPlan) =>
+    clash && overlap(plan) >= TONAL_CLASH;
 
   const gridsOk = hasBeatGrid(from) && hasBeatGrid(to);
   const stretchOk =
@@ -490,12 +550,13 @@ export const planTransition = (
     order = order.filter((style) => style !== 'segue');
   }
 
-  const reasonFor = (style: TransitionStyle): TransitionReason => {
+  const reasonFor = (plan: TransitionPlan): TransitionReason => {
+    const { style } = plan;
     if (options.preference !== 'auto') {
       return style === options.preference ? 'preference' : 'fallback';
     }
     if (style === 'blend') {
-      if (clash) return 'key-clash';
+      if (clashes(plan)) return 'key-clash';
       return endsAbruptly(from) ? 'ending-blend' : 'tempo-match';
     }
     if (style === 'segue') {
@@ -511,9 +572,9 @@ export const planTransition = (
     const plan =
       style === 'blend'
         ? endsAbruptly(from)
-          ? (planEndingBlend(from, to, options, clash) ??
-            planBlend(from, to, options, clash))
-          : planBlend(from, to, options, clash)
+          ? (planEndingBlend(from, to, options, clashes) ??
+            planBlend(from, to, options, clashes))
+          : planBlend(from, to, options, clashes)
         : style === 'segue'
           ? planSegue(from, to, options)
           : style === 'cut'
@@ -522,9 +583,10 @@ export const planTransition = (
     if (plan) {
       return {
         ...plan,
-        reason: reasonFor(style),
+        reason: reasonFor(plan),
         fromKey: outgoing.end.key?.camelot,
         toKey: incoming.start.key?.camelot,
+        tonalOverlap: style === 'blend' ? overlap(plan) : undefined,
       };
     }
   }

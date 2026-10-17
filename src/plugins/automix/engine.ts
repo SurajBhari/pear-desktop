@@ -1463,6 +1463,12 @@ export class AutoMixEngine {
       console.log(
         '[AutoMix debug] mix:',
         plan.style,
+        `${plan.duration.toFixed(1)}s`,
+        plan.beat > 0 ? `(${Math.round(plan.duration / plan.beat)} beats)` : '',
+        plan.tonalOverlap === undefined
+          ? ''
+          : `tonal overlap ${plan.tonalOverlap.toFixed(2)}`,
+        plan.fromKey && plan.toKey ? `${plan.fromKey} → ${plan.toKey}` : '',
         `${(Math.abs(plan.rate - 1) * 100).toFixed(1)}% tempo gap`,
         split
           ? `split: old song x${outRate.toFixed(3)}, new song x${timed.rate.toFixed(3)}`

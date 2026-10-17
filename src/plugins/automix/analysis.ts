@@ -6,7 +6,12 @@
  * (renderer, worker, or Node for testing).
  */
 
-import { detectKey, type MusicalKey } from './key';
+import {
+  detectKey,
+  tonalProfile,
+  type MusicalKey,
+  type TonalProfile,
+} from './key';
 
 export interface AnalysisBands {
   sampleRate: number;
@@ -436,6 +441,8 @@ export const computeLoudnessProfile = (
 export interface TempoSection {
   /** Musical key, when it's clear enough to detect */
   key: MusicalKey | null;
+  /** How tonal (not just drums) each part of the section is */
+  tonal: TonalProfile | null;
   bpm: number;
   beatPeriod: number;
   tempoConfidence: number;
@@ -450,6 +457,7 @@ export interface TempoSection {
 
 export const emptySection: TempoSection = {
   key: null,
+  tonal: null,
   bpm: 0,
   beatPeriod: 0,
   tempoConfidence: 0,
@@ -554,13 +562,19 @@ const analyzeSection = (
 ): TempoSection => {
   const { fps } = envelope;
   const key = detectKey(bands.full, bands.sampleRate, fromSeconds, toSeconds);
+  const tonal = tonalProfile(
+    bands.full,
+    bands.sampleRate,
+    fromSeconds,
+    toSeconds,
+  );
   const first = Math.max(0, Math.floor(fromSeconds * fps));
   const last = Math.min(envelope.onset.length, Math.ceil(toSeconds * fps));
   const onset = envelope.onset.subarray(first, last);
   const lowOnset = envelope.lowOnset.subarray(first, last);
 
   const tempo = estimateTempo(onset, fps);
-  if (!tempo) return { ...emptySection, key };
+  if (!tempo) return { ...emptySection, key, tonal };
 
   let beatFrames = trackBeats(onset, tempo.period);
   // At a song's start, skip a beatless intro (speech, ambience, a free-time
@@ -574,6 +588,7 @@ const analyzeSection = (
     return {
       ...emptySection,
       key,
+      tonal,
       bpm: tempo.bpm,
       beatPeriod: 60 / tempo.bpm,
     };
@@ -604,6 +619,7 @@ const analyzeSection = (
 
   return {
     key,
+    tonal,
     bpm: (60 * fps) / period,
     beatPeriod: period / fps,
     tempoConfidence: clamp(tempo.strength / 0.3, 0, 1),
@@ -637,7 +653,7 @@ export const analyzeTrack = (bands: AnalysisBands): TrackAnalysis => {
     loudness.trailingSilenceStart + 0.5,
     'end',
   );
-  // Whole-song tempo only (the key is per section)
+  // Whole-song tempo only (the key and tonal profile are per section)
   const whole = analyzeSection(
     { ...bands, full: new Float32Array(0) },
     envelope,
