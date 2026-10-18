@@ -141,9 +141,11 @@ async function onApiLoaded() {
         blockerSceneGuard?: { cancelFromUser: () => void };
       }
     ).blockerSceneGuard?.cancelFromUser();
-    document
-      .querySelector<HTMLElement>('.previous-button.ytmusic-player-bar')
-      ?.click();
+    const button = document.querySelector<HTMLElement>(
+      '.previous-button.ytmusic-player-bar',
+    );
+    if (button) button.click();
+    else api?.previousVideo?.();
   });
   window.ipcRenderer.on('peard:next-video', () => {
     (
@@ -151,9 +153,11 @@ async function onApiLoaded() {
         blockerSceneGuard?: { cancelFromUser: () => void };
       }
     ).blockerSceneGuard?.cancelFromUser();
-    document
-      .querySelector<HTMLElement>('.next-button.ytmusic-player-bar')
-      ?.click();
+    const button = document.querySelector<HTMLElement>(
+      '.next-button.ytmusic-player-bar',
+    );
+    if (button) button.click();
+    else api?.nextVideo?.();
   });
   window.ipcRenderer.on('peard:play', (_) => {
     (
