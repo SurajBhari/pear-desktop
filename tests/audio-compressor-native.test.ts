@@ -7,25 +7,80 @@ let bundle: string;
 const timingFixture = `
 export const observeGainTiming = node => {
   let target = NaN, end = 0;
+  const calls = [];
+  const sample = () => ({target, end, audioTime: node.context.currentTime,
+    state: node.context.state, sampleRate: node.context.sampleRate,
+    quantum: 128 / node.context.sampleRate, value: node.gain.value,
+    wallTime: performance.now()});
+  const ready = (item, expected) => item.target === expected &&
+    item.state === 'running' && item.audioTime >= item.end + item.quantum;
+  const record = (method, value, time) => {
+    target = value; end = time;
+    calls.push({method, value, time, audioTime: node.context.currentTime,
+      wallTime: performance.now()});
+  };
   const set = node.gain.setValueAtTime.bind(node.gain);
   const ramp = node.gain.linearRampToValueAtTime.bind(node.gain);
   node.gain.setValueAtTime = (value, time) => {
-    target = value; end = time; return set(value, time);
+    record('set', value, time); return set(value, time);
   };
   node.gain.linearRampToValueAtTime = (value, time) => {
-    target = value; end = time; return ramp(value, time);
+    record('ramp', value, time); return ramp(value, time);
   };
-  return { wait: async expected => {
+  const wait = async (expected, guard = () => {}) => {
     const deadline = performance.now() + 3000;
     while (performance.now() < deadline) {
-      const audioTime = node.context.currentTime;
-      const quantum = 128 / node.context.sampleRate;
-      if (target === expected && node.context.state === 'running' && audioTime >= end + quantum)
-        return {target, end, audioTime, value: node.gain.value};
+      const item = sample();
+      guard(item);
+      if (ready(item, expected)) return item;
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    throw Error('Owned gain did not reach its scheduled audio-clock end: ' + JSON.stringify({expected,target,end,audioTime:node.context.currentTime,state:node.context.state}));
-  }};
+    throw Error('Owned gain did not reach its scheduled audio-clock end: ' +
+      JSON.stringify({expected, ...sample()}));
+  };
+  const unityPhase = () => {
+    const before = sample(), first = calls.length;
+    let immediate, through;
+    const writes = () => calls.slice(first, through);
+    const check = item => {
+      const invalid = writes().find(call => call.value !== 1 || call.time > call.audioTime);
+      if (invalid || item.target !== 1)
+        throw Error('Unity phase scheduled target violation: ' +
+          JSON.stringify({before, immediate, invalid, item, calls: writes()}));
+    };
+    return {
+      dispatched: () => {
+        immediate = sample();
+        if (!writes().some(call => call.method === 'set' && call.value === 1 &&
+            call.time >= before.audioTime && call.time <= immediate.audioTime) ||
+            immediate.end < before.audioTime || immediate.end > immediate.audioTime)
+          throw Error('Missing immediate unity reset in dispatch audio-time window: ' +
+            JSON.stringify({before, immediate, calls: writes()}));
+        check(immediate);
+        return immediate;
+      },
+      settle: async wall => {
+        if (!immediate) throw Error('Unity phase dispatch was not observed');
+        check(wall);
+        let settled;
+        try { settled = ready(wall, 1) ? wall : await wait(1, check); }
+        catch (error) {
+          throw Error('Unity phase settlement failed: ' + error.message + ' ' +
+            JSON.stringify({before, immediate, wall, calls: writes()}));
+        }
+        if (settled.value !== 1)
+          throw Error('Unity first qualified sample has wrong value: ' +
+            JSON.stringify({before, immediate, wall, settled, calls: writes()}));
+        return settled;
+      },
+      finish: () => {
+        check(sample());
+        through = calls.length;
+        return {before, immediate, calls: writes()};
+      },
+    };
+  };
+  return {sample, wait, unityPhase};
 };`;
 test.beforeAll(async () => {
   bundle = await equalizerBundle(
@@ -102,19 +157,39 @@ test('Electron native identity events, response lag, late enable and teardown fe
     });
     rendered.push(await timing.wait(10 ** (6 / 20)));
     const enabled = read();
+    const stalePhase = timing.unityPhase();
     native = 'B';
     events.dispatchEvent(new Event('videodatachange'));
     const stale = anchor;
+    const staleImmediate = stalePhase.dispatched();
     await wait(20);
-    const staleRendered = read();
+    const staleWall = timing.sample();
+    const staleSettlement = await stalePhase.settle(staleWall);
+    const staleRendered = staleSettlement.value;
+    const staleTiming = {
+      immediate: staleImmediate,
+      wall: staleWall,
+      settled: staleSettlement,
+      guard: stalePhase.finish(),
+    };
     response = 'B';
     rendered.push(await timing.wait(10 ** (6 / 20)));
     const retry = read();
+    const lostPhase = timing.unityPhase();
     native = '';
     events.dispatchEvent(new Event('videodatachange'));
     const lost = anchor;
+    const lostImmediate = lostPhase.dispatched();
     await wait(450);
-    const stillLost = read();
+    const lostWall = timing.sample();
+    const lostSettlement = await lostPhase.settle(lostWall);
+    const stillLost = lostSettlement.value;
+    const lostTiming = {
+      immediate: lostImmediate,
+      wall: lostWall,
+      settled: lostSettlement,
+      guard: lostPhase.finish(),
+    };
     native = 'C';
     response = 'C';
     db = -3;
@@ -140,9 +215,11 @@ test('Electron native identity events, response lag, late enable and teardown fe
       enabled,
       stale,
       staleRendered,
+      staleTiming,
       retry,
       lost,
       stillLost,
+      lostTiming,
       next,
       apiFailure,
       stopped,
@@ -245,16 +322,26 @@ test('Electron auxiliary notifications precede dry connection, retire after disc
       observations.push({ count, connected, gain: anchor }),
     );
     const aux = document.createElement('audio');
+    const duringPhase = timing.unityPhase();
     const release = graph.registerMedia(aux, gain);
     const during = anchor;
+    const duringImmediate = duringPhase.dispatched();
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const duringRendered = trackGain!.gain.value;
+    const duringWall = timing.sample();
+    const duringSettlement = await duringPhase.settle(duringWall);
+    const duringRendered = duringSettlement.value;
     let duplicateRejected = false;
     try {
       graph.registerMedia(aux, gain);
     } catch {
       duplicateRejected = true;
     }
+    const duringTiming = {
+      immediate: duringImmediate,
+      wall: duringWall,
+      settled: duringSettlement,
+      guard: duringPhase.finish(),
+    };
     release();
     release();
     rendered.push(await timing.wait(10 ** (6 / 20)));
@@ -303,6 +390,7 @@ test('Electron auxiliary notifications precede dry connection, retire after disc
       boost,
       during,
       duringRendered,
+      duringTiming,
       recovered,
       observations,
       duplicateRejected,
