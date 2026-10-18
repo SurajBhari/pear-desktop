@@ -183,17 +183,31 @@ export default createPlugin<
       this.ipc = ipc;
     },
     stop() {
-      this.dispose?.();
+      const dispose = this.dispose;
       this.dispose = undefined;
+      dispose?.();
     },
     onConfigChange(newConfig) {
       this.config = newConfig;
     },
     onPlayerApiReady() {
-      this.dispose?.();
-      let transitionAudio: TransitionAudio | null = null;
+      const previousDispose = this.dispose;
       let stopped = false;
+      let cleanup = () => {};
+      const dispose = () => {
+        if (stopped) return;
+        stopped = true;
+        cleanup();
+      };
+      // Reserve this lifetime before retiring the old one: disposal may reenter.
+      this.dispose = dispose;
+      previousDispose?.();
+      if (stopped || this.dispose !== dispose) return;
+
+      let transitionAudio: TransitionAudio | null = null;
       let request = 0;
+      let intent = 0;
+      let releaseSpeed: (() => void) | null = null;
       const navigationAbort = new AbortController();
       let mediaAbort = new AbortController();
       const faders = new Set<VolumeFader>();
@@ -231,20 +245,31 @@ export default createPlugin<
         transitionAudio = null;
         mainEnvelope.volume = 1;
       };
-      this.dispose = () => {
-        stopped = true;
+      const cancelTransition = () => {
+        intent++;
         request++;
-        navigationAbort.abort();
-        mediaAbort.abort();
-        transitionAudio?.unload();
+        const settle = settleTransition;
+        settleTransition = null;
+        const audio = transitionAudio;
         transitionAudio = null;
+        mediaAbort.abort();
+        audio?.unload();
         faders.forEach((fader) => fader.stop());
         faders.clear();
-        settleTransition?.();
+        settle?.();
+        mainEnvelope.volume = 1;
+      };
+      cleanup = () => {
+        const release = releaseSpeed;
+        releaseSpeed = null;
+        navigationAbort.abort();
+        cancelTransition();
         status.remove();
         releaseMain();
         mainGain.disconnect();
         mainEnvelope.volume = 1;
+        // Unsubscribe may synchronously acquire the next exclusive main insert.
+        release?.();
       };
       let firstVideo = true;
       let waitForTransition: Promise<unknown>;
@@ -399,16 +424,21 @@ export default createPlugin<
       };
 
       const crossfade = (cb: () => void) => {
+        const generation = intent;
         if (!isReadyToCrossfade() || video.paused) {
           cb();
           return;
         }
 
-        let resolveTransition: () => void;
+        let resolveTransition!: () => void;
         waitForTransition = new Promise<void>((resolve) => {
           resolveTransition = resolve;
-          settleTransition = resolve;
         });
+        const settle = () => {
+          if (settleTransition === settle) settleTransition = null;
+          resolveTransition();
+        };
+        settleTransition = settle;
 
         const fader = new VolumeFader(transitionAudio!.element, {
           initialVolume: 1,
@@ -421,14 +451,15 @@ export default createPlugin<
         mainEnvelope.volume = 0;
         fader.fadeOut(() => {
           faders.delete(fader);
-          resolveTransition();
-          if (!stopped) cb();
+          settle();
+          if (!stopped && generation === intent) cb();
         });
       };
 
       watchVideoIDChanges(async (videoID) => {
+        const generation = intent;
         await waitForTransition;
-        if (stopped) return;
+        if (stopped || generation !== intent) return;
         const id = ++request;
         let url: string;
         try {
@@ -444,6 +475,28 @@ export default createPlugin<
         }
         await createAudioForCrossfade(url);
       });
+
+      try {
+        const release = this.ipc?.subscribe?.(
+          'peard:playback-speed-step',
+          (...args: unknown[]) => {
+            if (
+              !stopped &&
+              releaseSpeed &&
+              args.length === 1 &&
+              (args[0] === 1 || args[0] === -1)
+            ) {
+              cancelTransition();
+            }
+          },
+        );
+        if (typeof release === 'function') {
+          if (stopped) release();
+          else releaseSpeed = release;
+        }
+      } catch {
+        // Unsupported providers cannot grant ownership of a subscription.
+      }
     },
   },
 });
