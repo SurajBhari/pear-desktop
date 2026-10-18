@@ -1,6 +1,8 @@
+import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { setTimeout as pause } from 'node:timers/promises';
 
 import { test, expect, _electron as electron } from '@playwright/test';
 
@@ -17,10 +19,123 @@ const observer = path.resolve(
   'helpers/electron-startup-observer.cjs',
 );
 
+// BEGIN OWNED FIXTURE EXIT
+function fixtureExitReady(token) {
+  return JSON.stringify({ version: 1, token, phase: 'READY' });
+}
+
+async function requestFixtureExit(
+  { child, actionPath, actionDone, token },
+  io = {
+    readFile,
+    writeFile,
+    now: () => performance.now(),
+    sleep: (delay, signal) => pause(delay, undefined, { signal }),
+    setTimeout,
+    clearTimeout,
+  },
+) {
+  const deadline = io.now() + 2000;
+  const controller = new AbortController();
+  const timeoutError = new Error('Owned fixture exit phase timed out');
+  let expired = false,
+    active = true,
+    publishing = false,
+    onExit,
+    timer;
+  const timeout = new Promise((_, reject) => {
+    timer = io.setTimeout(() => {
+      expired = true;
+      reject(timeoutError);
+      controller.abort();
+    }, 2000);
+  });
+  // Observe rejection even if synchronous setup/I/O fails before a race is armed.
+  timeout.catch(() => {});
+  const withinDeadline = () => {
+    if (expired || io.now() >= deadline) throw timeoutError;
+  };
+  const running = () => {
+    assert(
+      child.exitCode === null && child.signalCode === null,
+      'Fixture exited before the owned exit request',
+    );
+  };
+  const bounded = (operation) => Promise.race([operation, timeout]);
+  try {
+    for (;;) {
+      withinDeadline();
+      running();
+      let marker;
+      try {
+        marker = await bounded(
+          io.readFile(actionDone, {
+            encoding: 'utf8',
+            signal: controller.signal,
+          }),
+        );
+      } catch (error) {
+        withinDeadline();
+        if (!(error instanceof Error) || error.code !== 'ENOENT') throw error;
+      }
+      withinDeadline();
+      running();
+      if (marker !== undefined) {
+        assert.equal(marker, fixtureExitReady(token), 'Wrong fixture READY');
+        break;
+      }
+      await bounded(
+        io.sleep(Math.min(20, deadline - io.now()), controller.signal),
+      );
+    }
+    let observedExit;
+    let resolveExit;
+    const exited = new Promise((resolve) => {
+      resolveExit = resolve;
+    });
+    exited.catch(() => {});
+    onExit = (code, signal) => {
+      if (!active) return;
+      observedExit = { code, signal, requested: publishing };
+      resolveExit(observedExit);
+    };
+    child.once('exit', onExit);
+    withinDeadline();
+    running();
+    assert(!observedExit, 'Fixture exited before action publication');
+    publishing = true;
+    await bounded(
+      io.writeFile(actionPath, 'exit:' + token, {
+        flag: 'wx',
+        signal: controller.signal,
+      }),
+    );
+    withinDeadline();
+    const result = await bounded(exited);
+    withinDeadline();
+    assert.equal(result.requested, true);
+    assert.equal(result.code, 23);
+    assert.equal(result.signal, null);
+    assert.equal(child.exitCode, 23);
+    assert.equal(child.signalCode, null);
+  } catch (error) {
+    throw expired ? timeoutError : error;
+  } finally {
+    active = false;
+    controller.abort();
+    try {
+      if (onExit) child.off('exit', onExit);
+    } finally {
+      if (timer !== undefined) io.clearTimeout(timer);
+    }
+  }
+}
+// END OWNED FIXTURE EXIT
+
 test.describe('test-only Electron startup observer', () => {
   /**
    * @param {{ wrongProfile?: boolean, visible?: boolean, preload?: boolean, exit?: boolean, delayedShow?: boolean, missingWatchFilename?: boolean }} options
-   * @param {(fixture: { application: import('@playwright/test').ElectronApplication, child: import('node:child_process').ChildProcess, profile: string, factsPath: string, actionPath: string, actionDone: string }) => Promise<void>} check
+   * @param {(fixture: { application: import('@playwright/test').ElectronApplication, child: import('node:child_process').ChildProcess, profile: string, factsPath: string, actionPath: string, actionDone: string, token: string }) => Promise<void>} check
    */
   async function withFixture(options, check) {
     const directory = await mkdtemp(
@@ -31,6 +146,7 @@ test.describe('test-only Electron startup observer', () => {
     const factsPath = path.join(directory, 'facts.json');
     const actionPath = path.join(directory, 'action.txt');
     const actionDone = path.join(directory, 'action-done.json');
+    const token = path.basename(directory);
     let application;
     let child;
     try {
@@ -53,10 +169,18 @@ test.describe('test-only Electron startup observer', () => {
         app.whenReady().then(() => {
           const window = new BrowserWindow({ show: ${options.visible !== false && !options.delayedShow}, width: 320, height: 240 });
           window.loadURL('data:text/html,<title>Owned startup fixture</title>');
+          let actionHandled = false;
           fs.watchFile(${JSON.stringify(actionPath)}, { interval: 20 }, (current) => {
-            if (!current.nlink) return;
+            if (actionHandled || !current.nlink) return;
+            let action;
+            if (${Boolean(options.exit)}) {
+              action = fs.readFileSync(${JSON.stringify(actionPath)}, 'utf8');
+              const expected = ${JSON.stringify('exit:' + token)};
+              if (action !== expected && expected.startsWith(action)) return;
+            }
+            actionHandled = true;
             fs.unwatchFile(${JSON.stringify(actionPath)});
-            const action = fs.readFileSync(${JSON.stringify(actionPath)}, 'utf8');
+            if (!${Boolean(options.exit)}) action = fs.readFileSync(${JSON.stringify(actionPath)}, 'utf8');
             const publishState = () => {
               const state = { closed: window.isDestroyed(), visible: !window.isDestroyed() && window.isVisible() };
               fs.writeFileSync(${JSON.stringify(actionDone)} + '.tmp', JSON.stringify(state));
@@ -68,10 +192,15 @@ test.describe('test-only Electron startup observer', () => {
               window.once('closed', publishState);
               window.close();
             }
+            else if (${Boolean(options.exit)} && action === ${JSON.stringify('exit:' + token)}) app.exit(23);
             else throw new Error('Unknown owned fixture action');
           });
+          if (${Boolean(options.exit)}) {
+            const temporary = ${JSON.stringify(actionDone)} + '.ready.tmp';
+            fs.writeFileSync(temporary, ${JSON.stringify(fixtureExitReady(token))}, { flag: 'wx' });
+            fs.renameSync(temporary, ${JSON.stringify(actionDone)});
+          }
           ${options.delayedShow ? 'setTimeout(() => window.show(), 50);' : ''}
-          ${options.exit ? 'setTimeout(() => app.exit(23), 500);' : ''}
         });
       `,
       );
@@ -97,6 +226,7 @@ test.describe('test-only Electron startup observer', () => {
         factsPath,
         actionPath,
         actionDone,
+        token,
       });
     } finally {
       try {
@@ -174,7 +304,8 @@ test.describe('test-only Electron startup observer', () => {
   test('a genuine main-process exit remains a failure with its actual code', async () => {
     await withFixture(
       { visible: false, exit: true },
-      async ({ child, factsPath }) => {
+      async ({ child, factsPath, actionPath, actionDone, token }) => {
+        await requestFixtureExit({ child, actionPath, actionDone, token });
         await expect(
           waitForStartupFacts(child, factsPath, 2000),
         ).rejects.toThrow(/exited.*23/);
