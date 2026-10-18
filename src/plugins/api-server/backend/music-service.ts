@@ -9,13 +9,34 @@ import {
 } from '@/providers/music-request';
 
 import {
+  captureMusicAccess,
+  sameMusicAccess,
+  musicAccessCurrent,
+  musicAccessBytes,
+  type MusicInvocation,
+  type MusicAccessOwner,
+  type MusicAccessBinding,
+  type MusicSessionOwner,
+} from './music-access';
+import {
   createPublicCommentsWeb,
   type PublicCommentsWeb,
 } from './music-comments-web';
 import {
+  musicGrantLifetimeSignal,
+  type MusicGrantStore,
+} from './music-grant-store';
+import {
+  localMusicHttpResource,
+  musicHttpResources,
+  musicHttpListenerSupports,
+  type MusicHttpListenerOwner,
+} from './music-http-policy';
+import {
   musicOperationLedger,
   type MusicOperationLedger,
   type MusicOperationRow,
+  type MusicOperationBinding,
 } from './music-operations';
 import {
   parseMusicInput,
@@ -63,7 +84,6 @@ import {
 } from '../music-types';
 
 import type { APIServerConfig } from '../config';
-import type { MusicGrantStore } from './music-grant-store';
 import type { MusicGrantRecord } from './music-grants';
 import type { BrowserWindow } from 'electron';
 
@@ -89,6 +109,7 @@ export interface MusicPage {
   videoId?: string;
 }
 interface CursorBase {
+  access: MusicAccessBinding;
   id: string;
   principal: MusicGrantRecord;
   scope: MusicScope;
@@ -127,6 +148,7 @@ type Cursor = CursorBase &
       }
   );
 interface TargetReference {
+  access: MusicAccessBinding;
   binding?: MetadataBinding;
   busy?: boolean;
   id: string;
@@ -142,6 +164,7 @@ interface TargetReference {
   bytes: number;
 }
 interface Lease {
+  access: MusicAccessBinding;
   principal: MusicGrantRecord;
   scope: MusicScope;
   resource: string;
@@ -159,27 +182,19 @@ export interface MusicRuntime {
   broker?: MusicRequestBroker;
   now?: () => number;
   commentsWeb?: PublicCommentsWeb;
+  restListenerOwner?(): MusicHttpListenerOwner | undefined;
+  resolveAccessOwner?(
+    transport: 'rest' | 'mcp',
+    resource: string,
+  ): MusicAccessOwner | undefined;
 }
 const services = new WeakMap<BrowserWindow, MusicService>();
-export function getMusicService(window: BrowserWindow) {
+export function getMusicService(window: BrowserWindow, resource?: string) {
   const service = services.get(window);
-  return service?.enabled ? service : undefined;
+  return service?.restAvailable(resource) ? service : undefined;
 }
 export function localMusicResource(config: APIServerConfig): string {
-  const hostname = config.hostname.toLowerCase();
-  if (
-    !['127.0.0.1', 'localhost', '::1', '0.0.0.0', '::'].includes(hostname) ||
-    !Number.isInteger(config.port) ||
-    config.port < 1 ||
-    config.port > 65535
-  )
-    return failMusic('unavailable');
-  const host = hostname === '::1' || hostname === '::' ? '[::1]' : '127.0.0.1';
-  const advertised = hostname === 'localhost' ? 'localhost' : host;
-  const https = config.useHttps && !!config.certPath && !!config.keyPath;
-  return new URL(
-    `${https ? 'https' : 'http'}://${advertised}:${config.port}/api/v1/music`,
-  ).href;
+  return localMusicHttpResource(config) ?? failMusic('unavailable');
 }
 const opaque = (prefix: string) =>
   `${prefix}_${randomBytes(32).toString('base64url')}`;
@@ -196,7 +211,12 @@ function waitOwned<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     signal.reason instanceof MusicServiceError
       ? signal.reason
       : new MusicServiceError('retired');
-  if (signal.aborted) return Promise.reject(reason());
+  if (signal.aborted) {
+    // The action may synchronously retire its lease before returning a rejected
+    // promise. Observe that promise even though its caller is already retired.
+    promise.catch(() => {});
+    return Promise.reject(reason());
+  }
   return new Promise((resolve, reject) => {
     const abort = () => reject(reason());
     signal.addEventListener('abort', abort, { once: true });
@@ -218,11 +238,17 @@ export class MusicService {
   private readonly releaseBroker: () => void;
   private config: APIServerConfig;
   private revision = 0;
+  private accessIdentity: object = {};
   private stopped = false;
   private scope = new AbortController();
   private cacheTimer?: ReturnType<typeof setTimeout>;
   private readonly cursors = new Map<string, Cursor>();
   private readonly references = new Map<string, TargetReference>();
+  private readonly retiredSessions = new WeakSet<MusicSessionOwner>();
+  private readonly sessionLeases = new Map<
+    MusicSessionOwner,
+    Set<AbortController>
+  >();
   constructor(private readonly runtime: MusicRuntime) {
     this.config = { ...runtime.config };
     this.grants = runtime.grants;
@@ -235,6 +261,7 @@ export class MusicService {
       this.broker.subscribeRetirement?.(() => {
         this.operations.retire(this);
         this.revision++;
+        this.accessIdentity = {};
         this.scope.abort();
         this.scope = new AbortController();
         this.cursors.clear();
@@ -262,36 +289,76 @@ export class MusicService {
     services.set(runtime.window, this);
   }
   get enabled() {
-    if (
-      this.stopped ||
-      this.config.enabled !== true ||
-      this.config.musicApiEnabled !== true
-    )
-      return false;
-    try {
-      localMusicResource(this.config);
-      return true;
-    } catch {
-      return false;
-    }
+    const resources = musicHttpResources(this.config);
+    return [resources.local, resources.remote].some(
+      (resource) => resource !== undefined && this.restAvailable(resource),
+    );
+  }
+  get httpConfigured() {
+    return this.sharedAvailable() && this.config.musicApiEnabled === true;
   }
   get resource() {
     return localMusicResource(this.config);
   }
-  captureNativeOwner() {
-    const revision = this.revision,
-      admission = this.broker.capture();
+  restAvailable(resource?: string): boolean {
+    try {
+      return (
+        this.restAccess(resource ?? this.resource)?.owner.current() === true
+      );
+    } catch {
+      return false;
+    }
+  }
+  captureNativeOwner(resource?: string) {
+    const revision = this.revision;
+    let selected: ReturnType<MusicService['restAccess']>;
+    try {
+      selected = this.restAccess(resource ?? this.resource);
+    } catch {
+      /* local discovery remains unavailable */
+    }
+    const admission = this.broker.capture();
     return {
-      signal: this.scope.signal,
-      current: () =>
-        this.enabled &&
-        this.revision === revision &&
-        this.broker.isCurrent(admission),
+      signal: AbortSignal.any([
+        this.scope.signal,
+        ...(selected?.signal ? [selected.signal] : []),
+      ]),
+      current: () => {
+        const unchanged = () =>
+          this.revision === revision && this.sharedAvailable();
+        if (
+          !selected ||
+          !unchanged() ||
+          !selected.owner.current() ||
+          !unchanged()
+        )
+          return false;
+        return (
+          this.broker.isCurrent(admission) &&
+          unchanged() &&
+          selected.owner.current() &&
+          unchanged()
+        );
+      },
     };
+  }
+  /** Exact main-owned session identity is terminal, regardless of later guard results. */
+  retireSession(owner: MusicSessionOwner): void {
+    this.retiredSessions.add(owner);
+    const controllers = this.sessionLeases.get(owner);
+    this.sessionLeases.delete(owner);
+    for (const controller of controllers ?? []) controller.abort();
+    for (const [id, cursor] of this.cursors)
+      if (cursor.access.session === owner) this.cursors.delete(id);
+    for (const [id, reference] of this.references)
+      if (reference.access.session === owner) this.references.delete(id);
+    this.scheduleCacheCleanup();
+    this.operations.retireSession(this, owner);
   }
   configure(config: APIServerConfig) {
     this.operations.retire(this);
     this.revision++;
+    this.accessIdentity = {};
     this.scope.abort();
     this.scope = new AbortController();
     this.config = { ...config };
@@ -305,6 +372,7 @@ export class MusicService {
     this.operations.retire(this);
     this.stopped = true;
     this.revision++;
+    this.accessIdentity = {};
     this.scope.abort();
     this.cursors.clear();
     this.detachNativeRetirement();
@@ -316,76 +384,240 @@ export class MusicService {
     if (services.get(this.runtime.window) === this)
       services.delete(this.runtime.window);
   }
-  private async admitted<T>(
+  private localInvocation(
     token: unknown,
-    scope: MusicScope,
+    signal?: AbortSignal,
+  ): MusicInvocation {
+    return {
+      token,
+      transport: 'rest',
+      resource: this.resource,
+      signal: signal ?? new AbortController().signal,
+    };
+  }
+  private sharedAvailable() {
+    return !this.stopped && this.config.enabled === true;
+  }
+  /** Capture one REST listener lifetime; only pure owned fixtures omit the seam. */
+  private restAccess(
+    resource: string,
+  ): { owner: MusicAccessOwner; signal?: AbortSignal } | undefined {
+    const identity = this.accessIdentity;
+    const revision = this.revision;
+    const unchanged = () =>
+      this.sharedAvailable() &&
+      this.accessIdentity === identity &&
+      this.revision === revision;
+    if (
+      !unchanged() ||
+      !Object.values(musicHttpResources(this.config)).includes(resource)
+    )
+      return;
+    const production = this.runtime.restListenerOwner !== undefined;
+    const listener = this.runtime.restListenerOwner?.();
+    if (!unchanged() || (production && !listener)) return;
+    const current = () => {
+      if (
+        !unchanged() ||
+        !Object.values(musicHttpResources(this.config)).includes(resource)
+      )
+        return false;
+      if (!production) return unchanged();
+      if (
+        !listener ||
+        !musicHttpListenerSupports(listener, resource) ||
+        !unchanged()
+      )
+        return false;
+      const selected = this.runtime.restListenerOwner?.();
+      return (
+        unchanged() &&
+        selected === listener &&
+        selected.identity === listener.identity &&
+        !listener.signal.aborted
+      );
+    };
+    if (!current()) return;
+    return {
+      owner: { identity: listener?.identity ?? identity, current },
+      ...(listener ? { signal: listener.signal } : {}),
+    };
+  }
+  private accessOwner(
+    transport: 'rest' | 'mcp',
+    resource: string,
+  ): MusicAccessOwner | undefined {
+    if (!this.sharedAvailable()) return undefined;
+    if (transport === 'rest') return this.restAccess(resource)?.owner;
+    return transport === 'mcp'
+      ? this.runtime.resolveAccessOwner?.(transport, resource)
+      : undefined;
+  }
+  private async admittedFor<T>(
+    invocation: MusicInvocation,
+    requiredScope: MusicScope | ((access: MusicAccessBinding) => MusicScope),
     extra: MusicScope[],
-    signal: AbortSignal | undefined,
     currentRead: boolean,
     action: (lease: Lease) => Promise<T>,
     deadlineAt?: number,
   ): Promise<T> {
-    if (!this.enabled) return failMusic('unavailable');
+    const { token, transport, resource, signal, session } = invocation;
     const revision = this.revision,
-      admission = this.broker.capture(),
-      resource = this.resource,
+      serviceSignal = this.scope.signal;
+    if (session && this.retiredSessions.has(session))
+      return failMusic('retired');
+    const rest = transport === 'rest' ? this.restAccess(resource) : undefined;
+    const owner =
+      transport === 'rest'
+        ? rest?.owner
+        : this.accessOwner(transport, resource);
+    if (!owner || (transport === 'rest' && session))
+      return failMusic('unavailable');
+    const access = captureMusicAccess(
+      { token, transport, resource, signal, session },
+      owner,
+    );
+    const accessCurrent = musicAccessCurrent(access);
+    if (session && this.retiredSessions.has(session))
+      return failMusic('retired');
+    if (!accessCurrent) return failMusic('unavailable');
+    const admission = this.broker.capture(),
       deadline = Math.min(
         this.now() + (currentRead ? 5000 : 15000),
         deadlineAt ?? Infinity,
       ),
       controller = new AbortController();
     const joined = AbortSignal.any([
-      this.scope.signal,
+      serviceSignal,
       controller.signal,
+      ...(rest?.signal ? [rest.signal] : []),
       ...(signal ? [signal] : []),
     ]);
-    const ownerCurrent = () =>
+    // Native retirement advances this same private revision through the broker
+    // observer. These terminal checks make no adapter/native guard callouts.
+    let observedRetirement = false;
+    let grantSignal: AbortSignal | undefined;
+    const observe = (current: boolean) => {
+      if (!current) observedRetirement = true;
+      return current;
+    };
+    const unchanged = () =>
+      !observedRetirement &&
+      !grantSignal?.aborted &&
       !joined.aborted &&
-      !signal?.aborted &&
-      !this.stopped &&
-      this.enabled &&
+      !signal.aborted &&
+      (!session || !this.retiredSessions.has(session)) &&
+      this.sharedAvailable() &&
       revision === this.revision &&
-      this.resource === resource &&
-      this.broker.isCurrent(admission);
-    const currentOwner = () => ownerCurrent() && this.now() < deadline;
-    const principalCurrent = (principal: MusicGrantRecord) =>
-      this.grants.isCurrent(principal, scope) &&
-      extra.every((permission) => this.grants.isCurrent(principal, permission));
+      this.scope.signal === serviceSignal;
+    const stable = () => this.now() < deadline && unchanged();
+    const authorityCurrent = () => {
+      if (!stable()) return false;
+      if (!observe(this.broker.isCurrent(admission)) || !stable()) return false;
+      // Resolve AFTER native/owner/session callbacks. Never refresh the captured
+      // binding: a different selected identity retires this invocation.
+      const selected = this.accessOwner(transport, resource);
+      return observe(selected?.identity === access.owner.identity) && stable();
+    };
+    const currentOwner = () => {
+      if (!authorityCurrent()) return false;
+      if (!observe(access.owner.current()) || !authorityCurrent()) return false;
+      if (
+        access.session &&
+        (!observe(access.session.current()) || !authorityCurrent())
+      )
+        return false;
+      return observe(access.owner.current()) && authorityCurrent();
+    };
     const invalidReason = (
       principal?: MusicGrantRecord,
       fallback: 'retired' | 'timeout' = 'timeout',
     ) => {
-      // Preserve an observed abort. Otherwise actual retirement takes precedence
-      // over a coincident request deadline, even before its timer callback runs.
       if (joined.reason instanceof MusicServiceError) return joined.reason;
+      // Classification never re-enters native, access, session or grant guards.
+      const now = this.now();
       return new MusicServiceError(
-        !ownerCurrent() || (principal && !principalCurrent(principal))
+        !unchanged() ||
+          (principal &&
+            (now < principal.createdAt || now >= principal.expiresAt))
           ? 'retired'
           : fallback,
       );
     };
     let detach = () => {},
+      detachGrantSignal = () => {},
       timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      if (session) {
+        const controllers =
+          this.sessionLeases.get(session) ?? new Set<AbortController>();
+        controllers.add(controller);
+        this.sessionLeases.set(session, controllers);
+      }
       timer = setTimeout(
         () => controller.abort(invalidReason()),
         Math.max(0, deadline - this.now()),
       );
       timer.unref?.();
       if (!currentOwner()) throw invalidReason();
+      // Receipt scope discovery and authorization share this captured origin.
+      // A reentrant guard must not authorize a replacement using the old scope.
+      const scope =
+        typeof requiredScope === 'function'
+          ? requiredScope(access)
+          : requiredScope;
+      if (typeof requiredScope === 'function' && !currentOwner())
+        throw invalidReason();
       const principal = await waitOwned(
-        this.grants.authorize(token, 'rest', resource, scope),
+        this.grants.authorize(token, transport, resource, scope),
         joined,
       );
-      if (!currentOwner()) throw invalidReason(principal);
+      // Bind the first authorized epoch before another authority callback can
+      // re-enter. A prior commit is still visible even if attachment is late.
+      grantSignal = musicGrantLifetimeSignal(this.grants, principal);
+      if (!grantSignal) {
+        observedRetirement = true;
+        throw invalidReason(principal);
+      }
+      const capturedGrantSignal = grantSignal;
+      const retireGrant = () => {
+        observedRetirement = true;
+        controller.abort(invalidReason(principal));
+      };
+      detachGrantSignal = () =>
+        capturedGrantSignal.removeEventListener('abort', retireGrant);
+      capturedGrantSignal.addEventListener('abort', retireGrant, {
+        once: true,
+      });
+      if (capturedGrantSignal.aborted) retireGrant();
+      if (
+        !currentOwner() ||
+        !observe(this.grants.isCurrent(principal, scope)) ||
+        !currentOwner()
+      )
+        throw invalidReason(principal);
       for (const permission of extra) {
         await waitOwned(
-          this.grants.authorize(token, 'rest', resource, permission),
+          this.grants.authorize(token, transport, resource, permission),
           joined,
         );
         if (!currentOwner()) throw invalidReason(principal);
       }
-      const current = () => currentOwner() && principalCurrent(principal);
+      const current = () => {
+        if (
+          !currentOwner() ||
+          !observe(this.grants.isCurrent(principal, scope)) ||
+          !currentOwner()
+        )
+          return false;
+        for (const permission of extra)
+          if (
+            !observe(this.grants.isCurrent(principal, permission)) ||
+            !currentOwner()
+          )
+            return false;
+        return true;
+      };
       detach = this.grants.subscribe(() => {
         if (!current()) controller.abort(invalidReason(principal));
       });
@@ -405,6 +637,7 @@ export class MusicService {
       const result = await waitOwned(
         action({
           principal,
+          access,
           scope,
           resource,
           ...(extra[0] ? { issuerScope: extra[0] } : {}),
@@ -442,7 +675,13 @@ export class MusicService {
       return failMusic('source');
     } finally {
       clearTimeout(timer);
+      detachGrantSignal();
       detach();
+      if (session) {
+        const controllers = this.sessionLeases.get(session);
+        controllers?.delete(controller);
+        if (controllers?.size === 0) this.sessionLeases.delete(session);
+      }
     }
   }
   private async native(lease: Lease, input: MusicReadInput) {
@@ -458,7 +697,8 @@ export class MusicService {
       },
     );
     const owner = this.broker.resultOwner(value);
-    if (!lease.current() || !owner?.current()) return failMusic('retired');
+    if (!lease.current() || !owner?.current() || !lease.current())
+      return failMusic('retired');
     return { value, owner };
   }
   prepare(
@@ -468,33 +708,80 @@ export class MusicService {
     deadlineAt?: number,
   ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
+    // Preserve synchronous validation and promised local-resource failure.
+    const command = parseMusicOperationPrepareInput(input);
+    try {
+      return this.prepareFor(
+        this.localInvocation(token, signal),
+        command,
+        deadline,
+      );
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+  }
+  prepareFor(invocation: MusicInvocation, input: unknown, deadlineAt?: number) {
+    const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
     const command = parseMusicOperationPrepareInput(input),
       scope = musicOperationScope(command);
-    return this.admitted(
-      token,
+    return this.admittedFor(
+      invocation,
       scope,
       [],
-      signal,
       false,
       (lease) => {
-        return Promise.resolve(
-          this.operations.prepare(command, {
-            principal: lease.principal,
-            resource: lease.resource,
-            service: this,
-            revision: lease.revision,
-            admission: lease.admission,
-            current: () =>
-              this.enabled &&
-              this.revision === lease.revision &&
-              this.grants.isCurrent(lease.principal, scope) &&
-              this.resource === lease.resource &&
-              this.broker.isCurrent(lease.admission),
-          }),
+        const binding = this.receiptOwnerFor(
+          lease.principal,
+          lease.access,
+          lease.revision,
+          lease.admission,
+          scope,
         );
+        if (!lease.current()) return failMusic('retired');
+        return Promise.resolve(this.operations.prepare(command, binding));
       },
       deadline,
     );
+  }
+  /** Separate factory: durable ownership never closes over a request lease or signal. */
+  private receiptOwnerFor(
+    principal: MusicGrantRecord,
+    access: MusicAccessBinding,
+    revision: number,
+    admission: MusicAdmission,
+    scope: MusicScope,
+  ): MusicOperationBinding {
+    const unchanged = () =>
+      this.sharedAvailable() &&
+      this.revision === revision &&
+      (!access.session || !this.retiredSessions.has(access.session));
+    const authorityCurrent = () => {
+      if (!unchanged() || !this.broker.isCurrent(admission) || !unchanged())
+        return false;
+      const selected = this.accessOwner(access.transport, access.resource);
+      return selected?.identity === access.owner.identity && unchanged();
+    };
+    const current = () => {
+      if (!authorityCurrent()) return false;
+      if (!access.owner.current() || !authorityCurrent()) return false;
+      if (access.session && (!access.session.current() || !authorityCurrent()))
+        return false;
+      if (!this.grants.isCurrent(principal, scope) || !authorityCurrent())
+        return false;
+      return access.owner.current() && authorityCurrent();
+    };
+    return Object.freeze({
+      principal,
+      access,
+      resource: access.resource,
+      service: this,
+      revision,
+      admission: Object.freeze({
+        frame: admission.frame,
+        generation: admission.generation,
+      }),
+      current,
+    });
   }
   private requireOperationContext(lease: Lease, row: MusicOperationRow) {
     if (
@@ -516,20 +803,31 @@ export class MusicService {
     deadlineAt?: number,
   ) {
     const id = parseMusicOperationId(operationId);
-    const scope =
-      this.operations.requiredScope(id, token, this.resource) ??
-      'playback.control';
-    return this.admitted(
-      token,
-      scope,
+    return this.operationFor(
+      this.localInvocation(token, signal),
+      id,
+      deadlineAt,
+    );
+  }
+  async operationFor(
+    invocation: MusicInvocation,
+    operationId: unknown,
+    deadlineAt?: number,
+  ) {
+    const id = parseMusicOperationId(operationId);
+    const { token, transport, resource, signal, session } = invocation;
+    const snapshot = { token, transport, resource, signal, session };
+    return this.admittedFor(
+      snapshot,
+      (access) =>
+        this.operations.requiredScope(id, token, access) ?? 'playback.control',
       [],
-      signal,
       false,
       (lease) => {
         const row = this.operations.lookup(
           parseMusicOperationId(operationId),
           lease.principal,
-          lease.resource,
+          lease.access,
           (row) => this.requireOperationContext(lease, row),
         );
         return Promise.resolve(this.operations.receipt(row));
@@ -544,18 +842,33 @@ export class MusicService {
     deadlineAt?: number,
   ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
-    return this.admitted(
-      token,
+    try {
+      return this.navigateFor(
+        this.localInvocation(token, signal),
+        input,
+        deadline,
+      );
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+  }
+  navigateFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt?: number,
+  ) {
+    const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
+    return this.admittedFor(
+      invocation,
       'playback.control',
       [],
-      signal,
       false,
       async (lease) => {
         const { operationId, ...command } = parseMusicMutationInput(input);
         const row = this.operations.lookup(
           operationId,
           lease.principal,
-          lease.resource,
+          lease.access,
           (row) => this.requireOperationContext(lease, row),
         );
         if (JSON.stringify(command) !== row.canonical)
@@ -645,11 +958,22 @@ export class MusicService {
     deadlineAt?: number,
   ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
-    return this.admitted(
-      token,
+    try {
+      return this.controlFor(
+        this.localInvocation(token, signal),
+        input,
+        deadline,
+      );
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+  }
+  controlFor(invocation: MusicInvocation, input: unknown, deadlineAt?: number) {
+    const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
+    return this.admittedFor(
+      invocation,
       'playback.control',
       [],
-      signal,
       false,
       async (lease) => {
         const { operationId, ...command } =
@@ -657,7 +981,7 @@ export class MusicService {
         const row = this.operations.lookup(
           operationId,
           lease.principal,
-          lease.resource,
+          lease.access,
           (row) => this.requireOperationContext(lease, row),
         );
         if (JSON.stringify(command) !== row.canonical)
@@ -757,18 +1081,33 @@ export class MusicService {
     deadlineAt?: number,
   ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
-    return this.admitted(
-      token,
+    try {
+      return this.mutateQueueFor(
+        this.localInvocation(token, signal),
+        input,
+        deadline,
+      );
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+  }
+  mutateQueueFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt?: number,
+  ) {
+    const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
+    return this.admittedFor(
+      invocation,
       'queue.write',
       [],
-      signal,
       false,
       async (lease) => {
         const { operationId, ...command } = parseMusicQueueMutationInput(input);
         const row = this.operations.lookup(
           operationId,
           lease.principal,
-          lease.resource,
+          lease.access,
           (row) => this.requireOperationContext(lease, row),
         );
         if (JSON.stringify(command) !== row.canonical)
@@ -936,6 +1275,7 @@ export class MusicService {
       this.retireMetadata(binding);
       return failMusic('retired');
     }
+    if (!lease.current()) return failMusic('retired');
   }
   lyrics(
     token: unknown,
@@ -944,11 +1284,22 @@ export class MusicService {
     deadlineAt?: number,
   ): Promise<LyricsResult> {
     const target = parseMusicLyricsInput(value);
-    return this.admitted(
-      token,
+    return this.lyricsFor(
+      this.localInvocation(token, signal),
+      target,
+      deadlineAt,
+    );
+  }
+  lyricsFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+  ): Promise<LyricsResult> {
+    const target = parseMusicLyricsInput(value);
+    return this.admittedFor(
+      invocation,
       'catalog.read',
       [],
-      signal,
       false,
       async (lease) => {
         const captured = await this.native(lease, {
@@ -970,11 +1321,22 @@ export class MusicService {
     deadlineAt?: number,
   ): Promise<MusicPage> {
     const input = parseMusicRelatedInput(value);
-    return this.admitted(
-      token,
+    return this.relatedFor(
+      this.localInvocation(token, signal),
+      input,
+      deadlineAt,
+    );
+  }
+  relatedFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+  ): Promise<MusicPage> {
+    const input = parseMusicRelatedInput(value);
+    return this.admittedFor(
+      invocation,
       'catalog.read',
       [],
-      signal,
       false,
       async (lease) => {
         if ('cursor' in input)
@@ -1014,14 +1376,20 @@ export class MusicService {
     maxRequests = 5,
   ) {
     await this.probeMetadata(lease, binding, owner);
-    if (!lease.current() || !owner.current()) return failMusic('retired');
+    if (!lease.current() || !owner.current() || !lease.current())
+      return failMusic('retired');
     const result = await this.broker.runOwned(
       lease.admission,
       lease.principal.id,
       async (context) => {
         const check = () => {
           if (this.now() >= lease.deadline) return failMusic('timeout');
-          if (!context.current() || !lease.current() || !owner.current())
+          if (
+            !context.current() ||
+            !lease.current() ||
+            !owner.current() ||
+            !lease.current()
+          )
             return failMusic('retired');
         };
         check();
@@ -1047,10 +1415,11 @@ export class MusicService {
       {
         signal: lease.signal,
         deadline: lease.deadline,
-        isCurrent: () => lease.current() && owner.current(),
+        isCurrent: () => lease.current() && owner.current() && lease.current(),
       },
     );
-    if (!lease.current() || !owner.current()) return failMusic('retired');
+    if (!lease.current() || !owner.current() || !lease.current())
+      return failMusic('retired');
     await this.probeMetadata(lease, binding, owner);
     return parseNativeCommentsMetadata(result);
   }
@@ -1061,12 +1430,23 @@ export class MusicService {
     deadlineAt?: number,
   ): Promise<CommentPage> {
     const input = parseMusicCommentsInput(value);
+    return this.commentsFor(
+      this.localInvocation(token, signal),
+      input,
+      deadlineAt,
+    );
+  }
+  commentsFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+  ): Promise<CommentPage> {
+    const input = parseMusicCommentsInput(value);
     const deadline = Math.min(this.now() + 15000, deadlineAt ?? Infinity);
-    return this.admitted(
-      token,
+    return this.admittedFor(
+      invocation,
       'comments.read',
       [],
-      signal,
       false,
       async (lease) => {
         if ('cursor' in input)
@@ -1118,7 +1498,8 @@ export class MusicService {
     offset: number,
     limit: number,
   ): CommentPage {
-    if (!lease.current() || !owner.current()) return failMusic('retired');
+    if (!lease.current() || !owner.current() || !lease.current())
+      return failMusic('retired');
     const comments = source.comments.slice(offset, offset + limit);
     let page: CommentPage;
     for (;;) {
@@ -1147,6 +1528,7 @@ export class MusicService {
         kind: 'comments',
         id: page.nextCursor,
         principal: lease.principal,
+        access: lease.access,
         scope: lease.scope,
         resource: lease.resource,
         revision: lease.revision,
@@ -1169,11 +1551,14 @@ export class MusicService {
         utf8Bytes(
           JSON.stringify({
             ...cursor,
+            access: undefined,
             owner: { epoch: owner.epoch },
             admission: { generation: cursor.admission.generation },
           }),
-        ) + 64;
-      this.allocate(cursor);
+        ) +
+        musicAccessBytes(cursor.access) +
+        64;
+      this.allocate(cursor, lease);
     }
     this.scheduleCacheCleanup();
     return structuredClone(page);
@@ -1187,6 +1572,7 @@ export class MusicService {
     if (
       !cursor ||
       cursor.kind !== 'comments' ||
+      !sameMusicAccess(cursor.access, lease.access) ||
       cursor.scope !== lease.scope ||
       cursor.resource !== lease.resource ||
       cursor.principal.id !== lease.principal.id ||
@@ -1197,10 +1583,14 @@ export class MusicService {
       return failMusic('not_found');
     if (
       cursor.revision !== this.revision ||
+      !musicAccessCurrent(cursor.access) ||
+      !lease.current() ||
       cursor.admission.frame !== lease.admission.frame ||
       cursor.admission.generation !== lease.admission.generation ||
       !cursor.owner.current() ||
-      !this.grants.isCurrent(cursor.principal, cursor.scope)
+      !lease.current() ||
+      !this.grants.isCurrent(cursor.principal, cursor.scope) ||
+      !lease.current()
     )
       return failMusic('retired');
     if (limit !== cursor.limit) return failMusic('invalid');
@@ -1208,6 +1598,7 @@ export class MusicService {
     cursor.busy = true;
     try {
       await this.probeMetadata(lease, cursor.binding, cursor.owner);
+      if (!lease.current()) return failMusic('retired');
       if (cursor.replay) return structuredClone(cursor.replay);
       let source = cursor.source,
         offset = cursor.offset;
@@ -1232,7 +1623,8 @@ export class MusicService {
           });
           if (
             captured.owner.epoch !== cursor.owner.epoch ||
-            !cursor.owner.current()
+            !cursor.owner.current() ||
+            !lease.current()
           )
             return failMusic('retired');
           result = parseNativeCommentsMetadata(captured.value);
@@ -1265,26 +1657,32 @@ export class MusicService {
         utf8Bytes(
           JSON.stringify({
             ...cursor,
+            access: undefined,
             owner: { epoch: cursor.owner.epoch },
             admission: { generation: cursor.admission.generation },
           }),
-        ) + 64;
+        ) +
+        musicAccessBytes(cursor.access) +
+        64;
       return page;
     } finally {
       cursor.busy = false;
     }
   }
-  current(token: unknown, signal?: AbortSignal) {
-    return this.admitted(
-      token,
+  async current(token: unknown, signal?: AbortSignal) {
+    return this.currentFor(this.localInvocation(token, signal));
+  }
+  currentFor(invocation: MusicInvocation, deadlineAt?: number) {
+    return this.admittedFor(
+      invocation,
       'playback.read',
       [],
-      signal,
       true,
       async (lease) => {
         const captured = await this.native(lease, { operation: 'current' });
         return parseNativeSnapshot(captured.value);
       },
+      deadlineAt,
     );
   }
   async queue(
@@ -1293,11 +1691,18 @@ export class MusicService {
     signal?: AbortSignal,
   ): Promise<QueuePage> {
     const input = parseMusicQueueInput(value);
-    return this.admitted(
-      token,
+    return this.queueFor(this.localInvocation(token, signal), input);
+  }
+  queueFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+  ): Promise<QueuePage> {
+    const input = parseMusicQueueInput(value);
+    return this.admittedFor(
+      invocation,
       'playback.read',
       [],
-      signal,
       true,
       async (lease) => {
         if (!input.cursor) {
@@ -1314,6 +1719,7 @@ export class MusicService {
         if (
           !cursor ||
           cursor.kind !== 'queue' ||
+          !sameMusicAccess(cursor.access, lease.access) ||
           cursor.resource !== lease.resource ||
           cursor.scope !== lease.scope ||
           cursor.principal.id !== lease.principal.id ||
@@ -1323,10 +1729,15 @@ export class MusicService {
           return failMusic('not_found');
         if (
           cursor.revision !== this.revision ||
+          !musicAccessCurrent(cursor.access) ||
+          !lease.current() ||
           !cursor.owner.current() ||
+          !lease.current() ||
           !this.grants.isCurrent(cursor.principal, cursor.scope) ||
+          !lease.current() ||
           (cursor.issuerScope !== undefined &&
-            !this.grants.isCurrent(cursor.principal, cursor.issuerScope))
+            !this.grants.isCurrent(cursor.principal, cursor.issuerScope)) ||
+          !lease.current()
         )
           return failMusic('retired');
         if (input.limit !== cursor.limit) return failMusic('invalid');
@@ -1339,6 +1750,7 @@ export class MusicService {
             fresh.queueRevision !== cursor.source.queueRevision ||
             captured.owner.epoch !== cursor.owner.epoch ||
             !cursor.owner.current() ||
+            !lease.current() ||
             JSON.stringify(fresh) !== JSON.stringify(cursor.source)
           )
             return failMusic('retired');
@@ -1362,6 +1774,7 @@ export class MusicService {
           cursor.busy = false;
         }
       },
+      deadlineAt,
     );
   }
   private queuePage(
@@ -1371,7 +1784,8 @@ export class MusicService {
     offset: number,
     limit: number,
   ): QueuePage {
-    if (!lease.current() || !owner.current()) return failMusic('retired');
+    if (!lease.current() || !owner.current() || !lease.current())
+      return failMusic('retired');
     const items = source.items
       .slice(offset, offset + limit)
       .map((item, index) => ({
@@ -1401,6 +1815,7 @@ export class MusicService {
         kind: 'queue',
         id: result.nextCursor,
         principal: lease.principal,
+        access: lease.access,
         scope: lease.scope,
         resource: lease.resource,
         ...(lease.issuerScope ? { issuerScope: lease.issuerScope } : {}),
@@ -1413,8 +1828,11 @@ export class MusicService {
         busy: false,
         bytes: 0,
       };
-      cursor.bytes = utf8Bytes(JSON.stringify(cursor)) + 64;
-      this.allocate(cursor);
+      cursor.bytes =
+        utf8Bytes(JSON.stringify({ ...cursor, access: undefined })) +
+        musicAccessBytes(cursor.access) +
+        64;
+      this.allocate(cursor, lease);
       this.scheduleCacheCleanup();
     }
     return structuredClone(result);
@@ -1422,35 +1840,64 @@ export class MusicService {
   search(token: unknown, value: unknown, signal?: AbortSignal) {
     return this.catalog(token, parseMusicInput(value, 'search'), signal);
   }
+  searchFor(invocation: MusicInvocation, value: unknown, deadlineAt?: number) {
+    return this.catalogFor(
+      invocation,
+      parseMusicInput(value, 'search'),
+      deadlineAt,
+    );
+  }
   browse(token: unknown, value: unknown, signal?: AbortSignal) {
     return this.catalog(token, parseMusicInput(value, 'browse'), signal);
+  }
+  browseFor(invocation: MusicInvocation, value: unknown, deadlineAt?: number) {
+    return this.catalogFor(
+      invocation,
+      parseMusicInput(value, 'browse'),
+      deadlineAt,
+    );
   }
   home(
     token: unknown,
     value: unknown,
     signal?: AbortSignal,
   ): Promise<MusicPage> {
-    return this.collection(token, value, 'home', signal);
+    const input = parseMusicCollectionInput(value);
+    return this.homeFor(this.localInvocation(token, signal), input);
+  }
+  homeFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+  ): Promise<MusicPage> {
+    return this.collectionFor(invocation, value, 'home', deadlineAt);
   }
   library(
     token: unknown,
     value: unknown,
     signal?: AbortSignal,
   ): Promise<MusicPage> {
-    return this.collection(token, value, 'library', signal);
+    const input = parseMusicCollectionInput(value);
+    return this.libraryFor(this.localInvocation(token, signal), input);
   }
-  private collection(
-    token: unknown,
+  libraryFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+  ): Promise<MusicPage> {
+    return this.collectionFor(invocation, value, 'library', deadlineAt);
+  }
+  private collectionFor(
+    invocation: MusicInvocation,
     value: unknown,
     route: 'home' | 'library',
-    signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<MusicPage> {
     const input = parseMusicCollectionInput(value);
-    return this.admitted(
-      token,
+    return this.admittedFor(
+      invocation,
       route === 'home' ? 'personalized.read' : 'library.read',
       [],
-      signal,
       false,
       async (lease) => {
         if (input.cursor)
@@ -1471,6 +1918,7 @@ export class MusicService {
           seenPlaylistIds,
         );
       },
+      deadlineAt,
     );
   }
   /** Bounded playlist-only first-occurrence projection; preserve shelf intersections. */
@@ -1501,10 +1949,17 @@ export class MusicService {
       seenPlaylistIds: [...seen],
     };
   }
-  private catalog(
+  private async catalog(
     token: unknown,
     input: MusicClientInput,
     signal?: AbortSignal,
+  ): Promise<MusicPage> {
+    return this.catalogFor(this.localInvocation(token, signal), input);
+  }
+  private catalogFor(
+    invocation: MusicInvocation,
+    input: MusicClientInput,
+    deadlineAt?: number,
   ): Promise<MusicPage> {
     const extra: MusicScope[] =
       input.operation === 'browse' &&
@@ -1512,11 +1967,10 @@ export class MusicService {
       personalCollection(input.target.id)
         ? ['library.read']
         : [];
-    return this.admitted(
-      token,
+    return this.admittedFor(
+      invocation,
       'catalog.read',
       extra,
-      signal,
       false,
       async (lease) => {
         if (input.operation === 'page')
@@ -1547,6 +2001,7 @@ export class MusicService {
             const reference = this.references.get(target.id);
             if (
               !reference ||
+              !sameMusicAccess(reference.access, lease.access) ||
               reference.principal.id !== lease.principal.id ||
               reference.principal.digest !== lease.principal.digest ||
               reference.resource !== lease.resource ||
@@ -1555,13 +2010,18 @@ export class MusicService {
               return failMusic('not_found');
             if (
               reference.revision !== this.revision ||
+              !musicAccessCurrent(reference.access) ||
+              !lease.current() ||
               !reference.owner.current() ||
+              !lease.current() ||
               !this.grants.isCurrent(reference.principal, reference.scope) ||
+              !lease.current() ||
               (reference.issuerScope !== undefined &&
                 !this.grants.isCurrent(
                   reference.principal,
                   reference.issuerScope,
-                ))
+                )) ||
+              !lease.current()
             )
               return failMusic('retired');
             if (reference.busy) return failMusic('busy');
@@ -1584,12 +2044,15 @@ export class MusicService {
               current: () =>
                 originLease.current() &&
                 reference.owner.current() &&
+                originLease.current() &&
                 this.grants.isCurrent(reference.principal, reference.scope) &&
+                originLease.current() &&
                 (!reference.issuerScope ||
-                  this.grants.isCurrent(
+                  (this.grants.isCurrent(
                     reference.principal,
                     reference.issuerScope,
-                  )),
+                  ) &&
+                    originLease.current())),
             };
             nativeInput = {
               operation: 'browse',
@@ -1627,6 +2090,7 @@ export class MusicService {
           input.limit,
         );
       },
+      deadlineAt,
     );
   }
   private bytes() {
@@ -1672,8 +2136,10 @@ export class MusicService {
     );
     this.cacheTimer.unref?.();
   }
-  private allocate(cursor: Cursor) {
+  private allocate(cursor: Cursor, lease: Lease) {
     this.sweep();
+    // Grant guards in sweep can synchronously retire the issuing session.
+    if (!lease.current()) return failMusic('retired');
     if (
       this.cursors.size >= MUSIC_LIMITS.globalCursors ||
       [...this.cursors.values()].filter(
@@ -1693,7 +2159,8 @@ export class MusicService {
     limit: number,
     seenPlaylistIds?: string[],
   ): MusicPage {
-    if (!lease.current() || !owner.current()) return failMusic('retired');
+    if (!lease.current() || !owner.current() || !lease.current())
+      return failMusic('retired');
     const sliced = sliceMusicSource(source, offset, limit);
     const recipeByIndex = new Map(
       source.targetRecipes.map((recipe) => [recipe.itemIndex, recipe]),
@@ -1749,6 +2216,7 @@ export class MusicService {
         const reference = {
           id: item.reference,
           principal: lease.principal,
+          access: lease.access,
           scope: lease.scope,
           resource: lease.resource,
           ...(lease.issuerScope ? { issuerScope: lease.issuerScope } : {}),
@@ -1762,7 +2230,10 @@ export class MusicService {
           expires: this.now() + MUSIC_LIMITS.cursorMs,
           bytes: 0,
         };
-        reference.bytes = utf8Bytes(JSON.stringify(reference)) + 64;
+        reference.bytes =
+          utf8Bytes(JSON.stringify({ ...reference, access: undefined })) +
+          musicAccessBytes(reference.access) +
+          64;
         newReferences.push(reference);
       }
     const referenceBytes = newReferences.reduce((n, r) => n + r.bytes, 0);
@@ -1778,6 +2249,7 @@ export class MusicService {
         kind: 'catalog',
         id: result.nextCursor,
         principal: lease.principal,
+        access: lease.access,
         scope: lease.scope,
         resource: lease.resource,
         ...(lease.issuerScope ? { issuerScope: lease.issuerScope } : {}),
@@ -1792,14 +2264,18 @@ export class MusicService {
         busy: false,
         bytes: 0,
       };
-      cursor.bytes = utf8Bytes(JSON.stringify(cursor)) + 64;
+      cursor.bytes =
+        utf8Bytes(JSON.stringify({ ...cursor, access: undefined })) +
+        musicAccessBytes(cursor.access) +
+        64;
       if (
         this.bytes() + cursor.bytes + referenceBytes >
         MUSIC_LIMITS.cacheBytes
       )
         return failMusic('budget');
-      this.allocate(cursor);
+      this.allocate(cursor, lease);
     }
+    if (!lease.current()) return failMusic('retired');
     for (const reference of newReferences)
       this.references.set(reference.id, reference);
     this.scheduleCacheCleanup();
@@ -1815,6 +2291,7 @@ export class MusicService {
     if (
       !cursor ||
       cursor.kind !== 'catalog' ||
+      !sameMusicAccess(cursor.access, lease.access) ||
       cursor.resource !== lease.resource ||
       cursor.scope !== lease.scope ||
       cursor.principal.id !== lease.principal.id ||
@@ -1825,10 +2302,15 @@ export class MusicService {
       return failMusic('not_found');
     if (
       cursor.revision !== this.revision ||
+      !musicAccessCurrent(cursor.access) ||
+      !lease.current() ||
       !cursor.owner.current() ||
+      !lease.current() ||
       !this.grants.isCurrent(cursor.principal, cursor.scope) ||
+      !lease.current() ||
       (cursor.issuerScope !== undefined &&
-        !this.grants.isCurrent(cursor.principal, cursor.issuerScope))
+        !this.grants.isCurrent(cursor.principal, cursor.issuerScope)) ||
+      !lease.current()
     )
       return failMusic('retired');
     if (limit !== cursor.limit) return failMusic('invalid');
@@ -1840,12 +2322,14 @@ export class MusicService {
         issuerScope: cursor.issuerScope,
         current: () =>
           originLease.current() &&
-          this.grants.isCurrent(cursor.principal, cursor.issuerScope!),
+          this.grants.isCurrent(cursor.principal, cursor.issuerScope!) &&
+          originLease.current(),
       };
     cursor.busy = true;
     try {
       if ('binding' in cursor.context && cursor.context.binding)
         await this.probeMetadata(lease, cursor.context.binding, cursor.owner);
+      if (!lease.current()) return failMusic('retired');
       if (cursor.replay) return structuredClone(cursor.replay);
       let seenPlaylistIds = cursor.seenPlaylistIds;
       let source = cursor.source,
@@ -1888,7 +2372,11 @@ export class MusicService {
             captured.value,
             source.continuation.endpoint,
           );
-        if (owner.epoch !== captured.owner.epoch || !owner.current())
+        if (
+          owner.epoch !== captured.owner.epoch ||
+          !owner.current() ||
+          !lease.current()
+        )
           return failMusic('retired');
         if (cursor.context.route === 'library') {
           const projected = this.librarySource(source, seenPlaylistIds ?? []);

@@ -1,11 +1,15 @@
-import { isIP } from 'node:net';
-
 import {
   MUSIC_LIMITS,
   MusicServiceError,
   type MusicFailure,
 } from '../../music-types';
-import { parseMusicBearer, type MusicGrantRecord } from '../music-grants';
+import { type MusicGrantRecord } from '../music-grants';
+import {
+  musicHttpPolicy,
+  isMusicHttpNamespace,
+  MusicHttpFailure,
+  type MusicHttpListenerOwner,
+} from '../music-http-policy';
 import {
   parseMusicQueueQuery,
   parseMusicLyricsQuery,
@@ -19,10 +23,7 @@ import type { Env, Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-export interface MusicTransportOwner {
-  resource: string;
-  current(): boolean;
-}
+export type MusicTransportOwner = MusicHttpListenerOwner;
 const prefix = '/api/v1/music';
 class HttpMusicFailure extends MusicServiceError {
   constructor(
@@ -55,7 +56,7 @@ const codes: Record<MusicFailure, ContentfulStatusCode> = {
   conflict: 409,
 };
 const failure = (error: unknown) => {
-  if (error instanceof HttpMusicFailure)
+  if (error instanceof HttpMusicFailure || error instanceof MusicHttpFailure)
     return {
       status: error.status,
       body: { error: { code: error.code, message: error.message } },
@@ -91,64 +92,6 @@ function wait<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
       .finally(() => signal.removeEventListener('abort', abort))
       .catch(() => {});
   });
-}
-function loopback(peer: string | undefined) {
-  if (!peer) return false;
-  if (peer === '::1') return true;
-  const ipv4 = peer.startsWith('::ffff:') ? peer.slice(7) : peer;
-  return isIP(ipv4) === 4 && ipv4.startsWith('127.');
-}
-function policy(incoming: IncomingMessage, resource: string) {
-  if (!loopback(incoming.socket.remoteAddress)) return reject(403, 'forbidden');
-  const audience = new URL(resource);
-  const expectedPort = Number(
-    audience.port || (audience.protocol === 'https:' ? 443 : 80),
-  );
-  const localAddress = incoming.socket.localAddress?.replace(/^::ffff:/, '');
-  const hostname = audience.hostname.startsWith('[')
-    ? audience.hostname.slice(1, -1)
-    : audience.hostname;
-  if (
-    incoming.socket.localPort !== expectedPort ||
-    (hostname === 'localhost'
-      ? !loopback(localAddress)
-      : localAddress !== hostname)
-  )
-    return reject(403, 'forbidden');
-  const entries = new Map<string, string[]>();
-  for (let i = 0; i < incoming.rawHeaders.length; i += 2) {
-    const key = incoming.rawHeaders[i].toLowerCase();
-    const values = entries.get(key) ?? [];
-    values.push(incoming.rawHeaders[i + 1]);
-    entries.set(key, values);
-  }
-  const host = entries.get('host');
-  if (!host || host.length !== 1 || host[0] !== new URL(resource).host)
-    return reject(403, 'forbidden');
-  const encrypted =
-    (incoming.socket as typeof incoming.socket & { encrypted?: boolean })
-      .encrypted === true;
-  if (encrypted !== (new URL(resource).protocol === 'https:'))
-    return reject(403, 'forbidden');
-  if (
-    [...entries.keys()].some(
-      (key) =>
-        key === 'origin' ||
-        key === 'forwarded' ||
-        key.startsWith('x-forwarded-'),
-    )
-  )
-    return reject(403, 'forbidden');
-  const authorization = entries.get('authorization');
-  if (!authorization || authorization.length !== 1)
-    return reject(
-      authorization?.length ? 403 : 401,
-      authorization?.length ? 'forbidden' : 'unauthorized',
-    );
-  const token = parseMusicBearer(authorization[0]);
-  if (!token) return reject(401, 'unauthorized');
-  if ((entries.get('content-type')?.length ?? 0) > 1) return reject(400);
-  return token;
 }
 async function jsonBody(
   request: Request,
@@ -209,7 +152,9 @@ async function jsonBody(
 export function registerMusicRoutes<E extends Env>(
   app: Hono<E>,
   getService: () => MusicService | undefined,
-  getTransportOwner: () => MusicTransportOwner | undefined,
+  getTransportOwner: (
+    incoming: IncomingMessage,
+  ) => MusicTransportOwner | undefined,
 ) {
   app.use('*', async (context, next) => {
     const bindings = context.env as
@@ -218,24 +163,20 @@ export function registerMusicRoutes<E extends Env>(
     const incoming = bindings?.incoming,
       outgoing = bindings?.outgoing;
     const rawTarget = incoming?.url ?? context.req.path;
-    const namespace = (target: string) =>
-      target === prefix ||
-      [prefix + '/', prefix + '%', prefix + '?', prefix + '\\'].some((start) =>
-        target.startsWith(start),
-      );
-    if (!namespace(rawTarget) && !namespace(context.req.path)) return next();
+    if (!isMusicHttpNamespace(rawTarget, context.req.path)) return next();
     context.header('Cache-Control', 'no-store');
     let timer: ReturnType<typeof setTimeout> | undefined,
       detachGrant = () => {},
       detachSocket = () => {};
     try {
-      const service = getService(),
-        transport = getTransportOwner();
-      if (!service?.enabled || !transport?.current() || !incoming || !outgoing)
+      const service = getService();
+      if (!service?.httpConfigured || !incoming || !outgoing)
         return reject(503, 'unavailable');
-      const owner = service.captureNativeOwner(),
-        token = policy(incoming, transport.resource);
-      if (transport.resource !== service.resource)
+      const transport = getTransportOwner(incoming);
+      if (!transport?.current()) return reject(503, 'unavailable');
+      const { token, resource } = musicHttpPolicy(incoming, transport);
+      const owner = service.captureNativeOwner(resource);
+      if (!transport.current() || !owner.current() || getService() !== service)
         return reject(409, 'retired');
       if (
         !rawTarget.startsWith(prefix + '/') ||
@@ -315,6 +256,7 @@ export function registerMusicRoutes<E extends Env>(
       };
       const signal = AbortSignal.any([
         controller.signal,
+        transport.signal,
         ...(Object.hasOwn(owner, 'signal')
           ? [(owner as typeof owner & { signal: AbortSignal }).signal]
           : []),
@@ -338,18 +280,35 @@ export function registerMusicRoutes<E extends Env>(
                   ? 'library.read'
                   : 'catalog.read';
       let principal: MusicGrantRecord | undefined;
-      const live = () =>
+      const invocation = Object.freeze({
+        token,
+        transport: 'rest' as const,
+        resource,
+        signal,
+      });
+      const unchanged = () =>
         !signal.aborted &&
-        getService() === service &&
-        transport.current() &&
-        owner.current() &&
-        (!principal || service.grants.isCurrent(principal, scope));
+        !transport.signal.aborted &&
+        getService() === service;
+      const live = () => {
+        if (!unchanged() || !transport.current() || !unchanged()) return false;
+        if (!owner.current() || !unchanged()) return false;
+        if (principal && !service.grants.isCurrent(principal, scope))
+          return false;
+        return (
+          unchanged() &&
+          transport.current() &&
+          unchanged() &&
+          owner.current() &&
+          unchanged()
+        );
+      };
       detachGrant = service.grants.subscribe(() => {
         if (!live()) controller.abort(new MusicServiceError('retired'));
       });
       if (!prepare && !status)
         principal = await wait(
-          service.grants.authorize(token, 'rest', transport.resource, scope),
+          service.grants.authorize(token, 'rest', resource, scope),
           signal,
         );
       if (!live()) return reject(409, 'retired');
@@ -396,12 +355,12 @@ export function registerMusicRoutes<E extends Env>(
         | Awaited<ReturnType<MusicService['prepare']>>
       >(
         prepare
-          ? service.prepare(token, input, signal, deadlineAt)
+          ? service.prepareFor(invocation, input, deadlineAt)
           : status
-            ? service.operation(token, operationId, signal, deadlineAt)
+            ? service.operationFor(invocation, operationId, deadlineAt)
             : queueMutation
-              ? service.mutateQueue(
-                  token,
+              ? service.mutateQueueFor(
+                  invocation,
                   {
                     ...(input as object),
                     action:
@@ -416,14 +375,13 @@ export function registerMusicRoutes<E extends Env>(
                       ? { index: Number(queueIndex) }
                       : {}),
                   },
-                  signal,
                   deadlineAt,
                 )
               : control
-                ? service.control(token, input, signal, deadlineAt)
+                ? service.controlFor(invocation, input, deadlineAt)
                 : mutation
-                  ? service.navigate(
-                      token,
+                  ? service.navigateFor(
+                      invocation,
                       {
                         ...(input as object),
                         action:
@@ -433,26 +391,37 @@ export function registerMusicRoutes<E extends Env>(
                               ? 'play_playlist'
                               : 'radio',
                       },
-                      signal,
                       deadlineAt,
                     )
                   : comments
-                    ? service.comments(token, input, signal, deadlineAt)
+                    ? service.commentsFor(invocation, input, deadlineAt)
                     : lyrics
-                      ? service.lyrics(token, input, signal, deadlineAt)
+                      ? service.lyricsFor(invocation, input, deadlineAt)
                       : related
-                        ? service.related(token, input, signal, deadlineAt)
+                        ? service.relatedFor(invocation, input, deadlineAt)
                         : current
-                          ? service.current(token, signal)
+                          ? service.currentFor(invocation, deadlineAt)
                           : queue
-                            ? service.queue(token, input, signal)
+                            ? service.queueFor(invocation, input, deadlineAt)
                             : home
-                              ? service.home(token, input, signal)
+                              ? service.homeFor(invocation, input, deadlineAt)
                               : library
-                                ? service.library(token, input, signal)
+                                ? service.libraryFor(
+                                    invocation,
+                                    input,
+                                    deadlineAt,
+                                  )
                                 : route === '/search'
-                                  ? service.search(token, input, signal)
-                                  : service.browse(token, input, signal),
+                                  ? service.searchFor(
+                                      invocation,
+                                      input,
+                                      deadlineAt,
+                                    )
+                                  : service.browseFor(
+                                      invocation,
+                                      input,
+                                      deadlineAt,
+                                    ),
         signal,
       );
       if (!live()) return reject(409, 'retired');

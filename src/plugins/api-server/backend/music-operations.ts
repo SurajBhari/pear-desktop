@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
+import {
+  sameMusicAccess,
+  musicAccessBytes,
+  type MusicAccessBinding,
+  type MusicSessionOwner,
+} from './music-access';
 import { grantMatches, type MusicGrantRecord } from './music-grants';
 
 import {
@@ -20,6 +26,7 @@ export const MUSIC_OPERATION_LIMITS = Object.freeze({
   global: 128,
 });
 export interface MusicOperationBinding {
+  readonly access: MusicAccessBinding;
   principal: MusicGrantRecord;
   resource: string;
   service: object;
@@ -55,6 +62,19 @@ function freezeCommand(command: MusicOperationCommand): MusicOperationCommand {
       seed: Object.freeze({ ...command.seed }),
     });
   return Object.freeze({ ...command });
+}
+/** Legacy REST wrappers retain their service/config/native retired-context result.
+ * MCP always requires the exact selected access owner, including across services.
+ */
+function operationAccessMatches(a: MusicAccessBinding, b: MusicAccessBinding) {
+  return (
+    sameMusicAccess(a, b) ||
+    (a.transport === 'rest' &&
+      b.transport === 'rest' &&
+      a.resource === b.resource &&
+      !a.session &&
+      !b.session)
+  );
 }
 /** Independent bounded receipt history. Issuance is the only way to create a row. */
 export class MusicOperationLedger {
@@ -119,7 +139,9 @@ export class MusicOperationLedger {
           physicalHold: false,
           notAdmitted: false,
         }),
-      ) + 32;
+      ) +
+      32 +
+      musicAccessBytes(binding.access);
     if (bytes > MUSIC_OPERATION_LIMITS.entryBytes) return failMusic('budget');
     const rows = [...this.rows.values()];
     if (
@@ -155,11 +177,18 @@ export class MusicOperationLedger {
     this.schedule();
     return { ...receipt };
   }
-  requiredScope(id: string, token: unknown, resource: string) {
+  requiredScope(id: string, token: unknown, access: MusicAccessBinding) {
     const row = this.rows.get(id);
     if (
       !row ||
-      !grantMatches(row.binding.principal, token, 'rest', resource, this.now())
+      !operationAccessMatches(row.binding.access, access) ||
+      !grantMatches(
+        row.binding.principal,
+        token,
+        access.transport,
+        access.resource,
+        this.now(),
+      )
     )
       return undefined;
     return row.requiredScope;
@@ -167,7 +196,7 @@ export class MusicOperationLedger {
   lookup(
     id: string,
     principal: MusicGrantRecord,
-    resource: string,
+    access: MusicAccessBinding,
     validateContext?: (row: MusicOperationRow) => void,
   ): MusicOperationRow {
     const row = this.rows.get(id);
@@ -176,7 +205,8 @@ export class MusicOperationLedger {
       row.binding.principal.id !== principal.id ||
       row.binding.principal.digest !== principal.digest ||
       row.binding.principal.transport !== principal.transport ||
-      row.binding.resource !== resource
+      row.binding.resource !== access.resource ||
+      !operationAccessMatches(row.binding.access, access)
     )
       return failMusic('unknown_operation');
     // Main-only synchronous validation must precede every request-driven mutation.
@@ -195,6 +225,22 @@ export class MusicOperationLedger {
         row.binding.service === service &&
         row.receipt.status === 'pending' &&
         !row.executing
+      )
+        row.receipt = {
+          operationId: row.id,
+          status: 'retired',
+          error: 'retired',
+        };
+    this.schedule();
+  }
+  retireSession(service: object, owner: MusicSessionOwner) {
+    for (const row of this.rows.values())
+      if (
+        row.binding.service === service &&
+        row.binding.access.session === owner &&
+        row.receipt.status === 'pending' &&
+        !row.executing &&
+        !row.physicalHold
       )
         row.receipt = {
           operationId: row.id,

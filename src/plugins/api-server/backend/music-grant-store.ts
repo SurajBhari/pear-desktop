@@ -19,9 +19,27 @@ import {
 
 import { failMusic, type MusicScope } from '../music-types';
 
+interface MusicGrantEpoch {
+  record: MusicGrantRecord;
+  controller: AbortController;
+}
+const leaseLifetimes = new WeakMap<
+  MusicGrantRecord,
+  { store: MusicGrantStore; signal: AbortSignal }
+>();
+/** Main-only negative fence; exact object provenance, with no authority callouts. */
+export function musicGrantLifetimeSignal(
+  store: MusicGrantStore,
+  lease: MusicGrantRecord,
+): AbortSignal | undefined {
+  const lifetime = leaseLifetimes.get(lease);
+  return lifetime?.store === store ? lifetime.signal : undefined;
+}
+
 /** Native main-process ledger. No record can be imported from renderer-writable plugin settings. */
 export class MusicGrantStore {
   private records: MusicGrantRecord[] | undefined;
+  private epochs = new Map<string, MusicGrantEpoch>();
   private windowsBinding: string | null | undefined;
   private readonly observers = new Set<() => void>();
   subscribe(observer: () => void) {
@@ -55,6 +73,39 @@ export class MusicGrantStore {
       (directory || (s.nlink === 1 && s.size <= GRANT_MAX_BYTES))
     );
   }
+  private nextEpochs(records: MusicGrantRecord[]) {
+    return new Map(
+      records.map((record) => {
+        const previous = this.epochs.get(record.id);
+        const old = previous?.record;
+        const unchanged =
+          old &&
+          old.digest === record.digest &&
+          old.transport === record.transport &&
+          old.resource === record.resource &&
+          old.createdAt === record.createdAt &&
+          old.expiresAt === record.expiresAt &&
+          old.scopes.length === record.scopes.length &&
+          old.scopes.every((scope) => record.scopes.includes(scope));
+        return [
+          record.id,
+          unchanged && previous && !previous.controller.signal.aborted
+            ? previous
+            : { record, controller: new AbortController() },
+        ] as const;
+      }),
+    );
+  }
+  private publish(
+    records: MusicGrantRecord[],
+    epochs = this.nextEpochs(records),
+  ) {
+    const previous = this.epochs;
+    this.records = records;
+    this.epochs = epochs;
+    for (const [id, epoch] of previous)
+      if (epochs.get(id) !== epoch) epoch.controller.abort();
+  }
   private async load() {
     if (this.records) return;
     if (this.windows) {
@@ -63,7 +114,7 @@ export class MusicGrantStore {
         const records =
           snapshot.contents === null ? [] : this.parse(snapshot.contents);
         this.windowsBinding = snapshot.binding;
-        this.records = records;
+        this.publish(records);
         return;
       } catch {
         return failMusic('unavailable');
@@ -75,7 +126,7 @@ export class MusicGrantStore {
         dir = await lstat(this.directory);
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
-          this.records = [];
+          this.publish([]);
           return;
         }
         throw e;
@@ -89,7 +140,7 @@ export class MusicGrantStore {
         );
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
-          this.records = [];
+          this.publish([]);
           return;
         }
         throw e;
@@ -100,7 +151,7 @@ export class MusicGrantStore {
         const contents = await handle.readFile({ encoding: 'utf8' });
         if (Buffer.byteLength(contents) > GRANT_MAX_BYTES)
           return failMusic('unavailable');
-        this.records = this.parse(contents);
+        this.publish(this.parse(contents));
       } finally {
         await handle.close();
       }
@@ -138,6 +189,7 @@ export class MusicGrantStore {
       Buffer.byteLength(content) > GRANT_MAX_BYTES
     )
       return failMusic('budget');
+    const epochs = this.nextEpochs(records);
     if (this.windows) {
       if (this.windowsBinding === undefined) return failMusic('unavailable');
       let prepared:
@@ -151,7 +203,7 @@ export class MusicGrantStore {
         );
         if (!current()) return failMusic('retired');
         this.windowsBinding = await prepared.commit();
-        this.records = records;
+        this.publish(records, epochs);
         for (const observer of this.observers) observer();
       } catch (error) {
         if (
@@ -181,7 +233,7 @@ export class MusicGrantStore {
       }
       if (!current()) return failMusic('retired');
       await rename(temporary, this.file);
-      this.records = records;
+      this.publish(records, epochs);
       for (const observer of this.observers) observer();
     } catch (error) {
       if (
@@ -257,6 +309,10 @@ export class MusicGrantStore {
       if (!record.scopes.includes(scope)) return failMusic('forbidden');
       const lease = structuredClone(record);
       Object.freeze(lease.scopes);
+      leaseLifetimes.set(lease, {
+        store: this,
+        signal: this.epochs.get(record.id)!.controller.signal,
+      });
       return Object.freeze(lease);
     });
   }

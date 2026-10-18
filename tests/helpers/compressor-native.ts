@@ -14,6 +14,17 @@ export async function compressorNative<T>(
   const directory = await mkdtemp(
     path.join(tmpdir(), 'pear-compressor-native-'),
   );
+  let taskFailed = false,
+    taskFailure: unknown;
+  const lifecycle = {
+    phase: 'setup',
+    leaderPid: null as number | null,
+    closeObserved: false,
+    exitCode: null as number | null,
+    exitSignal: null as string | null,
+    resultSeen: false,
+    taskCompleted: false,
+  };
   try {
     const entry = path.join(directory, 'entry.cjs');
     await writeFile(
@@ -32,6 +43,7 @@ for(const key of ['userData','sessionData']){const target=path.join(owned,key);f
     );
     const env = { ...process.env };
     delete env.ELECTRON_RUN_AS_NODE;
+    lifecycle.phase = 'launch';
     const child = spawn(
       require('electron') as string,
       [
@@ -46,6 +58,7 @@ for(const key of ['userData','sessionData']){const target=path.join(owned,key);f
         stdio: ['ignore', 'pipe', 'pipe'],
       },
     );
+    lifecycle.leaderPid = child.pid ?? null;
     const kill = () => {
       if (!child.pid) return;
       try {
@@ -61,32 +74,55 @@ for(const key of ['userData','sessionData']){const target=path.join(owned,key);f
     child.stderr.on('data', (chunk) => (stderr += chunk));
     let timer: ReturnType<typeof setTimeout>;
     try {
+      lifecycle.phase = 'wait-close';
       await new Promise<void>((resolve, reject) => {
         timer = setTimeout(() => {
           kill();
           reject(new Error('Native compressor fixture timed out'));
         }, 25000);
         child.on('error', reject);
-        child.on('close', (code) =>
+        child.on('close', (code, signal) => {
+          lifecycle.closeObserved = true;
+          lifecycle.exitCode = code;
+          lifecycle.exitSignal = signal;
           code === 0
             ? resolve()
             : reject(
                 new Error(
                   `Native compressor fixture exited ${code}: ${stderr}`,
                 ),
-              ),
-        );
+              );
+        });
       });
     } finally {
       clearTimeout(timer!);
       kill();
     }
+    lifecycle.phase = 'parse-result';
     const line = stdout
       .split('\n')
       .find((line) => line.startsWith('COMPRESSOR_NATIVE '));
     if (!line) throw new Error(`Native result missing: ${stdout}`);
-    return JSON.parse(line.slice('COMPRESSOR_NATIVE '.length)) as T;
+    lifecycle.resultSeen = true;
+    const result = JSON.parse(line.slice('COMPRESSOR_NATIVE '.length)) as T;
+    lifecycle.taskCompleted = true;
+    lifecycle.phase = 'complete';
+    return result;
+  } catch (error) {
+    taskFailed = true;
+    taskFailure = error;
+    throw error;
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch (error) {
+      console.error('COMPRESSOR_NATIVE_CLEANUP ' + JSON.stringify(lifecycle));
+      if (taskFailed)
+        throw new AggregateError(
+          [taskFailure, error],
+          'Native compressor task and cleanup both failed',
+        );
+      throw error;
+    }
   }
 }

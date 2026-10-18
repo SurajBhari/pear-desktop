@@ -603,6 +603,383 @@ test('N1 actual native prepared navigation six positive recipes and immutable re
 
 // F2 R1: genuine native windows and actual HTTP must fence all receipt phases.
 test('N1 F2 actual native original context rejects pending executing and terminal receipt access', async () => {
+  const proof = await musicNative(
+    async () => {
+      const f = (globalThis as any).MusicNativeProof,
+        http = require('node:http');
+      const reserve = http.createServer();
+      await new Promise<void>((resolve) =>
+        reserve.listen(0, '127.0.0.1', resolve),
+      );
+      const port = reserve.address().port;
+      await new Promise<void>((resolve) => reserve.close(resolve));
+      const make = () =>
+        new f.BrowserWindow({
+          show: false,
+          webPreferences: {
+            preload: f.preload,
+            contextIsolation: true,
+            sandbox: true,
+          },
+        });
+      const window = make();
+      await window.loadFile(f.owned + '/main.html');
+      const evaluate = (code: string) =>
+        window.webContents.executeJavaScript(code);
+      await evaluate(f.bundle);
+      await evaluate(
+        `window.identityReads=0;window.fetches=0;window.dispatches=[];window.holdAck=false;window.acks=[];window.api={getVideoData(){window.identityReads++;return {video_id:'seedVideo01'};},getPlayerResponse(){window.identityReads++;return {videoDetails:{videoId:'seedVideo01'}};},addEventListener(){},removeEventListener(){}};const app=document.querySelector('ytmusic-app');app.networkManager={fetch(){window.fetches++;return Promise.resolve({header:{musicResponsiveHeaderRenderer:{buttons:[]}}});}};app.addEventListener('yt-navigate',event=>window.dispatches.push({receiver:event.target===app,endpoint:event.detail.endpoint}));window.controller=MusicNativeSource.createMusicRendererController(window.api,()=>window.api,{subscribe:window.musicProof.subscribe,send:(channel,packet)=>{if(window.holdAck&&packet.type==='settled')window.acks.push(packet);else window.musicProof.send(channel,packet)}});undefined;`,
+      );
+      const config = {
+        enabled: true,
+        musicApiEnabled: true,
+        hostname: '127.0.0.1',
+        port,
+        useHttps: false,
+        certPath: '',
+        keyPath: '',
+        secret: '0'.repeat(64),
+        authorizedClients: [],
+        authStrategy: 'NONE',
+      };
+      const listeners: any[] = [],
+        context = {
+          window,
+          getConfig: () => config,
+          setConfig() {},
+          ipc: {
+            send: (...args: any[]) => window.webContents.send(...args),
+            on: (channel: string, fn: any) => {
+              const listener = (_event: any, ...args: any[]) => fn(...args);
+              listeners.push([channel, listener]);
+              f.ipcMain.on(channel, listener);
+            },
+            handle: (channel: string, fn: any) => f.ipcMain.handle(channel, fn),
+            removeHandler: (channel: string) =>
+              f.ipcMain.removeHandler(channel),
+          },
+        };
+      await f.source.backend.start(context);
+      if (!f.source.backend.server.listening)
+        await new Promise<void>((resolve) =>
+          f.source.backend.server.once('listening', resolve),
+        );
+      const service = f.source.getMusicService(window),
+        grant = await service.grants.issue(
+          'Owned F2 context',
+          'rest',
+          service.resource,
+          ['playback.control'],
+          () => true,
+        ),
+        token = grant.token;
+      const request = (path: string, method = 'GET', body?: unknown) =>
+        new Promise<any>((resolve, reject) => {
+          const req = http.request(
+            {
+              hostname: '127.0.0.1',
+              port,
+              path: '/api/v1/music' + path,
+              method,
+              headers: {
+                host: '127.0.0.1:' + port,
+                authorization: 'Bearer ' + token,
+                ...(body === undefined
+                  ? {}
+                  : { 'content-type': 'application/json' }),
+              },
+            },
+            (response: any) => {
+              let text = '';
+              response.on('data', (chunk: any) => (text += chunk));
+              response.on('end', () =>
+                resolve({
+                  status: response.statusCode,
+                  body: JSON.parse(text),
+                }),
+              );
+            },
+          );
+          req.on('error', reject);
+          req.end(body === undefined ? undefined : JSON.stringify(body));
+        });
+      const wait = async (check: () => boolean | Promise<boolean>) => {
+        const end = Date.now() + 5000;
+        while (!(await check())) {
+          if (Date.now() >= end)
+            throw Error('Missing F2 native context observation');
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      };
+      const broker = f.source.createMusicRequestBroker(window),
+        originalRead = broker.read;
+      let originalBrokerCalls = 0;
+      broker.read = function (...args: any[]) {
+        originalBrokerCalls++;
+        return originalRead.apply(this, args);
+      };
+      const records: any[] = [];
+      for (const phase of [
+        'pending',
+        'executing',
+        'accepted',
+        'failed',
+        'uncertain',
+        'retired',
+      ])
+        for (const mode of ['foreign-window', 'same-window-new-service']) {
+          f.source.clearMusicRouteService(f.source.backend.app);
+          await evaluate(
+            `window.holdAck=${phase === 'executing' || phase === 'uncertain'};window.acks=[];undefined;`,
+          );
+          const command: any =
+            phase === 'failed'
+              ? {
+                  action: 'play_playlist',
+                  playlistId: 'PL_N1PlaylistA',
+                  shuffle: true,
+                }
+              : { action: 'play_song', videoId: 'seedVideo01' };
+          const route = phase === 'failed' ? '/play/playlist' : '/play/song',
+            { action: _action, ...args } = command;
+          const prepared = await request(
+              '/operations/prepare',
+              'POST',
+              command,
+            ),
+            id = prepared.body.operationId,
+            body = { ...args, operationId: id },
+            beforeOriginalBroker = originalBrokerCalls,
+            beforeOriginalDispatch = await evaluate('window.dispatches.length');
+          const row = service.operations.lookup(id, grant.record, {
+            transport: 'rest',
+            resource: service.resource,
+            owner: service.accessOwner('rest', service.resource),
+          });
+          let executing: Promise<any> | undefined;
+          if (phase === 'executing') {
+            executing = service
+              .navigate(token, { ...command, operationId: id })
+              .then(
+                (value: any) => ({ ok: true, value }),
+                (error: any) => ({ ok: false, error }),
+              );
+            await wait(async () => await evaluate('window.acks.length===1'));
+          } else if (phase === 'uncertain') {
+            await service
+              .navigate(
+                token,
+                { ...command, operationId: id },
+                undefined,
+                Date.now() + 80,
+              )
+              .catch((error: any) => error.code);
+            await wait(async () => await evaluate('window.acks.length===1'));
+          } else if (phase === 'accepted' || phase === 'failed')
+            await request(route, 'POST', body);
+          else if (phase === 'retired') service.configure(config);
+          const before = {
+              receipt: { ...row.receipt },
+              expires: row.expires,
+              physicalHold: row.physicalHold,
+              executing: row.executing,
+            },
+            beforeNative = await evaluate(
+              '({identity:window.identityReads,fetches:window.fetches,dispatches:window.dispatches.length})',
+            );
+          const other = mode === 'foreign-window' ? make() : window;
+          if (other !== window) await other.loadFile(f.owned + '/main.html');
+          const second = new service.constructor({
+              window: other,
+              config,
+              grants: service.grants,
+              restListenerOwner: () => f.source.backend.musicHttpOwner,
+            }),
+            secondBroker = f.source.createMusicRequestBroker(other),
+            secondRead = secondBroker.read;
+          let foreignBrokerCalls = 0;
+          secondBroker.read = function (...values: any[]) {
+            foreignBrokerCalls++;
+            return secondRead.apply(this, values);
+          };
+          const selectionApp = f.source.backend.app,
+            transport = f.source.backend.musicHttpOwner;
+          let status: any,
+            replay: any,
+            rejectedBeforeOriginalSettlement: boolean,
+            afterRequests: any;
+          f.source.selectMusicRouteService(selectionApp, second);
+          try {
+            if (
+              f.source.backend.musicService !== service ||
+              !transport.current()
+            )
+              throw Error(
+                'Foreign routing replaced the original listener owner',
+              );
+            status = await request('/operations/' + id);
+            let returned = false;
+            const replayPromise = request(route, 'POST', body).then(
+              (reply) => {
+                returned = true;
+                return { ok: true, reply };
+              },
+              (error) => {
+                returned = true;
+                return { ok: false, error };
+              },
+            );
+            const until = Date.now() + 150;
+            while (!returned && Date.now() < until)
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            rejectedBeforeOriginalSettlement = returned;
+            afterRequests = {
+              receipt: { ...row.receipt },
+              expires: row.expires,
+              physicalHold: row.physicalHold,
+              executing: row.executing,
+            };
+            f.source.clearMusicRouteService(selectionApp);
+            if (
+              f.source.backend.musicService !== service ||
+              f.source.backend.musicHttpOwner !== transport ||
+              !transport.current()
+            )
+              throw Error('Foreign routing retired the original listener');
+            if (phase === 'executing') {
+              await evaluate(
+                "window.musicProof.send('peard:music-reply',window.acks.shift());undefined;",
+              );
+              const result = await executing;
+              if (!result.ok) throw result.error;
+            }
+            const result = await replayPromise;
+            if (!result.ok) throw result.error;
+            replay = result.reply;
+          } finally {
+            f.source.clearMusicRouteService(selectionApp);
+            secondBroker.read = secondRead;
+            second.stop();
+            if (other !== window) other.destroy();
+          }
+          const afterNative = await evaluate(
+            '({identity:window.identityReads,fetches:window.fetches,dispatches:window.dispatches.length})',
+          );
+          let originalStatus: any, originalReplay: any;
+          if (phase !== 'retired') {
+            originalStatus = await request('/operations/' + id);
+            if (phase !== 'pending')
+              originalReplay = await request(route, 'POST', body);
+          }
+          let afterLateAck: any;
+          if (phase === 'uncertain') {
+            await evaluate(
+              "window.musicProof.send('peard:music-reply',window.acks.shift());undefined;",
+            );
+            await wait(() => broker.stats().dispatched === 0);
+            afterLateAck = await request('/operations/' + id);
+          }
+          if (phase === 'pending')
+            originalReplay = await request(route, 'POST', body);
+          records.push({
+            phase,
+            mode,
+            status,
+            replay,
+            rejectedBeforeOriginalSettlement,
+            before,
+            afterRequests,
+            beforeNative,
+            afterNative,
+            foreignBrokerCalls,
+            originalStatus,
+            originalReplay,
+            afterLateAck,
+            originalBrokerCalls: originalBrokerCalls - beforeOriginalBroker,
+            originalDispatches:
+              (await evaluate('window.dispatches.length')) -
+              beforeOriginalDispatch,
+          });
+        }
+      // A committed replacement supplies real generation/document termination. Access
+      // under its new admission must not project the original pending receipt.
+      const replacement = await request('/operations/prepare', 'POST', {
+          action: 'play_song',
+          videoId: 'seedVideo01',
+        }),
+        replacementRow = service.operations.lookup(
+          replacement.body.operationId,
+          grant.record,
+          {
+            transport: 'rest',
+            resource: service.resource,
+            owner: service.accessOwner('rest', service.resource),
+          },
+        ),
+        oldAdmission = broker.capture();
+      await window.loadFile(f.owned + '/main.html');
+      const newAdmission = broker.capture(),
+        retiredBefore = { ...replacementRow.receipt };
+      const replacementStatus = await request(
+          '/operations/' + replacement.body.operationId,
+        ),
+        replacementReplay = await request('/play/song', 'POST', {
+          videoId: 'seedVideo01',
+          operationId: replacement.body.operationId,
+        });
+      const replacementProof = {
+        oldGeneration: oldAdmission.generation,
+        newGeneration: newAdmission.generation,
+        sameFrame: oldAdmission.frame === newAdmission.frame,
+        status: replacementStatus,
+        replay: replacementReplay,
+        before: retiredBefore,
+        after: replacementRow.receipt,
+      };
+      const server = f.source.backend.server,
+        closed = new Promise<void>((resolve) => server.once('close', resolve));
+      f.source.backend.stop();
+      await closed;
+      for (const [channel, listener] of listeners)
+        f.ipcMain.removeListener(channel, listener);
+      window.destroy();
+      return { records, replacementProof };
+    },
+    { routeSelection: true },
+  );
+  console.log('N1_F2_CONTEXT_NATIVE_PROOF ' + JSON.stringify(proof));
+  expect(proof.records).toHaveLength(12);
+  for (const row of proof.records) {
+    expect(row.status.status).toBe(409);
+    expect(row.status.body.error.code).toBe('retired');
+    expect(row.replay.status).toBe(409);
+    expect(row.replay.body.error.code).toBe('retired');
+    expect(row.rejectedBeforeOriginalSettlement).toBe(true);
+    expect(row.afterRequests).toEqual(row.before);
+    expect(row.afterNative).toEqual(row.beforeNative);
+    expect(row.foreignBrokerCalls).toBe(0);
+    if (row.phase !== 'retired') {
+      expect(row.originalStatus.status).toBe(200);
+      expect(row.originalReplay.status).toBe(200);
+    }
+    if (row.phase === 'uncertain') {
+      expect(row.before.physicalHold).toBe(true);
+      expect(row.afterLateAck.body).toEqual(row.originalStatus.body);
+    }
+    expect(row.originalBrokerCalls).toBe(row.phase === 'retired' ? 0 : 1);
+    expect(row.originalDispatches).toBe(
+      ['failed', 'retired'].includes(row.phase) ? 0 : 1,
+    );
+  }
+  expect(proof.replacementProof.newGeneration).toBeGreaterThan(
+    proof.replacementProof.oldGeneration,
+  );
+  expect(proof.replacementProof.status.status).toBe(409);
+  expect(proof.replacementProof.replay.status).toBe(409);
+  expect(proof.replacementProof.after).toEqual(proof.replacementProof.before);
+});
+
+test('N1 F2 genuine listener service replacement retires old work and preserves successor health', async () => {
   const proof = await musicNative(async () => {
     const f = (globalThis as any).MusicNativeProof,
       http = require('node:http');
@@ -713,215 +1090,131 @@ test('N1 F2 actual native original context rejects pending executing and termina
       originalBrokerCalls++;
       return originalRead.apply(this, args);
     };
-    const records: any[] = [];
-    for (const phase of [
-      'pending',
-      'executing',
-      'accepted',
-      'failed',
-      'uncertain',
-      'retired',
-    ])
-      for (const mode of ['foreign-window', 'same-window-new-service']) {
-        f.source.backend.musicService = service;
-        await evaluate(
-          `window.holdAck=${phase === 'executing' || phase === 'uncertain'};window.acks=[];undefined;`,
-        );
-        const command: any =
-          phase === 'failed'
-            ? {
-                action: 'play_playlist',
-                playlistId: 'PL_N1PlaylistA',
-                shuffle: true,
-              }
-            : { action: 'play_song', videoId: 'seedVideo01' };
-        const route = phase === 'failed' ? '/play/playlist' : '/play/song',
-          { action: _action, ...args } = command;
-        const prepared = await request('/operations/prepare', 'POST', command),
-          id = prepared.body.operationId,
-          body = { ...args, operationId: id },
-          beforeOriginalBroker = originalBrokerCalls,
-          beforeOriginalDispatch = await evaluate('window.dispatches.length');
-        const row = service.operations.lookup(
-          id,
-          grant.record,
-          service.resource,
-        );
-        let executing: Promise<any> | undefined;
-        if (phase === 'executing') {
-          executing = service.navigate(token, { ...command, operationId: id });
-          await wait(async () => await evaluate('window.acks.length===1'));
-        } else if (phase === 'uncertain') {
-          await service
-            .navigate(
-              token,
-              { ...command, operationId: id },
-              undefined,
-              Date.now() + 80,
-            )
-            .catch((error: any) => error.code);
-          await wait(async () => await evaluate('window.acks.length===1'));
-        } else if (phase === 'accepted' || phase === 'failed')
-          await request(route, 'POST', body);
-        else if (phase === 'retired') service.configure(config);
-        const before = {
-            receipt: { ...row.receipt },
-            expires: row.expires,
-            physicalHold: row.physicalHold,
-            executing: row.executing,
-          },
-          beforeNative = await evaluate(
-            '({identity:window.identityReads,fetches:window.fetches,dispatches:window.dispatches.length})',
-          );
-        const other = mode === 'foreign-window' ? make() : window;
-        if (other !== window) await other.loadFile(f.owned + '/main.html');
-        const second = new service.constructor({
-            window: other,
-            config,
-            grants: service.grants,
-          }),
-          secondBroker = f.source.createMusicRequestBroker(other),
-          secondRead = secondBroker.read;
-        let foreignBrokerCalls = 0;
-        secondBroker.read = function (...values: any[]) {
-          foreignBrokerCalls++;
-          return secondRead.apply(this, values);
-        };
-        f.source.backend.musicService = second;
-        const status = await request('/operations/' + id);
-        let returned = false;
-        const replayPromise = request(route, 'POST', body).then((reply) => {
-          returned = true;
-          return reply;
-        });
-        const until = Date.now() + 150;
-        while (!returned && Date.now() < until)
-          await new Promise((resolve) => setTimeout(resolve, 5));
-        const rejectedBeforeOriginalSettlement = returned,
-          afterRequests = {
-            receipt: { ...row.receipt },
-            expires: row.expires,
-            physicalHold: row.physicalHold,
-            executing: row.executing,
-          };
-        if (phase === 'executing') {
-          await evaluate(
-            "window.musicProof.send('peard:music-reply',window.acks.shift());undefined;",
-          );
-          await executing;
-        }
-        const replay = await replayPromise;
-        secondBroker.read = secondRead;
-        f.source.backend.musicService = service;
-        second.stop();
-        if (other !== window) other.destroy();
-        const afterNative = await evaluate(
-          '({identity:window.identityReads,fetches:window.fetches,dispatches:window.dispatches.length})',
-        );
-        let originalStatus: any, originalReplay: any;
-        if (phase !== 'retired') {
-          originalStatus = await request('/operations/' + id);
-          if (phase !== 'pending')
-            originalReplay = await request(route, 'POST', body);
-        }
-        let afterLateAck: any;
-        if (phase === 'uncertain') {
-          await evaluate(
-            "window.musicProof.send('peard:music-reply',window.acks.shift());undefined;",
-          );
-          await wait(() => broker.stats().dispatched === 0);
-          afterLateAck = await request('/operations/' + id);
-        }
-        if (phase === 'pending')
-          originalReplay = await request(route, 'POST', body);
-        records.push({
-          phase,
-          mode,
-          status,
-          replay,
-          rejectedBeforeOriginalSettlement,
-          before,
-          afterRequests,
-          beforeNative,
-          afterNative,
-          foreignBrokerCalls,
-          originalStatus,
-          originalReplay,
-          afterLateAck,
-          originalBrokerCalls: originalBrokerCalls - beforeOriginalBroker,
-          originalDispatches:
-            (await evaluate('window.dispatches.length')) -
-            beforeOriginalDispatch,
-        });
-      }
-    // A committed replacement supplies real generation/document termination. Access
-    // under its new admission must not project the original pending receipt.
-    const replacement = await request('/operations/prepare', 'POST', {
-        action: 'play_song',
-        videoId: 'seedVideo01',
-      }),
-      replacementRow = service.operations.lookup(
-        replacement.body.operationId,
-        grant.record,
-        service.resource,
-      ),
-      oldAdmission = broker.capture();
-    await window.loadFile(f.owned + '/main.html');
-    const newAdmission = broker.capture(),
-      retiredBefore = { ...replacementRow.receipt };
-    const replacementStatus = await request(
-        '/operations/' + replacement.body.operationId,
-      ),
-      replacementReplay = await request('/play/song', 'POST', {
-        videoId: 'seedVideo01',
-        operationId: replacement.body.operationId,
+
+    const command = { action: 'play_song', videoId: 'seedVideo01' },
+      prepared = await service.prepare(token, command),
+      row = service.operations.lookup(prepared.operationId, grant.record, {
+        transport: 'rest',
+        resource: service.resource,
+        owner: service.accessOwner('rest', service.resource),
       });
-    const replacementProof = {
-      oldGeneration: oldAdmission.generation,
-      newGeneration: newAdmission.generation,
-      sameFrame: oldAdmission.frame === newAdmission.frame,
-      status: replacementStatus,
-      replay: replacementReplay,
-      before: retiredBefore,
-      after: replacementRow.receipt,
-    };
-    const server = f.source.backend.server,
-      closed = new Promise<void>((resolve) => server.once('close', resolve));
-    f.source.backend.stop();
-    await closed;
-    for (const [channel, listener] of listeners)
-      f.ipcMain.removeListener(channel, listener);
-    window.destroy();
-    return { records, replacementProof };
+    await evaluate('window.holdAck=true;window.acks=[];undefined;');
+    const executing = service
+      .navigate(token, { ...command, operationId: prepared.operationId })
+      .then(
+        (value: any) => ({ ok: true, value }),
+        (error: any) => ({ ok: false, error }),
+      );
+    await wait(async () => await evaluate('window.acks.length===1'));
+    const previous = f.source.backend.musicHttpOwner,
+      originalOwner = {
+        current: previous.current(),
+        aborted: previous.signal.aborted,
+      };
+    let successor: any;
+    try {
+      successor = new service.constructor({
+        window,
+        config,
+        grants: service.grants,
+        restListenerOwner: () => f.source.backend.musicHttpOwner,
+      });
+      f.source.backend.musicService = successor;
+      f.source.backend.publishMusicHttpOwner();
+      const next = f.source.backend.musicHttpOwner,
+        result = await executing;
+      if (result.ok)
+        throw Error('Replaced listener unexpectedly admitted old work');
+      await wait(
+        () => row.executing === false && row.receipt.status === 'uncertain',
+      );
+      const retired = { ...row.receipt },
+        beforeAck = {
+          physicalHold: row.physicalHold,
+          executing: row.executing,
+          oldCurrent: previous.current(),
+          oldAborted: previous.signal.aborted,
+          newCurrent: next.current(),
+          newIdentity: next.identity !== previous.identity,
+        },
+        oldStatus = await request('/operations/' + prepared.operationId),
+        oldReplay = await request('/play/song', 'POST', {
+          videoId: command.videoId,
+          operationId: prepared.operationId,
+        });
+      await evaluate(
+        "window.musicProof.send('peard:music-reply',window.acks.shift());window.holdAck=false;undefined;",
+      );
+      await wait(
+        () => broker.stats().dispatched === 0 && row.physicalHold === false,
+      );
+      const afterAck = {
+          receipt: { ...row.receipt },
+          physicalHold: row.physicalHold,
+        },
+        fresh = await request('/operations/prepare', 'POST', command),
+        healthy = await request('/play/song', 'POST', {
+          videoId: command.videoId,
+          operationId: fresh.body.operationId,
+        });
+      return {
+        selectionAbsent: !('selectMusicRouteService' in f.source),
+        originalOwner,
+        reason: result.error.code,
+        retired,
+        beforeAck,
+        afterAck,
+        oldStatus,
+        oldReplay,
+        fresh,
+        healthy,
+        brokerCalls: originalBrokerCalls,
+        dispatches: await evaluate('window.dispatches.length'),
+      };
+    } finally {
+      broker.read = originalRead;
+      const server = f.source.backend.server,
+        closed = server?.listening
+          ? new Promise<void>((resolve) => server.once('close', resolve))
+          : undefined;
+      f.source.backend.stop();
+      service.stop();
+      successor?.stop();
+      if (closed) await closed;
+      for (const [channel, listener] of listeners)
+        f.ipcMain.removeListener(channel, listener);
+      window.destroy();
+    }
   });
-  console.log('N1_F2_CONTEXT_NATIVE_PROOF ' + JSON.stringify(proof));
-  expect(proof.records).toHaveLength(12);
-  for (const row of proof.records) {
-    expect(row.status.status).toBe(409);
-    expect(row.status.body.error.code).toBe('retired');
-    expect(row.replay.status).toBe(409);
-    expect(row.replay.body.error.code).toBe('retired');
-    expect(row.rejectedBeforeOriginalSettlement).toBe(true);
-    expect(row.afterRequests).toEqual(row.before);
-    expect(row.afterNative).toEqual(row.beforeNative);
-    expect(row.foreignBrokerCalls).toBe(0);
-    if (row.phase !== 'retired') {
-      expect(row.originalStatus.status).toBe(200);
-      expect(row.originalReplay.status).toBe(200);
-    }
-    if (row.phase === 'uncertain') {
-      expect(row.before.physicalHold).toBe(true);
-      expect(row.afterLateAck.body).toEqual(row.originalStatus.body);
-    }
-    expect(row.originalBrokerCalls).toBe(row.phase === 'retired' ? 0 : 1);
-    expect(row.originalDispatches).toBe(
-      ['failed', 'retired'].includes(row.phase) ? 0 : 1,
-    );
-  }
-  expect(proof.replacementProof.newGeneration).toBeGreaterThan(
-    proof.replacementProof.oldGeneration,
+  console.log(
+    'N1_F2_SERVICE_REPLACEMENT_NATIVE_PROOF ' + JSON.stringify(proof),
   );
-  expect(proof.replacementProof.status.status).toBe(409);
-  expect(proof.replacementProof.replay.status).toBe(409);
-  expect(proof.replacementProof.after).toEqual(proof.replacementProof.before);
+  expect(proof.selectionAbsent).toBe(true);
+  expect(proof.originalOwner).toEqual({ current: true, aborted: false });
+  expect(proof.reason).toBe('retired');
+  expect(proof.beforeAck).toEqual({
+    physicalHold: true,
+    executing: false,
+    oldCurrent: false,
+    oldAborted: true,
+    newCurrent: true,
+    newIdentity: true,
+  });
+  expect(proof.retired).toMatchObject({
+    status: 'uncertain',
+    error: 'outcome_unknown',
+  });
+  expect(proof.afterAck).toEqual({
+    receipt: proof.retired,
+    physicalHold: false,
+  });
+  for (const reply of [proof.oldStatus, proof.oldReplay]) {
+    expect(reply.status).toBe(409);
+    expect(reply.body.error.code).toBe('retired');
+  }
+  expect(proof.fresh.status).toBe(200);
+  expect(proof.healthy.status).toBe(200);
+  expect(proof.healthy.body.status).toBe('accepted');
+  expect(proof.brokerCalls).toBe(2);
+  expect(proof.dispatches).toBe(2);
 });

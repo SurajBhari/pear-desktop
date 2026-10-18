@@ -3,6 +3,7 @@ import { type OpenAPIHono as Hono } from '@hono/zod-openapi';
 
 import type { APIServerConfig } from '../config';
 import type { MusicGrantStore } from './music-grant-store';
+import type { MusicHttpListenerOwner } from './music-http-policy';
 import type { MusicService } from './music-service';
 import type { SongInfo } from '@/providers/song-info';
 import type { BackendContext } from '@/types/contexts';
@@ -16,6 +17,13 @@ export type BackendType = {
   app?: HonoApp;
   server?: ReturnType<typeof serve>;
   oldConfig?: APIServerConfig;
+  musicHttpOwner?: MusicHttpListenerOwner;
+  musicHttpRetirement?: AbortController;
+  musicHttpServer?: ReturnType<typeof serve>;
+  musicHttpSockets?: WeakSet<object>;
+  musicHttpTls?: boolean;
+  publishMusicHttpOwner(): void;
+  retireMusicHttpOwner(owner?: MusicHttpListenerOwner): void;
   songInfo?: SongInfo;
   startRevision?: number;
   unsubscribeSongInfo?: () => void;

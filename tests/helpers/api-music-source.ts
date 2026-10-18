@@ -11,13 +11,21 @@ export async function musicCatalogSource() {
   return musicModuleSource('src/providers/music-catalog.ts');
 }
 
-export async function musicModuleSource(relative: string, electron?: unknown) {
-  const catalog = path.join(root, relative);
-  if (!existsSync(catalog)) return {};
+export async function musicModuleSource(
+  relative: string | readonly string[],
+  electron?: unknown,
+) {
+  const sources = (typeof relative === 'string' ? [relative] : relative).map(
+    (source) => path.join(root, source),
+  );
+  if (!sources.every((source) => existsSync(source))) return {};
   const owned = await mkdtemp(path.join(tmpdir(), 'pear-music-catalog-'));
   try {
     const entry = path.join(owned, 'entry.ts');
-    await writeFile(entry, `export * from ${JSON.stringify(catalog)};`);
+    await writeFile(
+      entry,
+      sources.map((source) => `export * from ${JSON.stringify(source)};`).join('\n'),
+    );
     const aliases: Record<string, string> = { '@': path.join(root, 'src') };
     if (electron) {
       (globalThis as any).__musicElectron = electron;

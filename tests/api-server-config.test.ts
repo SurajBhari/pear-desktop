@@ -12,10 +12,11 @@ import {
   type APIServerConfig,
 } from '../src/plugins/api-server/config';
 
-const fixtureWindow = () => Object.assign(new EventEmitter(), {
-  isDestroyed: () => false,
-  webContents: { send: () => {}, isDestroyed: () => false },
-});
+const fixtureWindow = () =>
+  Object.assign(new EventEmitter(), {
+    isDestroyed: () => false,
+    webContents: { send: () => {}, isDestroyed: () => false },
+  });
 
 const root = path.resolve('.');
 const requireRoot = createRequire(path.join(root, 'package.json'));
@@ -246,11 +247,11 @@ test('new profiles receive distinct API server secrets', async () => {
       Date.now = () => 0;
       const first = (await import(`${moduleUrl}?profile=one`)) as {
         defaultAPIServerConfig: APIServerConfig;
-      store: Conf;
+        store: Conf;
       };
       const second = (await import(`${moduleUrl}?profile=two`)) as {
         defaultAPIServerConfig: APIServerConfig;
-      store: Conf;
+        store: Conf;
       };
 
       expect(first.defaultAPIServerConfig.secret).not.toBe(
@@ -270,22 +271,28 @@ test('shared-link option updates the current window only and releases its config
     const source = await buildActualInitHook(directory);
     const win = fixtureWindow();
     const sent: unknown[][] = [];
-    win.webContents.send = (...args: unknown[]) => { sent.push(args); };
+    win.webContents.send = (...args: unknown[]) => {
+      sent.push(args);
+    };
     await source.initHook(win);
     const store = source.store;
     store.set('options.stripMusicFromSharedLinks', true);
-    await expect.poll(() => sent).toEqual([['peard:strip-music-from-shared-links', true]]);
+    await expect
+      .poll(() => sent)
+      .toEqual([['peard:strip-music-from-shared-links', true]]);
     store.set('options.unrelatedFixtureOption', true);
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(sent).toHaveLength(1);
     store.set('options.stripMusicFromSharedLinks', false);
-    await expect.poll(() => sent).toEqual([
-      ['peard:strip-music-from-shared-links', true],
-      ['peard:strip-music-from-shared-links', false],
-    ]);
+    await expect
+      .poll(() => sent)
+      .toEqual([
+        ['peard:strip-music-from-shared-links', true],
+        ['peard:strip-music-from-shared-links', false],
+      ]);
     win.emit('closed');
     store.set('options.stripMusicFromSharedLinks', true);
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(sent).toHaveLength(2);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -305,6 +312,36 @@ test('window retirement during async plugin discovery never installs a shared-li
     expect(win.listenerCount('closed')).toBe(0);
     // The parent locale lifecycle retires before persisting config or installing watchers.
     expect(source.fixtureEvents).toEqual([]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('remote fields default off without an audience and saved explicit resource survives actual config initialization', async () => {
+  expect(defaultAPIServerConfig.musicApiRemoteEnabled).toBe(false);
+  expect(Object.hasOwn(defaultAPIServerConfig, 'musicApiRemoteResource')).toBe(
+    false,
+  );
+  const directory = await makeTestDirectory('.pear-api-remote-config-');
+  const saved = {
+    hostname: '127.0.0.1',
+    port: 26538,
+    secret: 'public-fixture-existing-secret',
+    authorizedClients: ['legacy-owned-client'],
+    authStrategy: 'NONE',
+    musicApiEnabled: true,
+    musicApiRemoteEnabled: true,
+    musicApiRemoteResource:
+      'http://music-http.fixture.invalid:26538/api/v1/music',
+  };
+  try {
+    const options = { cwd: directory, configName: 'config' };
+    new Conf(options).set('plugins.api-server', saved);
+    const source = await buildActualInitHook(directory);
+    await source.initHook(fixtureWindow());
+    const reopened = new Conf(options);
+    expect(reopened.get('plugins.api-server')).toEqual(saved);
+    expect(source.fixtureEvents).toEqual(['watch', 'watch']);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

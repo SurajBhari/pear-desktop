@@ -10,13 +10,14 @@ import {
 } from './music-catalog-fixtures';
 export async function musicServiceFixture() {
   const m = await musicModuleSource(
-    'src/plugins/api-server/backend/music-service.ts',
+    [
+      'src/plugins/api-server/backend/music-service.ts',
+      'src/plugins/api-server/backend/music-grant-store.ts',
+    ],
     { ipcMain: new EventEmitter() },
   );
   if (!m.createMusicService) throw Error('Missing typed music service');
-  const g = await musicModuleSource(
-      'src/plugins/api-server/backend/music-grant-store.ts',
-    ),
+  const g = m,
     c = await musicModuleSource('src/providers/music-catalog.ts');
   const folder = await mkdtemp(path.join(tmpdir(), 'pear-music-service-'));
   let now = Date.now(),
@@ -54,9 +55,14 @@ export async function musicServiceFixture() {
     return originalAuth(...args);
   };
   const calls: any[] = [];
+  const retirementObservers = new Set<() => void>();
   const broker = {
     capture: () => ({ frame: {}, generation: 0 }),
     isCurrent: () => live,
+    subscribeRetirement: (observer: () => void) => {
+      retirementObservers.add(observer);
+      return () => retirementObservers.delete(observer);
+    },
     resultOwner: () => ({
       epoch: '1'.repeat(32) + ':' + '2'.repeat(32),
       current: () => live && sourceLive,
@@ -79,6 +85,7 @@ export async function musicServiceFixture() {
     now: () => now,
   });
   return {
+    m,
     service,
     store,
     config,
@@ -96,6 +103,10 @@ export async function musicServiceFixture() {
       releaseAuth?.();
     },
     retire: () => (live = false),
+    retireObserved: () => {
+      live = false;
+      for (const observer of retirementObservers) observer();
+    },
     retireSource: () => (sourceLive = false),
     advance: (ms: number) => (now += ms),
     async close() {
