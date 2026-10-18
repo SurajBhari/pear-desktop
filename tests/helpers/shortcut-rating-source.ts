@@ -193,7 +193,7 @@ export async function shortcutRatingSource() {
             if (id === '\0shortcut:mpris')
               return 'export const registerMPRIS=()=>{};';
             if (id === '\0shortcut:volume-renderer')
-              return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},overrideListener=()=>{};';
+              return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},overrideListener=()=>{},stop=()=>{};';
             if (id === '\0shortcut:speed-renderer')
               return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},onUnload=()=>{};';
           },
