@@ -40,8 +40,12 @@ const snapshot = {
 async function fixture(
   rest = false,
   guard?: (kind: 'owner' | 'session' | 'resolver') => void,
+  progress?: (phase: string) => void,
 ) {
+  progress?.('broker-bundle:begin');
   const f = await musicRequestFixture();
+  progress?.('broker-bundle:end');
+  progress?.('service-bundle:begin');
   const m = await musicModuleSource(
     [
       'src/plugins/api-server/backend/music-service.ts',
@@ -49,8 +53,11 @@ async function fixture(
     ],
     { ipcMain: f.ipcMain },
   );
+  progress?.('service-bundle:end');
   const g = m;
+  progress?.('grant-directory:begin');
   const folder = await mkdtemp(path.join(tmpdir(), 'pear-access-'));
+  progress?.('grant-directory:end');
   let now = Date.now(),
     ownerLive = true;
   const owner = {
@@ -68,6 +75,7 @@ async function fixture(
     useHttps: false,
   };
   const store = new g.MusicGrantStore(path.join(folder, 'owned'), () => now);
+  progress?.('grant-issue:begin');
   const grant = await store.issue(
     'Owned MCP',
     'mcp',
@@ -75,6 +83,7 @@ async function fixture(
     ['catalog.read', 'playback.read', 'library.read'],
     () => true,
   );
+  progress?.('grant-issue:end');
   let registered: any = owner;
   const releaseFixture = f.broker.retain();
   const runtime = {
@@ -111,11 +120,13 @@ async function fixture(
     const before = f.sent.filter(
       (p) => p[0] === 'peard:music-owner-query',
     ).length;
+    progress?.('finish-query:begin');
     await expect
       .poll(
         () => f.sent.filter((p) => p[0] === 'peard:music-owner-query').length,
       )
       .toBeGreaterThan(before);
+    progress?.('finish-query:end');
     f.ready();
     f.settled(undefined, { ok: true, value });
     return pending;
@@ -410,18 +421,34 @@ test('every shared reference lookup rejects foreign sessions before native work 
   }
 });
 
-test('authorization waits fence stop configuration ABA frame expiry revoke and owner or session retirement before dispatch', async () => {
-  for (const step of [1, 2]) {
-    for (const retirement of [
-      'stop',
-      'config',
-      'frame',
-      'expiry',
-      'revoke',
-      'owner',
-      'session',
-    ]) {
-      const f = await fixture();
+for (const step of [1, 2])
+  for (const retirement of [
+    'stop',
+    'config',
+    'frame',
+    'expiry',
+    'revoke',
+    'owner',
+    'session',
+  ])
+    test(`authorization waits fence stop configuration ABA frame expiry revoke and owner or session retirement before dispatch [step ${step}, ${retirement}]`, async () => {
+      const startedAt = performance.now();
+      const progress = (phase: string) =>
+        console.log(
+          'MUSIC_MATRIX_PHASE ' +
+            JSON.stringify({
+              mode: 'authorization-wait',
+              step,
+              retirement,
+              phase,
+              elapsedMs: performance.now() - startedAt,
+            }),
+        );
+      progress('fixture:begin');
+      const f = await fixture(false, undefined, progress);
+      progress('fixture:end');
+      let bodyFailed = false,
+        primary: unknown;
       try {
         let release!: () => void,
           count = 0,
@@ -449,7 +476,10 @@ test('authorization waits fence stop configuration ABA frame expiry revoke and o
             },
           )
           .catch((e: any) => e.code);
+        progress('authorization-wait:begin');
         await expect.poll(() => waiting).toBe(true);
+        progress('authorization-wait:end');
+        progress('retirement:begin');
         if (retirement === 'stop') f.service.stop();
         if (retirement === 'config') {
           f.service.configure({ ...f.config, port: 26540 });
@@ -466,17 +496,25 @@ test('authorization waits fence stop configuration ABA frame expiry revoke and o
           f.contents.emit('did-navigate', {}, 'https://music.youtube.com/');
         }
         if (retirement === 'expiry') f.advance(24 * 60 * 60 * 1000 + 1);
-        if (retirement === 'revoke')
+        if (retirement === 'revoke') {
+          progress('grant-revoke:begin');
           await f.store.revoke(f.grant.record.id, () => true);
+          progress('grant-revoke:end');
+        }
         if (retirement === 'owner') f.ownerOff();
         if (retirement === 'session') sessionLive = false;
+        progress('retirement:end');
         release();
+        progress('retirement-fence:begin');
         expect(await pending).toBe('retired');
         expect(
           f.sent.filter((p) => p[0] === 'peard:music-owner-query'),
         ).toHaveLength(0);
+        progress('retirement-fence:end');
+        progress('recovery:begin');
         f.ownerOn();
         const healthy = retirement === 'stop' ? f.restart() : f.service;
+        progress('recovery-grant:begin');
         const grant = ['expiry', 'revoke'].includes(retirement)
           ? await f.store.issue(
               'Recovery',
@@ -486,18 +524,38 @@ test('authorization waits fence stop configuration ABA frame expiry revoke and o
               () => true,
             )
           : f.grant;
+        progress('recovery-grant:end');
+        progress('recovery-current:begin');
         expect(
           await f.finish(
             healthy.currentFor(f.invocation({ token: grant.token })),
             snapshot,
           ),
         ).toEqual(snapshot);
+        progress('recovery-current:end');
+        progress('recovery:end');
+      } catch (error) {
+        bodyFailed = true;
+        primary = error;
+        progress('body:error');
+        throw error;
       } finally {
-        await f.close();
+        progress('cleanup:begin');
+        try {
+          await f.close();
+          progress('cleanup:end');
+        } catch (cleanup) {
+          progress('cleanup:error');
+          if (bodyFailed)
+            throw new AggregateError(
+              [primary, cleanup],
+              'Authorization wait body and cleanup failed',
+              { cause: primary },
+            );
+          throw cleanup;
+        }
       }
-    }
-  }
-});
+    });
 
 test('guard reentry and configuration ABA cannot authenticate old authority; healthy current owner recovers', async () => {
   const f = await fixture();

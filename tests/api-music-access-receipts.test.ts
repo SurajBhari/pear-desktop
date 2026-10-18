@@ -40,8 +40,12 @@ const snapshot = {
 async function fixture(
   rest = false,
   guard?: (kind: 'owner' | 'session' | 'resolver') => void,
+  progress?: (phase: string) => void,
 ) {
+  progress?.('broker-bundle:begin');
   const f = await musicRequestFixture();
+  progress?.('broker-bundle:end');
+  progress?.('service-bundle:begin');
   const m = await musicModuleSource(
     [
       'src/plugins/api-server/backend/music-service.ts',
@@ -49,8 +53,11 @@ async function fixture(
     ],
     { ipcMain: f.ipcMain },
   );
+  progress?.('service-bundle:end');
   const g = m;
+  progress?.('grant-directory:begin');
   const folder = await mkdtemp(path.join(tmpdir(), 'pear-access-'));
+  progress?.('grant-directory:end');
   let now = Date.now(),
     ownerLive = true;
   const owner = {
@@ -68,6 +75,7 @@ async function fixture(
     useHttps: false,
   };
   const store = new g.MusicGrantStore(path.join(folder, 'owned'), () => now);
+  progress?.('grant-issue:begin');
   const grant = await store.issue(
     'Owned MCP',
     'mcp',
@@ -81,6 +89,7 @@ async function fixture(
     ],
     () => true,
   );
+  progress?.('grant-issue:end');
   let registered: any = owner;
   const releaseFixture = f.broker.retain();
   const runtime = {
@@ -117,11 +126,13 @@ async function fixture(
     const before = f.sent.filter(
       (p) => p[0] === 'peard:music-owner-query',
     ).length;
+    progress?.('finish-query:begin');
     await expect
       .poll(
         () => f.sent.filter((p) => p[0] === 'peard:music-owner-query').length,
       )
       .toBeGreaterThan(before);
+    progress?.('finish-query:end');
     f.ready();
     f.settled(undefined, { ok: true, value });
     return pending;
@@ -1296,75 +1307,142 @@ for (const limited of [false, true])
     }
   });
 
-for (const kind of ['owner', 'session', 'resolver', 'grant'] as const)
-  test(`every prepare ${kind} guard reentry fences receipt publication and preserves useful recovery`, async () => {
-    async function run(at?: number) {
-      let armed = false,
-        calls = 0,
-        triggered = false;
-      let f: any;
-      const trigger = () => {
-        if (armed && ++calls === at) {
-          triggered = true;
-          f.service.retireSession(f.session);
-        }
-      };
-      f = await fixture(false, (call) => {
-        if (call === kind) trigger();
-      });
-      const original = f.store.isCurrent.bind(f.store);
-      if (kind === 'grant')
-        f.store.isCurrent = (...args: any[]) => {
-          const value = original(...args);
-          trigger();
-          return value;
+for (const kind of ['owner', 'session', 'resolver', 'grant'] as const) {
+  const shards = kind === 'owner' || kind === 'resolver' ? 8 : 1;
+  for (let shard = 0; shard < shards; shard++)
+    test(
+      `every prepare ${kind} guard reentry fences receipt publication and preserves useful recovery${
+        shards > 1 ? ` [shard ${shard + 1}/${shards}]` : ''
+      }`,
+      async () => {
+        const startedAt = performance.now();
+        let guardCount: number | undefined;
+        const report = (phase: string, detail: object = {}) => {
+          if (shards === 1) return;
+          console.log(
+            'MUSIC_MATRIX_PHASE ' +
+              JSON.stringify({
+                mode: 'prepare-guard',
+                guard: kind,
+                shard: shard + 1,
+                shards,
+                G: guardCount ?? null,
+                phase,
+                elapsedMs: performance.now() - startedAt,
+                ...detail,
+              }),
+          );
         };
-      try {
-        armed = true;
-        const result = await outcome(
-          f.service.prepareFor(f.invocation(), { action: 'pause' }),
-        );
-        armed = false;
-        const count = calls;
-        if (at === undefined) {
-          expect(result.code).toBe('success');
-          expect('value' in result ? result.value.status : undefined).toBe(
-            'pending',
+        async function run(at?: number) {
+          let armed = false,
+            calls = 0,
+            triggered = false;
+          let f: any;
+          const trigger = () => {
+            if (armed && ++calls === at) {
+              triggered = true;
+              f.service.retireSession(f.session);
+            }
+          };
+          const progress = (phase: string) => report(phase, { at: at ?? null });
+          progress('fixture:begin');
+          f = await fixture(
+            false,
+            (call) => {
+              if (call === kind) trigger();
+            },
+            progress,
           );
-        } else {
-          expect(triggered).toBe(true);
-          expect(result.code).toBe('retired');
-          for (const row of f.service.operations.rows.values()) {
-            expect(row.binding.access.session).toBe(f.session);
-            expect(row.receipt.status).toBe('retired');
-            expect(row.physicalHold).toBe(false);
+          progress('fixture:end');
+          const original = f.store.isCurrent.bind(f.store);
+          if (kind === 'grant')
+            f.store.isCurrent = (...args: any[]) => {
+              const value = original(...args);
+              trigger();
+              return value;
+            };
+          let bodyFailed = false,
+            primary: unknown;
+          try {
+            armed = true;
+            progress('prepare:begin');
+            const result = await outcome(
+              f.service.prepareFor(f.invocation(), { action: 'pause' }),
+            );
+            progress('prepare:end');
+            armed = false;
+            const count = calls;
+            if (at === undefined) {
+              expect(result.code).toBe('success');
+              expect('value' in result ? result.value.status : undefined).toBe(
+                'pending',
+              );
+            } else {
+              expect(triggered).toBe(true);
+              expect(result.code).toBe('retired');
+              for (const row of f.service.operations.rows.values()) {
+                expect(row.binding.access.session).toBe(f.session);
+                expect(row.receipt.status).toBe('retired');
+                expect(row.physicalHold).toBe(false);
+              }
+              expect(f.service.sessionLeases.size).toBe(0);
+              expect(queries(f)).toHaveLength(0);
+              const invocation = f.invocation({ session: { ...f.session } });
+              progress('recovery-prepare:begin');
+              const prepared = await f.service.prepareFor(invocation, {
+                action: 'pause',
+              });
+              progress('recovery-prepare:end');
+              progress('recovery-control:begin');
+              const receipt = await f.finish(
+                f.service.controlFor(invocation, {
+                  action: 'pause',
+                  operationId: prepared.operationId,
+                }),
+                { version: 1, phase: 'owned_control_dispatch' },
+              );
+              progress('recovery-control:end');
+              expect(receipt.status).toBe('accepted');
+              expect(f.broker.stats()).toEqual({ dispatched: 0, queued: 0 });
+            }
+            return count;
+          } catch (error) {
+            bodyFailed = true;
+            primary = error;
+            progress('body:error');
+            throw error;
+          } finally {
+            if (shards === 1) await f.close();
+            else {
+              progress('cleanup:begin');
+              try {
+                await f.close();
+                progress('cleanup:end');
+              } catch (cleanup) {
+                progress('cleanup:error');
+                if (bodyFailed)
+                  throw new AggregateError(
+                    [primary, cleanup],
+                    'Prepare guard body and cleanup failed',
+                    { cause: primary },
+                  );
+                throw cleanup;
+              }
+            }
           }
-          expect(f.service.sessionLeases.size).toBe(0);
-          expect(queries(f)).toHaveLength(0);
-          const invocation = f.invocation({ session: { ...f.session } });
-          const prepared = await f.service.prepareFor(invocation, {
-            action: 'pause',
-          });
-          const receipt = await f.finish(
-            f.service.controlFor(invocation, {
-              action: 'pause',
-              operationId: prepared.operationId,
-            }),
-            { version: 1, phase: 'owned_control_dispatch' },
-          );
-          expect(receipt.status).toBe('accepted');
-          expect(f.broker.stats()).toEqual({ dispatched: 0, queued: 0 });
         }
-        return count;
-      } finally {
-        await f.close();
-      }
-    }
-    const count = await run();
-    console.log('receipt prepare retirement points', kind, count);
-    expect(count).toBeGreaterThan(0);
-    for (let at = 1; at <= count; at++) await run(at);
-  });
+        const count = await run();
+        guardCount = count;
+        console.log('receipt prepare retirement points', kind, count);
+        expect(count).toBeGreaterThan(0);
+        const indices: number[] = [];
+        for (let at = shard + 1; at <= count; at += shards) indices.push(at);
+        report('partition', { indices });
+        for (const at of indices) await run(at);
+        report('complete', { indices });
+      },
+    );
+}
 
 test('MCP receipt ACK and owned WEB completion retain independent physical holds on one stable grant and broker', async () => {
   const f = await fixture();

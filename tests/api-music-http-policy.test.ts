@@ -1,5 +1,4 @@
 import { test, expect } from '@playwright/test';
-import { EventEmitter } from 'node:events';
 import { musicModuleSource } from './helpers/api-music-source';
 import { musicServiceFixture } from './helpers/api-music-service';
 
@@ -192,10 +191,7 @@ test('namespace classification consumes absolute and encoded aliases without cla
 
 test('selected remote REST works without local resource and production seam never falls back when undefined', async () => {
   const f = await musicServiceFixture();
-  const m = await musicModuleSource(
-    'src/plugins/api-server/backend/music-service.ts',
-    { ipcMain: new EventEmitter() },
-  );
+  const m = f.m;
   const window = {};
   const controller = new AbortController();
   let listener: any = {
@@ -282,10 +278,7 @@ test('remote configuration defaults false and leaves resource unconfigured', asy
 
 test('present undefined REST listener seam cannot disable a registered MCP owner on the same owned service', async () => {
   const f = await musicServiceFixture();
-  const m = await musicModuleSource(
-    'src/plugins/api-server/backend/music-service.ts',
-    { ipcMain: new EventEmitter() },
-  );
+  const m = f.m;
   const resource = 'http://127.0.0.1:26539/mcp',
     window = {};
   const owner = { identity: {}, current: () => true };

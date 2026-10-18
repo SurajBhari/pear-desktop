@@ -192,7 +192,17 @@ async function fixture(rest = false) {
     f.settled(packet, error ? { ok: false, error } : { ok: true, value });
     return packet;
   }
+  const owned = new Set<Promise<unknown>>();
+  function own<T>(pending: Promise<T>): Promise<T> {
+    owned.add(pending);
+    const release = () => {
+      owned.delete(pending);
+    };
+    void pending.then(release, release);
+    return pending;
+  }
   async function finish(pending: Promise<any>, value: any) {
+    own(pending);
     await step(value);
     return pending;
   }
@@ -207,6 +217,7 @@ async function fixture(rest = false) {
     session,
     invocation,
     step,
+    own,
     finish,
     webCalls,
     webResponses,
@@ -225,6 +236,7 @@ async function fixture(rest = false) {
       for (const s of services) s.stop();
       release();
       f.broker.dispose();
+      await Promise.allSettled([...owned]);
       await rm(folder, { recursive: true, force: true });
     },
   };
@@ -1254,126 +1266,242 @@ test('current WEB comments retain epoch probes around source-bound continuation 
   }
 });
 
+const issuerScopeShards = 8;
 for (const mode of ['remainder', 'continuation']) {
-  test(`issuer-scope ${mode} composition cannot republish after any grant guard retires its session`, async () => {
-    async function run(at?: number) {
-      const f = await fixture();
-      try {
-        const source = {
-          ...catalog('song', 'issuer-private-next'),
-          items: [
-            { ...song(0), kind: 'category', id: 'genres' },
-            ...catalog().items.slice(1),
-          ],
-          targetRecipes: [
-            {
-              itemIndex: 0,
-              browseId: 'FEmusic_moods_and_genres_category',
-              params: 'issuer-private-recipe',
-            },
-          ],
-        };
-        // The reference originates under personalized.read; browsing and its cursor
-        // require catalog.read plus the retained issuer scope on the same grant.
-        const home = await f.finish(
-          f.service.homeFor(f.invocation(), { limit: 100 }),
-          source,
-        );
-        const browse = await f.finish(
-          f.service.browseFor(f.invocation(), {
-            target: { kind: 'reference', id: home.items[0].reference },
-            limit: 100,
+  for (let shard = 0; shard < issuerScopeShards; shard++) {
+    test(`issuer-scope ${mode} composition cannot republish after any grant guard retires its session shard ${shard + 1}/${issuerScopeShards}`, async () => {
+      const started = Date.now();
+      async function run(at?: number) {
+        const iterationStarted = Date.now();
+        console.info(
+          'ISSUER_SCOPE_ITERATION_START',
+          JSON.stringify({
+            mode,
+            shard,
+            shards: issuerScopeShards,
+            at: at ?? null,
+            phase: 'fixture',
+            elapsedMs: Date.now() - iterationStarted,
           }),
-          source,
         );
-        expect(reads(f)[1][1].input).toEqual({
-          operation: 'browse',
-          browseId: 'FEmusic_moods_and_genres_category',
-          params: 'issuer-private-recipe',
-        });
-        let cursor = browse.nextCursor;
-        if (mode === 'continuation') {
-          const remainder = await f.service.browseFor(f.invocation(), {
-            cursor,
-            limit: 100,
-          });
-          expect(remainder.items).toHaveLength(51);
-          expect(
-            await f.service.browseFor(f.invocation(), { cursor, limit: 100 }),
-          ).toEqual(remainder);
-          cursor = remainder.nextCursor;
-        }
-        const original = f.store.isCurrent.bind(f.store);
-        let calls = 0,
-          armed = mode === 'remainder',
-          triggered = false;
-        f.store.isCurrent = (...args: any[]) => {
-          const result = original(...args);
-          if (armed && ++calls === at) {
-            triggered = true;
-            f.service.retireSession(f.session);
-          }
-          return result;
+        const f = await fixture();
+        let phase = 'fixture',
+          calls = 0,
+          triggered = false,
+          primaryFailed = false;
+        let primary: unknown;
+        const enter = (next: string) => {
+          phase = next;
+          console.info(
+            'ISSUER_SCOPE_PHASE',
+            JSON.stringify({
+              mode,
+              shard,
+              shards: issuerScopeShards,
+              at: at ?? null,
+              phase,
+              elapsedMs: Date.now() - iterationStarted,
+            }),
+          );
         };
-        const pending = f.service
-          .browseFor(f.invocation(), { cursor, limit: 100 })
-          .then(
-            (page: any) => ({ code: 'success', page }),
-            (e: any) => ({ code: e.code }),
+        try {
+          enter('home');
+          const source = {
+            ...catalog('song', 'issuer-private-next'),
+            items: [
+              { ...song(0), kind: 'category', id: 'genres' },
+              ...catalog().items.slice(1),
+            ],
+            targetRecipes: [
+              {
+                itemIndex: 0,
+                browseId: 'FEmusic_moods_and_genres_category',
+                params: 'issuer-private-recipe',
+              },
+            ],
+          };
+          // The reference originates under personalized.read; browsing and its cursor
+          // require catalog.read plus the retained issuer scope on the same grant.
+          const home = await f.finish(
+            f.service.homeFor(f.invocation(), { limit: 100 }),
+            source,
           );
-        if (mode === 'continuation') {
-          await expect
-            .poll(
-              () =>
-                f.sent.filter((p) => p[0] === 'peard:music-owner-query').length,
-            )
-            .toBe(3);
-          f.ready(f.challenge(2));
-          armed = true;
-          await f.step(source);
-        }
-        const result = await pending;
-        const guardCount = calls;
-        if (at !== undefined) {
-          expect(triggered).toBe(true);
-          expect(result.code).toBe('retired');
-          expect(f.service.stats()).toEqual({
-            cursors: 0,
-            references: 0,
-            cacheBytes: 0,
-          });
-          expect(f.service.sessionLeases.size).toBe(0);
-          expect(
-            await f.finish(
-              f.service.currentFor(f.invocation({ session: { ...f.session } })),
-              snapshot,
-            ),
-          ).toEqual(snapshot);
-          expect(f.service.stats()).toEqual({
-            cursors: 0,
-            references: 0,
-            cacheBytes: 0,
-          });
-          expect(f.broker.stats()).toEqual({ dispatched: 0, queued: 0 });
-        } else {
-          expect(result.code).toBe('success');
-          expect(result.page.items).toHaveLength(
-            mode === 'remainder' ? 51 : 100,
+          enter('browse-reference');
+          const browse = await f.finish(
+            f.service.browseFor(f.invocation(), {
+              target: { kind: 'reference', id: home.items[0].reference },
+              limit: 100,
+            }),
+            source,
           );
-          const replay = await f.service.browseFor(f.invocation(), {
-            cursor,
-            limit: 100,
+          expect(reads(f)[1][1].input).toEqual({
+            operation: 'browse',
+            browseId: 'FEmusic_moods_and_genres_category',
+            params: 'issuer-private-recipe',
           });
-          expect(replay).toEqual(result.page);
-          expect(reads(f)).toHaveLength(mode === 'remainder' ? 2 : 3);
+          let cursor = browse.nextCursor;
+          if (mode === 'continuation') {
+            enter('cached-remainder');
+            const remainder = await f.service.browseFor(f.invocation(), {
+              cursor,
+              limit: 100,
+            });
+            expect(remainder.items).toHaveLength(51);
+            expect(
+              await f.service.browseFor(f.invocation(), { cursor, limit: 100 }),
+            ).toEqual(remainder);
+            cursor = remainder.nextCursor;
+          }
+          const original = f.store.isCurrent.bind(f.store);
+          let armed = mode === 'remainder';
+          f.store.isCurrent = (...args: any[]) => {
+            const result = original(...args);
+            if (armed && ++calls === at) {
+              triggered = true;
+              f.service.retireSession(f.session);
+            }
+            return result;
+          };
+          enter('issuer-read');
+          const pending = f.own(
+            f.service
+              .browseFor(f.invocation(), { cursor, limit: 100 })
+              .then(
+                (page: any) => ({ code: 'success', page }),
+                (e: any) => ({ code: e.code }),
+              ),
+          );
+          if (mode === 'continuation') {
+            enter('continuation-query');
+            await expect
+              .poll(
+                () =>
+                  f.sent.filter((p) => p[0] === 'peard:music-owner-query').length,
+              )
+              .toBe(3);
+            f.ready(f.challenge(2));
+            armed = true;
+            enter('continuation-settlement');
+            await f.step(source);
+          }
+          enter('issuer-result');
+          const result = await pending;
+          const guardCount = calls;
+          if (at !== undefined) {
+            expect(triggered).toBe(true);
+            expect(result.code).toBe('retired');
+            expect(f.service.stats()).toEqual({
+              cursors: 0,
+              references: 0,
+              cacheBytes: 0,
+            });
+            expect(f.service.sessionLeases.size).toBe(0);
+            enter('recovery-current');
+            expect(
+              await f.finish(
+                f.service.currentFor(f.invocation({ session: { ...f.session } })),
+                snapshot,
+              ),
+            ).toEqual(snapshot);
+            enter('recovery-assertions');
+            expect(f.service.stats()).toEqual({
+              cursors: 0,
+              references: 0,
+              cacheBytes: 0,
+            });
+            expect(f.broker.stats()).toEqual({ dispatched: 0, queued: 0 });
+          } else {
+            enter('baseline-result');
+            expect(result.code).toBe('success');
+            expect(result.page.items).toHaveLength(
+              mode === 'remainder' ? 51 : 100,
+            );
+            enter('baseline-replay');
+            const replay = await f.service.browseFor(f.invocation(), {
+              cursor,
+              limit: 100,
+            });
+            expect(replay).toEqual(result.page);
+            expect(reads(f)).toHaveLength(mode === 'remainder' ? 2 : 3);
+          }
+          return guardCount;
+        } catch (error) {
+          primaryFailed = true;
+          primary = error;
+          console.error(
+            'ISSUER_SCOPE_FAILURE',
+            JSON.stringify({
+              mode,
+              shard,
+              shards: issuerScopeShards,
+              at: at ?? null,
+              phase,
+              calls,
+              triggered,
+              elapsedMs: Date.now() - iterationStarted,
+            }),
+          );
+          throw error;
+        } finally {
+          let cleanupFailed = false;
+          enter('cleanup');
+          try {
+            await f.close();
+          } catch (error) {
+            cleanupFailed = true;
+            console.error(
+              'ISSUER_SCOPE_CLEANUP_FAILURE',
+              JSON.stringify({
+                mode,
+                shard,
+                shards: issuerScopeShards,
+                at: at ?? null,
+                phase,
+                primaryFailed,
+              }),
+            );
+            if (primaryFailed)
+              throw new AggregateError(
+                [primary, error],
+                'Issuer-scope primary and cleanup failures',
+              );
+            throw error;
+          } finally {
+            console.info(
+              'ISSUER_SCOPE_ITERATION',
+              JSON.stringify({
+                mode,
+                shard,
+                shards: issuerScopeShards,
+                at: at ?? null,
+                phase,
+                elapsedMs: Date.now() - iterationStarted,
+                primaryFailed,
+                cleanupFailed,
+              }),
+            );
+          }
         }
-        return guardCount;
-      } finally {
-        await f.close();
       }
-    }
-    const count = await run();
-    expect(count).toBeGreaterThan(1);
-    for (let at = 1; at <= count; at++) await run(at);
-  });
+      const count = await run();
+      expect(count).toBeGreaterThan(1);
+      const indices: number[] = [];
+      for (let at = shard + 1; at <= count; at += issuerScopeShards) {
+        indices.push(at);
+        await run(at);
+      }
+      console.info(
+        'ISSUER_SCOPE_SHARD',
+        JSON.stringify({
+          mode,
+          shard,
+          shards: issuerScopeShards,
+          guardCount: count,
+          indices,
+          phase: 'complete',
+          elapsedMs: Date.now() - started,
+        }),
+      );
+    });
+  }
 }

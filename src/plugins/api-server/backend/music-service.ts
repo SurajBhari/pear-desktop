@@ -23,6 +23,10 @@ import {
   type PublicCommentsWeb,
 } from './music-comments-web';
 import {
+  musicGrantLifetimeSignal,
+  type MusicGrantStore,
+} from './music-grant-store';
+import {
   localMusicHttpResource,
   musicHttpResources,
   musicHttpListenerSupports,
@@ -80,10 +84,6 @@ import {
 } from '../music-types';
 
 import type { APIServerConfig } from '../config';
-import {
-  musicGrantLifetimeSignal,
-  type MusicGrantStore,
-} from './music-grant-store';
 import type { MusicGrantRecord } from './music-grants';
 import type { BrowserWindow } from 'electron';
 

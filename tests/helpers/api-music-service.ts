@@ -85,6 +85,7 @@ export async function musicServiceFixture() {
     now: () => now,
   });
   return {
+    m,
     service,
     store,
     config,

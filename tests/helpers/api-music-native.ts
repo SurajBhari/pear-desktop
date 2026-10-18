@@ -7,9 +7,59 @@ import { spawn } from 'node:child_process';
 import { build, normalizePath } from 'vite';
 const root = path.resolve(import.meta.dirname, '../..'),
   requireRoot = createRequire(path.join(root, 'package.json'));
+function nativeRouteSelection() {
+  const main = normalizePath(
+      path.join(root, 'src/plugins/api-server/backend/main.ts'),
+    ),
+    router = normalizePath(
+      path.join(root, 'src/plugins/api-server/backend/routes/music.ts'),
+    ),
+    virtualId = '\0owned:music-route-selection';
+  const source = [
+    'import {registerMusicRoutes as registerActual} from ' +
+      JSON.stringify(router) +
+      ';',
+    'const registrations=new WeakMap(),selections=new WeakMap();',
+    'export function registerMusicRoutes(app,getService,getTransportOwner){',
+    'if(registrations.has(app))throw Error("Duplicate fixture music app");',
+    'registrations.set(app,getService);',
+    'return registerActual(app,()=>{const base=getService(),selection=selections.get(app);',
+    'if(selection&&(!base||selection.base!==base))selection.retired=true;',
+    'if(!base||selection?.retired)return undefined;',
+    'return selection?selection.service:base;},getTransportOwner);}',
+    'export function selectMusicRouteService(app,service){',
+    'const getService=registrations.get(app),base=getService?.();',
+    'if(!base||!service)throw Error("Unowned fixture music selection");',
+    'selections.set(app,{base,service,retired:false});}',
+    'export function clearMusicRouteService(app){',
+    'if(!registrations.has(app))throw Error("Unowned fixture music app");',
+    'selections.delete(app);}',
+  ].join('\n');
+  return {
+    virtualId,
+    router,
+    plugin: {
+      name: 'owned-native-music-route-selection',
+      enforce: 'pre' as const,
+      resolveId(id: string, importer?: string) {
+        if (id === virtualId || (id === './routes/music' && importer === main))
+          return virtualId;
+      },
+      load(id: string) {
+        if (id === virtualId) return source;
+      },
+    },
+  };
+}
 /** Actual broker/controller and Electron IPC; only native getters and service responses are synthetic. */
-export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
+export async function musicNative<T>(
+  task: () => Promise<T>,
+  options: { routeSelection?: boolean } = {},
+): Promise<T> {
   const owned = await mkdtemp(path.join(tmpdir(), 'pear-music-native-'));
+  const routeSelection = options.routeSelection
+    ? nativeRouteSelection()
+    : undefined;
   let child: ReturnType<typeof spawn> | undefined;
   try {
     const mainEntry = path.join(owned, 'main-source.ts'),
@@ -21,6 +71,13 @@ export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
         `export {backend} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/api-server/backend/main.ts')))};`,
         `export {createMusicGrantMenu} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/api-server/music-menu.ts')))};`,
         `export {getMusicService} from ${JSON.stringify(normalizePath(path.join(root, 'src/plugins/api-server/backend/music-service.ts')))};`,
+        ...(routeSelection
+          ? [
+              'export {selectMusicRouteService,clearMusicRouteService} from ' +
+                JSON.stringify(routeSelection.virtualId) +
+                ';',
+            ]
+          : []),
       ].join('\n'),
     );
     await writeFile(
@@ -62,12 +119,15 @@ export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
       ...common,
       plugins: [
         ...common.plugins,
+        ...(routeSelection ? [routeSelection.plugin] : []),
         {
           name: 'assert-native-broker-singleton',
           generateBundle() {
             for (const relative of [
               'src/providers/music-request.ts',
               'src/plugins/api-server/backend/music-service.ts',
+              'src/plugins/api-server/backend/music-grant-store.ts',
+              'src/plugins/api-server/backend/routes/music.ts',
             ]) {
               const expected = normalizePath(path.join(root, relative));
               const ids = [...this.getModuleIds()].filter(
@@ -77,6 +137,13 @@ export async function musicNative<T>(task: () => Promise<T>): Promise<T> {
                 this.error(
                   `Owned native singleton identity: ${relative}: ${JSON.stringify(ids)}`,
                 );
+            }
+            if (routeSelection) {
+              const ids = [...this.getModuleIds()].filter(
+                (id) => id === routeSelection.virtualId,
+              );
+              if (ids.length !== 1)
+                this.error('Owned native route selector is not a singleton');
             }
           },
         },
