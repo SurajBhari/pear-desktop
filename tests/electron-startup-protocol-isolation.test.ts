@@ -16,6 +16,93 @@ const observer = path.resolve(
   'helpers/electron-startup-observer.cjs',
 );
 
+// BEGIN OWNED PROTOCOL CLEANUP
+async function closeOwnedProtocolFixture(
+  application: import('@playwright/test').ElectronApplication,
+  io = {
+    now: () => performance.now(),
+    setTimeout,
+    clearTimeout,
+    terminate: terminateStartupProcess,
+  },
+) {
+  const child = application.process();
+  const deadline = io.now() + 5000;
+  const timeoutError = new Error('Owned Electron cleanup timed out');
+  let onExit: (() => void) | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let failed = false;
+  let failure: unknown;
+  try {
+    const exited = new Promise<void>((resolve) => {
+      onExit = () => resolve();
+      child.once('exit', onExit);
+    });
+    if (child.exitCode !== null || child.signalCode !== null)
+      throw new Error(
+        'Owned launcher exited before protocol cleanup observation',
+      );
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = io.setTimeout(
+        () => reject(timeoutError),
+        Math.max(0, deadline - io.now()),
+      );
+    });
+    timeout.catch(() => {});
+    const closing = Promise.resolve().then(() => application.close());
+    closing.catch(() => {});
+    await Promise.race([Promise.all([closing, exited]), timeout]);
+    if (io.now() >= deadline) throw timeoutError;
+  } catch (error) {
+    failed = true;
+    failure = error;
+  } finally {
+    if (onExit) child.off('exit', onExit);
+    if (timer !== undefined) io.clearTimeout(timer);
+  }
+  if (failed) {
+    const failures = [failure];
+    if (child.exitCode === null && child.signalCode === null)
+      try {
+        await io.terminate(child);
+      } catch (error) {
+        failures.push(error);
+      }
+    if (failures.length > 1)
+      throw new AggregateError(
+        failures,
+        'Owned protocol close and strict fallback failed',
+        { cause: failure },
+      );
+    throw failure;
+  }
+}
+
+async function finishOwnedProtocolFixture(
+  application: import('@playwright/test').ElectronApplication | undefined,
+  directory: string,
+  bodyFailures: unknown[],
+  io = { close: closeOwnedProtocolFixture, remove: rm },
+) {
+  const failures = [...bodyFailures];
+  try {
+    if (application) await io.close(application);
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    await io.remove(directory, { recursive: true, force: true, maxRetries: 5 });
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1)
+    throw new AggregateError(failures, 'Owned protocol fixture failed', {
+      cause: failures[0],
+    });
+}
+// END OWNED PROTOCOL CLEANUP
+
 test('startup observer sinks native protocol registration before entry and after ready without delegation', async () => {
   test.setTimeout(25_000);
   const directory = await mkdtemp(
@@ -26,6 +113,7 @@ test('startup observer sinks native protocol registration before entry and after
   const bootstrap = path.join(directory, 'bootstrap.cjs');
   const entry = path.join(directory, 'main.cjs');
   let application: import('@playwright/test').ElectronApplication | undefined;
+  const failures: unknown[] = [];
   try {
     await mkdir(profile);
     // These recording delegates replace the actual native methods FIRST. The
@@ -130,31 +218,10 @@ app.whenReady().then(async () => {
       },
     ]);
     expect(proof.delegated).toEqual([]);
-  } finally {
-    try {
-      if (application) {
-        const child = application.process();
-        let deadline: ReturnType<typeof setTimeout> | undefined;
-        try {
-          await Promise.race([
-            application.close(),
-            new Promise<never>((_resolve, reject) => {
-              deadline = setTimeout(
-                () => reject(new Error('Owned Electron cleanup timed out')),
-                5000,
-              );
-            }),
-          ]);
-        } finally {
-          if (deadline) clearTimeout(deadline);
-          if (child.exitCode === null && child.signalCode === null)
-            await terminateStartupProcess(child);
-        }
-      }
-    } finally {
-      await rm(directory, { recursive: true, force: true, maxRetries: 5 });
-    }
+  } catch (error) {
+    failures.push(error);
   }
+  await finishOwnedProtocolFixture(application, directory, failures);
 });
 
 type LoginIsolationProof = {
