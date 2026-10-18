@@ -86,7 +86,7 @@ export async function shortcutRatingNative<T>(
             if (id === '\0native-shortcut:mpris')
               return 'export const registerMPRIS=()=>{};';
             if (id === '\0native-shortcut:volume-renderer')
-              return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},overrideListener=()=>{};';
+              return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},overrideListener=()=>{},stop=()=>{};';
             if (id === '\0native-shortcut:speed-renderer')
               return 'export const onConfigChange=()=>{},onPlayerApiReady=()=>{},onUnload=()=>{};';
           },
