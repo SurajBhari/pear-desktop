@@ -14,10 +14,16 @@ export async function musicHttpFixture() {
   if (!m.registerMusicRoutes) throw Error('Missing guarded music routes');
   const f = await musicServiceFixture(),
     app = new Hono();
+  const p = await musicModuleSource(
+    'src/plugins/api-server/backend/music-http-policy.ts',
+  );
+  let owner: any;
+  const lifetime = new AbortController();
+  const membership = new WeakSet<object>();
   m.registerMusicRoutes(
     app,
     () => f.service,
-    () => ({ resource: f.service.resource, current: () => true }),
+    () => ({ ...owner, resources: { local: f.service.resource } }),
   );
   app.use('*', cors());
   app.use('*', async (c, next) => {
@@ -26,9 +32,23 @@ export async function musicHttpFixture() {
   });
   app.get('/api/v1/song', (c) => c.json({ legacy: 'NONE unchanged' }));
   const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 });
-  await new Promise<void>((r) => server.once('listening', r));
+  server.on('connection', (socket) => membership.add(socket));
+  await new Promise<void>((r, reject) => {
+    server.once('listening', r);
+    server.once('error', reject);
+  });
   const port = (server.address() as any).port;
   f.service.configure({ ...f.config, port });
+  owner = {
+    identity: {},
+    address: (server.address() as any).address,
+    port,
+    tls: false,
+    resources: p.musicHttpResources({ ...f.config, port }),
+    signal: lifetime.signal,
+    current: () => !lifetime.signal.aborted && server.listening,
+    ownsSocket: (socket: object) => membership.has(socket),
+  };
   const grant = await f.store.issue(
     'Socket',
     'rest',
@@ -96,6 +116,7 @@ export async function musicHttpFixture() {
     http,
     raw,
     async close() {
+      lifetime.abort();
       await new Promise<void>((r) => server.close(() => r()));
       await f.close();
     },

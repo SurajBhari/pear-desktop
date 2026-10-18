@@ -29,7 +29,16 @@ export async function playlistApiFixture() {
       return serial;
     },
     clearTimeout: (id: number) => timers.delete(id),
-    serve: () => ({ close() {} }),
+    serve: () => {
+      const server = new EventEmitter();
+      return Object.assign(server, {
+        listening: false,
+        address: () => null,
+        close: () => {
+          server.emit('close');
+        },
+      });
+    },
   };
   (globalThis as any).__playlistApiBoundary = boundary;
   await writeFile(

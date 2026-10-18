@@ -23,6 +23,11 @@ import {
   stopLegacyClock,
 } from './legacy-clock';
 import { MusicGrantStore } from './music-grant-store';
+import {
+  musicHttpResources,
+  normalizeMusicIp,
+  type MusicHttpListenerOwner,
+} from './music-http-policy';
 import { createMusicService } from './music-service';
 import { registerAuth, registerControl, registerWebsocket } from './routes';
 import { registerMusicRoutes } from './routes/music';
@@ -40,6 +45,7 @@ import type { MiddlewareHandler } from 'hono';
 
 export const backend = createBackend<BackendType, APIServerConfig>({
   async start(ctx) {
+    this.retireMusicHttpOwner();
     if (this.musicWindow) stopLegacyClock(this.musicWindow);
     this.musicService?.stop();
     this.musicService = undefined;
@@ -100,6 +106,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     this.end();
   },
   onConfigChange(config) {
+    this.retireMusicHttpOwner();
     this.musicConfigRevision = (this.musicConfigRevision ?? 0) + 1;
     // Reconfiguration, including authorization changes, retires admitted playlist work.
     this.queueRequestScope?.abort();
@@ -114,6 +121,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       old?.keyPath === config.keyPath
     ) {
       this.oldConfig = config;
+      this.publishMusicHttpOwner();
       return;
     }
 
@@ -131,17 +139,9 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     registerMusicRoutes(
       this.app,
       () => (this.app === owningApp ? this.musicService : undefined),
-      () => {
-        const service = this.app === owningApp ? this.musicService : undefined;
-        if (!service) return;
-        const config = this.musicConfig;
-        return {
-          resource: service.resource,
-          current: () =>
-            this.app === owningApp &&
-            this.musicService === service &&
-            this.musicConfig === config,
-        };
+      (incoming) => {
+        const owner = this.app === owningApp ? this.musicHttpOwner : undefined;
+        return owner?.ownsSocket(incoming.socket) ? owner : undefined;
       },
     );
 
@@ -265,6 +265,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
   },
   run(config) {
     if (!this.app) return;
+    this.retireMusicHttpOwner();
     this.configureMusic(config);
     if (!this.queueRequestScope || this.queueRequestScope.signal.aborted)
       this.queueRequestScope = new AbortController();
@@ -292,12 +293,38 @@ export const backend = createBackend<BackendType, APIServerConfig>({
               websocket: { server: wss },
             };
 
-      this.server = serve(serveOptions);
+      const server = serve(serveOptions);
+      this.server = server;
+      this.musicHttpServer = server;
+      this.musicHttpTls = !!(
+        config.useHttps &&
+        config.certPath &&
+        config.keyPath
+      );
+      const sockets = new WeakSet<object>();
+      this.musicHttpSockets = sockets;
+      server.on('connection', (socket: object) => sockets.add(socket));
+      server.on('secureConnection', (socket: object) => sockets.add(socket));
+      server.once('listening', () => {
+        if (this.server === server) this.publishMusicHttpOwner();
+      });
+      const retired = () => {
+        if (this.server === server) {
+          this.retireMusicHttpOwner();
+          this.musicHttpServer = undefined;
+          this.musicHttpSockets = undefined;
+        }
+      };
+      server.once('close', retired);
+      server.on('error', retired);
     } catch (err) {
       console.error(err);
     }
   },
   end() {
+    this.retireMusicHttpOwner();
+    this.musicHttpServer = undefined;
+    this.musicHttpSockets = undefined;
     if (this.musicWindow) stopLegacyClock(this.musicWindow);
     this.musicService?.stop();
     this.musicService = undefined;
@@ -305,6 +332,60 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     this.queueRequestScope = undefined;
     this.server?.close();
     this.server = undefined;
+  },
+  retireMusicHttpOwner(owner?: MusicHttpListenerOwner) {
+    if (owner && this.musicHttpOwner !== owner) return;
+    this.musicHttpRetirement?.abort();
+    this.musicHttpRetirement = undefined;
+    this.musicHttpOwner = undefined;
+  },
+  publishMusicHttpOwner() {
+    this.retireMusicHttpOwner();
+    const server = this.server,
+      service = this.musicService,
+      sockets = this.musicHttpSockets;
+    const config = this.musicConfig;
+    if (
+      !server?.listening ||
+      this.musicHttpServer !== server ||
+      !service ||
+      !sockets ||
+      !config
+    )
+      return;
+    const address = server.address();
+    if (
+      !address ||
+      typeof address === 'string' ||
+      !normalizeMusicIp(address.address)
+    )
+      return;
+    const revision = this.musicConfigRevision,
+      start = this.startRevision,
+      app = this.app;
+    const controller = new AbortController();
+    const owner: MusicHttpListenerOwner = Object.freeze({
+      identity: {},
+      address: address.address,
+      port: address.port,
+      tls: this.musicHttpTls === true,
+      resources: musicHttpResources(config),
+      signal: controller.signal,
+      ownsSocket: (socket: object) => sockets.has(socket),
+      current: () =>
+        !controller.signal.aborted &&
+        this.musicHttpOwner === owner &&
+        this.server === server &&
+        this.musicHttpServer === server &&
+        this.musicHttpSockets === sockets &&
+        this.musicService === service &&
+        this.app === app &&
+        this.musicConfigRevision === revision &&
+        this.startRevision === start &&
+        server.listening,
+    });
+    this.musicHttpRetirement = controller;
+    this.musicHttpOwner = owner;
   },
   configureMusic(config) {
     if (this.musicWindow) configureLegacyClock(this.musicWindow, config);
@@ -321,6 +402,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       window: this.musicWindow,
       config,
       grants: this.musicGrants,
+      restListenerOwner: () => this.musicHttpOwner,
     });
   },
 });

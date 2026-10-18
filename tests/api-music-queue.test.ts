@@ -45,12 +45,13 @@ async function queueHttp() {
   const queue = { store: { store }, getItems: () => items };
   queueElement.queue = queue;
   const main = await musicModuleSource(
-    'src/plugins/api-server/backend/music-service.ts',
+    [
+      'src/plugins/api-server/backend/music-service.ts',
+      'src/plugins/api-server/backend/music-grant-store.ts',
+    ],
     { ipcMain: new EventEmitter() },
   );
-  const grants = await musicModuleSource(
-    'src/plugins/api-server/backend/music-grant-store.ts',
-  );
+  const grants = main;
   const routes = await musicModuleSource(
     'src/plugins/api-server/backend/routes/music.ts',
     { ipcMain: new EventEmitter() },
@@ -92,15 +93,31 @@ async function queueHttp() {
     broker,
   });
   const app = new Hono();
+  const httpLifetime = new AbortController();
+  const httpSockets = new WeakSet<object>();
+  let httpOwner: any;
   routes.registerMusicRoutes(
     app,
     () => service,
-    () => ({ resource: service.resource, current: () => live }),
+    () => httpOwner,
   );
   const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 });
+  server.on('connection', (socket: object) => httpSockets.add(socket));
+  server.once('close', () => httpLifetime.abort());
+  server.on('error', () => httpLifetime.abort());
   await new Promise<void>((resolve) => server.once('listening', resolve));
   const port = (server.address() as any).port;
   service.configure({ ...config, port });
+  httpOwner = {
+    identity: {},
+    address: (server.address() as { address: string }).address,
+    port,
+    tls: false,
+    resources: Object.freeze({ local: service.resource }),
+    signal: httpLifetime.signal,
+    current: () => live && !httpLifetime.signal.aborted && server.listening,
+    ownsSocket: (socket: object) => httpSockets.has(socket),
+  };
   const grant = await ledger.issue(
     'Queue reader',
     'rest',
@@ -566,70 +583,222 @@ for (const method of ['getItems', 'getState', 'subscribe', 'store'])
     }
   });
 
-test('review final native queue binding getter replacement must retire HTTP snapshot',async()=>{
- const f=await queueHttp();try{
-  const element=f.renderer.dom.document.querySelector('#queue') as any,original=f.queue.getItems;
-  let calls=0,threshold=Infinity,triggered=false;
-  Object.defineProperty(f.queue,'getItems',{configurable:true,get(){calls++;if(calls===threshold){triggered=true;element.queue={getItems:original,store:f.queue.store};}return original;}});
-  expect((await f.http()).status).toBe(200);calls=0;expect((await f.http()).status).toBe(200);const baselineCalls=calls;
-  const probes=[];
-  for(let at=1;at<=baselineCalls;at++){
-   threshold=Infinity;element.queue=f.queue;expect((await f.http()).status).toBe(200);
-   calls=0;triggered=false;threshold=at;const response=await f.http();threshold=Infinity;
-   probes.push({at,calls,triggered,status:response.status,total:response.body.total});
+test('review final native queue binding getter replacement must retire HTTP snapshot', async () => {
+  const f = await queueHttp();
+  try {
+    const element = f.renderer.dom.document.querySelector('#queue') as any,
+      original = f.queue.getItems;
+    let calls = 0,
+      threshold = Infinity,
+      triggered = false;
+    Object.defineProperty(f.queue, 'getItems', {
+      configurable: true,
+      get() {
+        calls++;
+        if (calls === threshold) {
+          triggered = true;
+          element.queue = { getItems: original, store: f.queue.store };
+        }
+        return original;
+      },
+    });
+    expect((await f.http()).status).toBe(200);
+    calls = 0;
+    expect((await f.http()).status).toBe(200);
+    const baselineCalls = calls;
+    const probes = [];
+    for (let at = 1; at <= baselineCalls; at++) {
+      threshold = Infinity;
+      element.queue = f.queue;
+      expect((await f.http()).status).toBe(200);
+      calls = 0;
+      triggered = false;
+      threshold = at;
+      const response = await f.http();
+      threshold = Infinity;
+      probes.push({
+        at,
+        calls,
+        triggered,
+        status: response.status,
+        total: response.body.total,
+      });
+    }
+    element.queue = f.queue;
+    const recovery = await f.http();
+    console.log(
+      'QUEUE_FINAL_GETTER ' +
+        JSON.stringify({
+          baselineCalls,
+          probes,
+          recovery: recovery.status,
+          fetches: f.renderer.fetches.length,
+        }),
+    );
+    expect(recovery.status).toBe(200);
+    expect(recovery.body.total).toBe(151);
+    expect(f.renderer.fetches).toHaveLength(0);
+    for (const p of probes)
+      if (p.triggered) expect(p.status, 'callout ' + p.at).toBe(409);
+  } finally {
+    await f.close();
   }
-  element.queue=f.queue;const recovery=await f.http();
-  console.log('QUEUE_FINAL_GETTER '+JSON.stringify({baselineCalls,probes,recovery:recovery.status,fetches:f.renderer.fetches.length}));
-  expect(recovery.status).toBe(200);expect(recovery.body.total).toBe(151);expect(f.renderer.fetches).toHaveLength(0);
-  for(const p of probes)if(p.triggered)expect(p.status,'callout '+p.at).toBe(409);
- }finally{await f.close();}
 });
-test('review unrelated store notifications do not reread whole native queue',async()=>{
- const f=await queueHttp();try{
-  let reads=0;const original=f.queue.getItems;f.queue.getItems=()=>{reads++;return original()};
-  const first=await f.http('?limit=100');expect(first.status).toBe(200);const initial=reads;
-  for(let i=0;i<50;i++)f.notify();const idle=reads-initial;
-  const second=await f.http('?limit=100&cursor='+first.body.nextCursor);
-  const beforeABA=second.status;
-  const rows=f.items();f.replaceItems([...rows].reverse(),30);f.replaceItems(rows,120);
-  const retired=await f.http('?limit=100&cursor='+first.body.nextCursor);const recovery=await f.http();
-  console.log('QUEUE_BACKGROUND '+JSON.stringify({idle,continuation:beforeABA,total:second.body.total,items:second.body.items.length,retired:retired.status,recovery:recovery.status}));
-  expect(beforeABA).toBe(200);expect(second.body.items).toHaveLength(51);expect(retired.status).toBe(409);expect(recovery.status).toBe(200);expect(idle).toBe(0);
- }finally{await f.close();}
+test('review unrelated store notifications do not reread whole native queue', async () => {
+  const f = await queueHttp();
+  try {
+    let reads = 0;
+    const original = f.queue.getItems;
+    f.queue.getItems = () => {
+      reads++;
+      return original();
+    };
+    const first = await f.http('?limit=100');
+    expect(first.status).toBe(200);
+    const initial = reads;
+    for (let i = 0; i < 50; i++) f.notify();
+    const idle = reads - initial;
+    const second = await f.http('?limit=100&cursor=' + first.body.nextCursor);
+    const beforeABA = second.status;
+    const rows = f.items();
+    f.replaceItems([...rows].reverse(), 30);
+    f.replaceItems(rows, 120);
+    const retired = await f.http('?limit=100&cursor=' + first.body.nextCursor);
+    const recovery = await f.http();
+    console.log(
+      'QUEUE_BACKGROUND ' +
+        JSON.stringify({
+          idle,
+          continuation: beforeABA,
+          total: second.body.total,
+          items: second.body.items.length,
+          retired: retired.status,
+          recovery: recovery.status,
+        }),
+    );
+    expect(beforeABA).toBe(200);
+    expect(second.body.items).toHaveLength(51);
+    expect(retired.status).toBe(409);
+    expect(recovery.status).toBe(200);
+    expect(idle).toBe(0);
+  } finally {
+    await f.close();
+  }
 });
-test('review getApi final recapture cannot return after exact queue owner disposal',async()=>{
- const f=await queueHttp();const m=await musicModuleSource('src/providers/music-queue.ts');
- let owner:any,calls=0,armed=Infinity,disposed=false;
- try{
-  const getApi=()=>{if(++calls===armed){disposed=true;owner.dispose()}return f.renderer.originalApi};
-  owner=m.createMusicQueueOwner(f.renderer.originalApi,getApi,f.renderer.dom.document);owner.snapshot();calls=0;owner.snapshot();const n=calls;
-  calls=0;armed=n;let result:any,error:any;try{result=owner.snapshot()}catch(e){error=(e as any).code}
-  console.log('QUEUE_DISPOSE '+JSON.stringify({n,calls,disposed,total:result?.items.length,error}));expect(disposed).toBe(true);expect(error).toBe('retired');expect(result).toBeUndefined();
- }finally{owner?.dispose();await f.close();}
+test('review getApi final recapture cannot return after exact queue owner disposal', async () => {
+  const f = await queueHttp();
+  const m = await musicModuleSource('src/providers/music-queue.ts');
+  let owner: any,
+    calls = 0,
+    armed = Infinity,
+    disposed = false;
+  try {
+    const getApi = () => {
+      if (++calls === armed) {
+        disposed = true;
+        owner.dispose();
+      }
+      return f.renderer.originalApi;
+    };
+    owner = m.createMusicQueueOwner(
+      f.renderer.originalApi,
+      getApi,
+      f.renderer.dom.document,
+    );
+    owner.snapshot();
+    calls = 0;
+    owner.snapshot();
+    const n = calls;
+    calls = 0;
+    armed = n;
+    let result: any, error: any;
+    try {
+      result = owner.snapshot();
+    } catch (e) {
+      error = (e as any).code;
+    }
+    console.log(
+      'QUEUE_DISPOSE ' +
+        JSON.stringify({
+          n,
+          calls,
+          disposed,
+          total: result?.items.length,
+          error,
+        }),
+    );
+    expect(disposed).toBe(true);
+    expect(error).toBe('retired');
+    expect(result).toBeUndefined();
+  } finally {
+    owner?.dispose();
+    await f.close();
+  }
 });
 
 import { Window } from 'happy-dom';
-test('a getter that disposes the queue owner cannot publish an admitted snapshot',async()=>{
- const source=await musicModuleSource('src/providers/music-queue.ts');
- const oldWindow=(globalThis as any).window;
- const leaked:number[]=[];
- try {
-  for(let armedCall=1;armedCall<=32;armedCall++){
-   const dom=new Window();(globalThis as any).window=dom;
-   const element=dom.document.createElement('div') as any;element.id='queue';dom.document.body.append(element);
-   const items=[{playlistPanelVideoRenderer:{videoId:'duplicate01',title:{simpleText:'Owned positive'}}}];
-   const store={getState:()=>({queue:{items,selectedItemIndex:0}}),subscribe:()=>()=>{}};
-   element.queue={store:{store},getItems:()=>items};
-   const api={isConnected:true};let calls=0,armed=false,disposed=false;
-   let owner:any;
-   owner=source.createMusicQueueOwner(api,()=>{calls++;if(armed&&calls===armedCall){disposed=true;owner.dispose();}return api;},dom.document);
-   const healthy=owner.snapshot();expect(healthy.items).toHaveLength(1);
-   calls=0;armed=true;
-   try {owner.snapshot();if(disposed)leaked.push(armedCall);}catch(error){if(!disposed)throw error;}
-   owner.dispose();await dom.happyDOM.close();
+test('a getter that disposes the queue owner cannot publish an admitted snapshot', async () => {
+  const source = await musicModuleSource('src/providers/music-queue.ts');
+  const oldWindow = (globalThis as any).window;
+  const leaked: number[] = [];
+  try {
+    for (let armedCall = 1; armedCall <= 32; armedCall++) {
+      const dom = new Window();
+      (globalThis as any).window = dom;
+      const element = dom.document.createElement('div') as any;
+      element.id = 'queue';
+      dom.document.body.append(element);
+      const items = [
+        {
+          playlistPanelVideoRenderer: {
+            videoId: 'duplicate01',
+            title: { simpleText: 'Owned positive' },
+          },
+        },
+      ];
+      const store = {
+        getState: () => ({ queue: { items, selectedItemIndex: 0 } }),
+        subscribe: () => () => {},
+      };
+      element.queue = { store: { store }, getItems: () => items };
+      const api = { isConnected: true };
+      let calls = 0,
+        armed = false,
+        disposed = false;
+      let owner: any;
+      owner = source.createMusicQueueOwner(
+        api,
+        () => {
+          calls++;
+          if (armed && calls === armedCall) {
+            disposed = true;
+            owner.dispose();
+          }
+          return api;
+        },
+        dom.document,
+      );
+      const healthy = owner.snapshot();
+      expect(healthy.items).toHaveLength(1);
+      calls = 0;
+      armed = true;
+      try {
+        owner.snapshot();
+        if (disposed) leaked.push(armedCall);
+      } catch (error) {
+        if (!disposed) throw error;
+      }
+      owner.dispose();
+      await dom.happyDOM.close();
+    }
+    expect(
+      leaked,
+      'snapshot publication after synchronous owner disposal',
+    ).toEqual([]);
+  } finally {
+    if (oldWindow === undefined) delete (globalThis as any).window;
+    else (globalThis as any).window = oldWindow;
   }
-  expect(leaked,'snapshot publication after synchronous owner disposal').toEqual([]);
- }finally{if(oldWindow===undefined)delete (globalThis as any).window;else(globalThis as any).window=oldWindow;}
 });
 
 test('notified in-place duplicate reorder ABA retires cursor without callerless getItems work', async () => {
@@ -637,18 +806,30 @@ test('notified in-place duplicate reorder ABA retires cursor without callerless 
   try {
     let reads = 0;
     const original = f.queue.getItems;
-    f.queue.getItems = () => { reads++; return original(); };
-    const first = await f.http('?limit=100'); expect(first.status).toBe(200);
-    const before = reads, rows = f.items();
-    [rows[0], rows[1]] = [rows[1], rows[0]]; f.notify();
-    [rows[0], rows[1]] = [rows[1], rows[0]]; f.notify();
+    f.queue.getItems = () => {
+      reads++;
+      return original();
+    };
+    const first = await f.http('?limit=100');
+    expect(first.status).toBe(200);
+    const before = reads,
+      rows = f.items();
+    [rows[0], rows[1]] = [rows[1], rows[0]];
+    f.notify();
+    [rows[0], rows[1]] = [rows[1], rows[0]];
+    f.notify();
     expect(reads - before).toBe(0);
-    expect((await f.http('?limit=100&cursor=' + first.body.nextCursor)).status).toBe(409);
-    const healthy = await f.http('?limit=100'); expect(healthy.status).toBe(200);
+    expect(
+      (await f.http('?limit=100&cursor=' + first.body.nextCursor)).status,
+    ).toBe(409);
+    const healthy = await f.http('?limit=100');
+    expect(healthy.status).toBe(200);
     expect(healthy.body.items[0].item.title).toBe('Owned 0');
     expect(healthy.body.items[1].item.title).toBe('Owned 1');
     expect(healthy.body.selectedIndex).toBe(120);
-  } finally { await f.close(); }
+  } finally {
+    await f.close();
+  }
 });
 
 test('ordinary Polymer accessor uses ref-equal inst data backing and retires final replacement', async () => {
@@ -656,75 +837,172 @@ test('ordinary Polymer accessor uses ref-equal inst data backing and retires fin
   try {
     const element = f.renderer.dom.document.querySelector('#queue') as any;
     element.inst = { queue: f.queue };
-    Object.defineProperty(element, 'queue', { configurable: true, get: () => element.inst.queue, set: value => element.inst.queue = value });
-    const first = await f.http('?limit=100'); expect(first.status).toBe(200);
+    Object.defineProperty(element, 'queue', {
+      configurable: true,
+      get: () => element.inst.queue,
+      set: (value) => (element.inst.queue = value),
+    });
+    const first = await f.http('?limit=100');
+    expect(first.status).toBe(200);
     const second = await f.http('?limit=100&cursor=' + first.body.nextCursor);
-    expect(second.status).toBe(200); expect(second.body.items).toHaveLength(51);
+    expect(second.status).toBe(200);
+    expect(second.body.items).toHaveLength(51);
     const original = f.queue.getItems;
-    let calls = 0, threshold = Infinity, triggered = false;
-    Object.defineProperty(f.queue, 'getItems', { configurable: true, get() {
-      if (++calls === threshold) { triggered = true; element.inst.queue = {getItems: original, store:f.queue.store}; }
-      return original;
-    } });
+    let calls = 0,
+      threshold = Infinity,
+      triggered = false;
+    Object.defineProperty(f.queue, 'getItems', {
+      configurable: true,
+      get() {
+        if (++calls === threshold) {
+          triggered = true;
+          element.inst.queue = { getItems: original, store: f.queue.store };
+        }
+        return original;
+      },
+    });
     expect((await f.http('?limit=100')).status).toBe(200);
-    calls = 0; expect((await f.http('?limit=100')).status).toBe(200); threshold = calls; calls = 0;
-    expect((await f.http('?limit=100')).status).toBe(409); expect(triggered).toBe(true);
-    threshold = Infinity; element.inst.queue = f.queue;
-    expect((await f.http('?limit=100')).status).toBe(200); expect(f.renderer.fetches).toHaveLength(0);
-  } finally { await f.close(); }
+    calls = 0;
+    expect((await f.http('?limit=100')).status).toBe(200);
+    threshold = calls;
+    calls = 0;
+    expect((await f.http('?limit=100')).status).toBe(409);
+    expect(triggered).toBe(true);
+    threshold = Infinity;
+    element.inst.queue = f.queue;
+    expect((await f.http('?limit=100')).status).toBe(200);
+    expect(f.renderer.fetches).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
 });
 
 test('final reflection trap that disposes the owner cannot publish and a clean owner remains useful', async () => {
-  const f = await queueHttp(), source = await musicModuleSource('src/providers/music-queue.ts');
+  const f = await queueHttp(),
+    source = await musicModuleSource('src/providers/music-queue.ts');
   let owner: any;
   try {
     const element = f.renderer.dom.document.querySelector('#queue') as any;
-    let calls = 0, threshold = Infinity, disposed = false;
-    element.queue = new Proxy(f.queue, { getOwnPropertyDescriptor(target, key) {
-      if (++calls === threshold) { disposed = true; owner.dispose(); }
-      return Reflect.getOwnPropertyDescriptor(target, key);
-    } });
-    owner = source.createMusicQueueOwner(f.renderer.originalApi, () => f.renderer.originalApi, f.renderer.dom.document);
+    let calls = 0,
+      threshold = Infinity,
+      disposed = false;
+    element.queue = new Proxy(f.queue, {
+      getOwnPropertyDescriptor(target, key) {
+        if (++calls === threshold) {
+          disposed = true;
+          owner.dispose();
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    owner = source.createMusicQueueOwner(
+      f.renderer.originalApi,
+      () => f.renderer.originalApi,
+      f.renderer.dom.document,
+    );
     expect(owner.snapshot().items).toHaveLength(151);
-    calls = 0; expect(owner.snapshot().items).toHaveLength(151); threshold = calls; calls = 0;
-    expect(() => owner.snapshot()).toThrow('retired'); expect(disposed).toBe(true);
+    calls = 0;
+    expect(owner.snapshot().items).toHaveLength(151);
+    threshold = calls;
+    calls = 0;
+    expect(() => owner.snapshot()).toThrow('retired');
+    expect(disposed).toBe(true);
     element.queue = f.queue;
-    const healthy = source.createMusicQueueOwner(f.renderer.originalApi, () => f.renderer.originalApi, f.renderer.dom.document);
-    try { expect(healthy.snapshot().items).toHaveLength(151); } finally { healthy.dispose(); }
-  } finally { owner?.dispose(); await f.close(); }
+    const healthy = source.createMusicQueueOwner(
+      f.renderer.originalApi,
+      () => f.renderer.originalApi,
+      f.renderer.dom.document,
+    );
+    try {
+      expect(healthy.snapshot().items).toHaveLength(151);
+    } finally {
+      healthy.dispose();
+    }
+  } finally {
+    owner?.dispose();
+    await f.close();
+  }
 });
 
 test('ordinary1000 queue retains literal pages and selected999 after unrelated notifications', async () => {
   const f = await queueHttp();
   try {
     const row = f.items()[0].playlistPanelVideoRenderer;
-    f.replaceItems(Array.from({length:1000}, (_, index) => ({playlistPanelVideoRenderer:{...row,title:{simpleText:'Queue '+index},selected:index===999}})), 999);
-    const first = await f.http('?limit=100'); expect(first.status).toBe(200);
-    for (let i=0;i<50;i++) f.notify();
-    const all = [...first.body.items]; let cursor = first.body.nextCursor;
-    while (cursor) { const page = await f.http('?limit=100&cursor='+cursor); expect(page.status).toBe(200); all.push(...page.body.items); cursor=page.body.nextCursor; }
-    expect(all).toHaveLength(1000); expect(all[0].item.title).toBe('Queue 0'); expect(all[999]).toMatchObject({index:999,selected:true,item:{title:'Queue 999',id:'duplicate01'}});
+    f.replaceItems(
+      Array.from({ length: 1000 }, (_, index) => ({
+        playlistPanelVideoRenderer: {
+          ...row,
+          title: { simpleText: 'Queue ' + index },
+          selected: index === 999,
+        },
+      })),
+      999,
+    );
+    const first = await f.http('?limit=100');
+    expect(first.status).toBe(200);
+    for (let i = 0; i < 50; i++) f.notify();
+    const all = [...first.body.items];
+    let cursor = first.body.nextCursor;
+    while (cursor) {
+      const page = await f.http('?limit=100&cursor=' + cursor);
+      expect(page.status).toBe(200);
+      all.push(...page.body.items);
+      cursor = page.body.nextCursor;
+    }
+    expect(all).toHaveLength(1000);
+    expect(all[0].item.title).toBe('Queue 0');
+    expect(all[999]).toMatchObject({
+      index: 999,
+      selected: true,
+      item: { title: 'Queue 999', id: 'duplicate01' },
+    });
     expect(f.renderer.fetches).toHaveLength(0);
-  } finally { await f.close(); }
+  } finally {
+    await f.close();
+  }
 });
 
 test('last getter cannot publish after the native API node disconnects while queue remains connected', async () => {
-  const f = await queueHttp(), source = await musicModuleSource('src/providers/music-queue.ts');
+  const f = await queueHttp(),
+    source = await musicModuleSource('src/providers/music-queue.ts');
   let owner: any;
   try {
-    const api = f.renderer.dom.document.createElement('div'); f.renderer.dom.document.body.append(api);
+    const api = f.renderer.dom.document.createElement('div');
+    f.renderer.dom.document.body.append(api);
     const original = f.queue.getItems;
-    let calls = 0, threshold = Infinity, disconnected = false;
-    Object.defineProperty(f.queue, 'getItems', { configurable: true, get() {
-      if (++calls === threshold) { api.remove(); disconnected = true; }
-      return original;
-    } });
-    owner = source.createMusicQueueOwner(api, () => api, f.renderer.dom.document);
+    let calls = 0,
+      threshold = Infinity,
+      disconnected = false;
+    Object.defineProperty(f.queue, 'getItems', {
+      configurable: true,
+      get() {
+        if (++calls === threshold) {
+          api.remove();
+          disconnected = true;
+        }
+        return original;
+      },
+    });
+    owner = source.createMusicQueueOwner(
+      api,
+      () => api,
+      f.renderer.dom.document,
+    );
     expect(owner.snapshot().items).toHaveLength(151);
-    calls = 0; expect(owner.snapshot().items).toHaveLength(151); threshold = calls; calls = 0;
-    expect(() => owner.snapshot()).toThrow('retired'); expect(disconnected).toBe(true);
-    expect((f.renderer.dom.document.querySelector('#queue') as any).isConnected).toBe(true);
-    threshold = Infinity; f.renderer.dom.document.body.append(api);
+    calls = 0;
     expect(owner.snapshot().items).toHaveLength(151);
-  } finally { owner?.dispose(); await f.close(); }
+    threshold = calls;
+    calls = 0;
+    expect(() => owner.snapshot()).toThrow('retired');
+    expect(disconnected).toBe(true);
+    expect(
+      (f.renderer.dom.document.querySelector('#queue') as any).isConnected,
+    ).toBe(true);
+    threshold = Infinity;
+    f.renderer.dom.document.body.append(api);
+    expect(owner.snapshot().items).toHaveLength(151);
+  } finally {
+    owner?.dispose();
+    await f.close();
+  }
 });

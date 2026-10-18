@@ -742,11 +742,11 @@ test('N1 F2 actual native original context rejects pending executing and termina
           body = { ...args, operationId: id },
           beforeOriginalBroker = originalBrokerCalls,
           beforeOriginalDispatch = await evaluate('window.dispatches.length');
-        const row = service.operations.lookup(
-          id,
-          grant.record,
-          service.resource,
-        );
+        const row = service.operations.lookup(id, grant.record, {
+          transport: 'rest',
+          resource: service.resource,
+          owner: service.accessOwner('rest', service.resource),
+        });
         let executing: Promise<any> | undefined;
         if (phase === 'executing') {
           executing = service.navigate(token, { ...command, operationId: id });
@@ -863,7 +863,11 @@ test('N1 F2 actual native original context rejects pending executing and termina
       replacementRow = service.operations.lookup(
         replacement.body.operationId,
         grant.record,
-        service.resource,
+        {
+          transport: 'rest',
+          resource: service.resource,
+          owner: service.accessOwner('rest', service.resource),
+        },
       ),
       oldAdmission = broker.capture();
     await window.loadFile(f.owned + '/main.html');

@@ -727,19 +727,35 @@ async function commentsSocketFixture(
     }),
   });
   const appHttp = new Hono();
+  const httpLifetime = new AbortController();
+  const httpSockets = new WeakSet<object>();
+  let httpOwner: any;
   source.registerMusicRoutes(
     appHttp,
     () => service,
-    () => ({ resource: service.resource, current: () => true }),
+    () => httpOwner,
   );
   const server = serve({
     fetch: appHttp.fetch,
     hostname: '127.0.0.1',
     port: 0,
   });
+  server.on('connection', (socket: object) => httpSockets.add(socket));
+  server.once('close', () => httpLifetime.abort());
+  server.on('error', () => httpLifetime.abort());
   await new Promise<void>((yes) => server.once('listening', yes));
   const port = (server.address() as any).port;
   service.configure({ ...config, port });
+  httpOwner = {
+    identity: {},
+    address: (server.address() as { address: string }).address,
+    port,
+    tls: false,
+    resources: Object.freeze({ local: service.resource }),
+    signal: httpLifetime.signal,
+    current: () => true && !httpLifetime.signal.aborted && server.listening,
+    ownsSocket: (socket: object) => httpSockets.has(socket),
+  };
   const grant = await store.issue(
     'COM socket',
     'rest',

@@ -531,12 +531,67 @@ async function operationFixture() {
     new Promise((resolve, reject) =>
       calls.push({ input, options, resolve, reject }),
     );
-  return { ...f, broker, grant, calls };
+  return {
+    ...f,
+    broker,
+    grant,
+    calls,
+    access: {
+      transport: 'rest',
+      resource: f.resource,
+      owner: f.service.accessOwner('rest', f.resource),
+    },
+  };
 }
 
 function until(check: () => boolean) {
   return expect.poll(check).toBe(true);
 }
+
+test('N1 silent native flip at deadline stays timeout without terminal authority probes', async () => {
+  const f = await operationFixture();
+  const probes: string[] = [];
+  let terminal = false;
+  const current = f.store.isCurrent.bind(f.store),
+    native = f.broker.isCurrent.bind(f.broker);
+  f.store.isCurrent = (...args: any[]) => {
+    if (terminal) probes.push('grant');
+    return current(...args);
+  };
+  f.broker.isCurrent = (...args: any[]) => {
+    if (terminal) probes.push('native');
+    return native(...args);
+  };
+  try {
+    const prepared = await f.service.prepare(f.grant.token, song),
+      row = (f.service as any).operations.lookup(
+        prepared.operationId,
+        f.grant.record,
+        f.access,
+      ),
+      execution = f.service.navigate(
+        f.grant.token,
+        { ...song, operationId: prepared.operationId },
+        undefined,
+        (f.service as any).now() + 10000,
+      ).catch((error: any) => error.code);
+    await until(() => f.calls.length === 1);
+    f.advance(10000);
+    terminal = true;
+    f.retire(); // Deliberately silent; no subscribeRetirement notification.
+    f.calls[0].reject(Error('ACK lost after hidden native flip'));
+    expect(await execution).toBe('timeout');
+    expect(probes).toEqual([]);
+    expect(row.receipt).toMatchObject({ status: 'uncertain', error: 'outcome_unknown' });
+    expect(row.physicalHold).toBe(true);
+    f.calls[0].options.onPhysicalSettled('authenticated_ack');
+    expect(row.physicalHold).toBe(false);
+    expect(f.calls).toHaveLength(1);
+  } finally {
+    terminal = false;
+    await f.close();
+  }
+});
 
 // These boundaries use the fixture clock, so no real deadline timer can win.
 for (const elapsed of [10000, 10001]) {
@@ -549,7 +604,7 @@ for (const elapsed of [10000, 10001]) {
         row = (f.service as any).operations.lookup(
           prepared.operationId,
           f.grant.record,
-          f.resource,
+          f.access,
         );
       const execution = f.service.navigate(
         f.grant.token,
@@ -718,7 +773,7 @@ for (const retirement of [
         .catch((error: any) => error.code);
       await until(() => f.calls.length === 1);
       f.advance(retirement === 'grant-expiry' ? 86400000 : 10000);
-      if (retirement === 'native') f.retire();
+      if (retirement === 'native') f.retireObserved();
       if (retirement === 'grant-revocation')
         await f.store.revoke(f.grant.record.id, () => true);
       if (retirement === 'revision') f.service.configure(f.config);
@@ -782,7 +837,7 @@ for (const condition of [
             ? 0
             : 10000,
       );
-      if (condition === 'lost-native-owner') f.retire();
+      if (condition === 'lost-native-owner') f.retireObserved();
       callbacks[1]();
       expect(await execution).toBe(
         condition === 'deadline-only' ? 'timeout' : 'retired',
@@ -825,7 +880,7 @@ for (const condition of ['deadline-only', 'lost-native-owner']) {
       }
       expect(callbacks).toHaveLength(1);
       f.advance(10000);
-      if (condition === 'lost-native-owner') f.retire();
+      if (condition === 'lost-native-owner') f.retireObserved();
       callbacks[0]();
       expect(await execution).toBe(
         condition === 'deadline-only' ? 'timeout' : 'retired',
@@ -847,7 +902,7 @@ test('N1 equal grant and request deadline timer retires the grant', async () => 
       row = (f.service as any).operations.lookup(
         prepared.operationId,
         f.grant.record,
-        f.resource,
+        f.access,
       ),
       execution = f.service
         .navigate(
@@ -889,7 +944,7 @@ test('N1 typed timeout abort remains an error when native ownership also retires
         .catch((error: any) => error.code);
     await until(() => f.calls.length === 1);
     controller.abort(timeout);
-    f.retire();
+    f.retireObserved();
     f.calls[0].reject(Error('Late ACK failure'));
     expect(await execution).toBe('timeout');
     await expect(
@@ -1467,6 +1522,11 @@ test('N1 entry storage admits a bounded encoded scalar record and rejects 32KiB 
   // Internal scalar storage policy is independent of the stricter issuer name limit.
   const binding = {
     principal,
+    access: {
+      transport: 'rest',
+      resource: principal.resource,
+      owner: { identity: {}, current: () => true },
+    },
     resource: principal.resource,
     service: {},
     revision: 0,
@@ -1511,7 +1571,7 @@ for (const phase of [
           const row = (f.service as any).operations.lookup(
             prepared.operationId,
             f.grant.record,
-            f.resource,
+            f.access,
           );
           if (phase !== 'pending' && phase !== 'retired') {
             originalExecution = f.service.navigate(f.grant.token, command);
@@ -1628,7 +1688,7 @@ for (const phase of ['pending', 'accepted', 'uncertain'] as const)
         const row = (f.service as any).operations.lookup(
           prepared.operationId,
           f.grant.record,
-          f.resource,
+          f.access,
         );
         if (phase !== 'pending') {
           const original = f.service.navigate(f.grant.token, command);
@@ -1682,7 +1742,7 @@ for (const context of ['foreign-window', 'same-window-new-service'] as const)
         const row = ledger.lookup(
           prepared.operationId,
           f.grant.record,
-          f.resource,
+          f.access,
         );
         second = new f.service.constructor({
           window:
@@ -1791,7 +1851,7 @@ for (const route of ['status', 'execute'] as const)
         const row = ledger.lookup(
             prepared.operationId,
             f.grant.record,
-            f.resource,
+            f.access,
           ),
           original = f.service.navigate(f.grant.token, command);
         await until(() => f.calls.length === 1);
@@ -1863,7 +1923,7 @@ test('N1 F3 principal digest transport resource identity precedes the main-only 
         ledger.lookup(
           prepared.operationId,
           { ...f.grant.record, ...patch },
-          f.resource,
+          f.access,
           validate,
         ),
       ).toThrow('Music operation history is unavailable.');
@@ -1871,14 +1931,14 @@ test('N1 F3 principal digest transport resource identity precedes the main-only 
       ledger.lookup(
         prepared.operationId,
         f.grant.record,
-        'http://localhost:26538/api/v1/music',
+        { ...f.access, resource: 'http://localhost:26538/api/v1/music' },
         validate,
       ),
     ).toThrow('Music operation history is unavailable.');
     expect(validations).toBe(0);
     expect(ledger.rows.has(prepared.operationId)).toBe(true);
     expect(() =>
-      ledger.lookup(prepared.operationId, f.grant.record, f.resource, validate),
+      ledger.lookup(prepared.operationId, f.grant.record, f.access, validate),
     ).toThrow('Context rejection');
     expect(validations).toBe(1);
     expect(ledger.rows.has(prepared.operationId)).toBe(true);
