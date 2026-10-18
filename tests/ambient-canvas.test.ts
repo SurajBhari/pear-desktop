@@ -14,6 +14,13 @@ async function fixture(page: Page, interpolationTime = 1000, buffer = 2) {
   );
   await page.evaluate(async () => {
     const w = window as any;
+    const video = document.querySelector('video')!;
+    w.mediaState = { paused: false, ended: false, readyState: 4 };
+    Object.defineProperties(video, {
+      paused: { configurable: true, get: () => w.mediaState.paused },
+      ended: { configurable: true, get: () => w.mediaState.ended },
+      readyState: { configurable: true, get: () => w.mediaState.readyState },
+    });
     let serial = 0;
     w.timers = new Map();
     w.frames = new Map();
@@ -138,7 +145,6 @@ test('ambient drawing uses retained native canvas pixels with opaque first frame
   page,
 }) => {
   await fixture(page);
-  await page.evaluate(() => (window as any).tick(500));
   expect(await page.evaluate(() => (window as any).pixel())).toEqual([
     255, 0, 0, 255,
   ]);
@@ -177,7 +183,6 @@ test('ambient resize resets history, instant interpolation stays opaque and paus
   await fixture(page);
   await page.evaluate(() => {
     const w = window as any;
-    w.tick(500);
     w.plugin.renderer.onConfigChange({
       ...w.plugin.config,
       quality: 2,
@@ -213,17 +218,21 @@ test('ambient resize resets history, instant interpolation stays opaque and paus
       ),
     ),
   ).toBe(true);
-  await page.evaluate(() =>
-    document.querySelector('#song-video')!.dispatchEvent(new Event('pause')),
-  );
+  await page.evaluate(() => {
+    (window as any).mediaState.paused = true;
+    document.querySelector('video')!.dispatchEvent(new Event('pause'));
+  });
   expect(
     await page.evaluate(() =>
       [...(window as any).timers.values()].map((timer: any) => timer.delay),
     ),
   ).toEqual([1000]);
-  await page.evaluate(() =>
-    document.querySelector('#song-video')!.dispatchEvent(new Event('play')),
-  );
+  await page.evaluate(() => {
+    const w = window as any;
+    w.mediaState.paused = false;
+    w.mediaState.ended = false;
+    document.querySelector('video')!.dispatchEvent(new Event('play'));
+  });
   expect(await page.evaluate(() => (window as any).timers.size)).toBe(2);
   await page.evaluate(() => (window as any).plugin.renderer.stop());
   expect(await page.evaluate(() => (window as any).timers.size)).toBe(0);
