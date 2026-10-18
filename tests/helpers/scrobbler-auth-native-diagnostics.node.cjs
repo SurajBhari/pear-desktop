@@ -148,6 +148,55 @@ function fixtureHarness(options = {}) {
     .replaceAll('import.meta.dirname', JSON.stringify(__dirname))
     .replace('export async function', 'async function');
   let clock = 0;
+  const cooperativeError = Error('MOCK_COOPERATIVE_WRITE_ERROR');
+  let cooperativePacket;
+  const cooperativeWrite = (name, value) => {
+    if (!name.endsWith('/task.json.tmp')) return false;
+    const packet = JSON.parse(value);
+    if (!packet.source.includes('app.exit(0)')) return false;
+    operations.push(['cooperative-write']);
+    if (!options.cooperative || options.cooperative === 'write-error')
+      throw cooperativeError;
+    cooperativePacket = packet;
+    writes.set(name, value);
+    options.afterCooperativeWrite?.();
+    return true;
+  };
+  const cooperativeRename = (from, to) => {
+    if (!cooperativePacket || !from.endsWith('/task.json.tmp')) return false;
+    operations.push(['cooperative-publish']);
+    assert.equal(to, '/FAKE/owned/task.json');
+    if (options.cooperative !== 'no-close') {
+      const code = options.cooperative === 'nonzero' ? 1 : 0;
+      const signal = options.cooperative === 'signal' ? 'SIGTERM' : null;
+      launched.exitCode = signal ? null : code;
+      launched.signalCode = signal;
+      operations.push(['cooperative-physical-close', code, signal]);
+      launched.emit('exit', code, signal);
+      launched.emit('close', code, signal);
+    }
+    options.afterCooperativePublish?.();
+    return true;
+  };
+  const cooperativeRead = (name) => {
+    if (!cooperativePacket || !name.endsWith('/result.json')) return undefined;
+    operations.push(['cooperative-reply']);
+    if (options.cooperative === 'no-ack')
+      throw Object.assign(Error('MOCK_NO_ACK'), { code: 'ENOENT' });
+    if (options.rawCooperativeReply !== undefined)
+      return options.rawCooperativeReply;
+    const reply = JSON.stringify({
+      id:
+        options.cooperative === 'wrong-id'
+          ? cooperativePacket.id + 1
+          : cooperativePacket.id,
+      ok: options.cooperative === 'not-ok' ? false : true,
+      result: options.cooperative === 'false-result' ? false : true,
+    });
+    options.afterCooperativeRead?.();
+    return reply;
+  };
+  let openedReply;
   const context = vm.createContext({
     Buffer,
     Error,
@@ -181,10 +230,47 @@ function fixtureHarness(options = {}) {
     existsSync: () => true,
     build: async () => {},
     writeFile: async (name, value) => {
+      if (cooperativeWrite(name, value)) return;
       writes.set(name, value);
     },
-    rename: async () => {},
+    rename: async (from, to) => {
+      cooperativeRename(from, to);
+    },
+    writeFileSync: (name, value) => {
+      assert.equal(cooperativeWrite(name, value), true);
+    },
+    renameSync: (from, to) => {
+      assert.equal(cooperativeRename(from, to), true);
+    },
+    openSync: (name, mode) => {
+      assert.equal(mode, 'r');
+      openedReply = cooperativeRead(name);
+      assert.notEqual(openedReply, undefined);
+      return 17;
+    },
+    fstatSync: (fd) => {
+      assert.equal(fd, 17);
+      if (options.statError) throw options.statError;
+      return { size: Buffer.byteLength(openedReply) };
+    },
+    readSync: (fd, target, offset, length, position) => {
+      assert.equal(fd, 17);
+      assert.equal(offset, 0);
+      assert.equal(position, 0);
+      if (options.readError) throw options.readError;
+      const bytes = Buffer.from(openedReply);
+      assert.equal(length, bytes.length);
+      bytes.copy(target);
+      return options.shortReplyRead ? length - 1 : length;
+    },
+    closeSync: (fd) => {
+      assert.equal(fd, 17);
+      operations.push(['cooperative-reply-handle-close']);
+      if (options.descriptorCloseError) throw options.descriptorCloseError;
+    },
     readFile: async (name) => {
+      const reply = cooperativeRead(name);
+      if (reply !== undefined) return reply;
       if (name.endsWith('electron-startup-observer.cjs')) return 'OBSERVER';
       if (name.endsWith('trace.log')) return 'existing trace';
       if (name.endsWith('result.json'))
@@ -266,6 +352,10 @@ function fixtureHarness(options = {}) {
     timers,
     timeouts,
     writes,
+    cooperativeError,
+    advance: (ms) => {
+      clock += ms;
+    },
     packets,
     context,
     create: () => context.create(),
@@ -361,6 +451,354 @@ test('host body-pass cleanup-fail stays failure despite diagnostic emission fail
   });
   assert.equal(await failure(h.run), cleanupError);
 });
+test('cooperative shutdown publishes owned RPC, observes physical close and strict ack before removal', async () => {
+  const h = fixtureHarness({ cooperative: 'success' });
+  const f = await h.create();
+  await f.close();
+  const operations = h.operations.map((item) => item[0]);
+  assert.ok(operations.includes('cooperative-write'));
+  assert.ok(operations.includes('cooperative-publish'));
+  assert.ok(operations.includes('cooperative-physical-close'));
+  assert.ok(operations.includes('cooperative-reply'));
+  assert.ok(
+    operations.indexOf('cooperative-physical-close') <
+      operations.indexOf('cooperative-reply'),
+  );
+  assert.ok(operations.indexOf('cooperative-reply') < operations.indexOf('rm'));
+  assert.ok(
+    !operations.some((name) => ['terminate', 'query', 'kill'].includes(name)),
+  );
+  assert.equal(
+    f
+      .diagnostics()
+      .events.filter((event) => event.phase === 'cooperative-close').length,
+    1,
+  );
+  assert.equal(f.diagnostics().nativeAbsence, 'UNKNOWN');
+  assert.equal(f.diagnostics().captureStopped, true);
+  safe(f.diagnostics());
+});
+for (const cooperative of [
+  'wrong-id',
+  'not-ok',
+  'false-result',
+  'nonzero',
+  'signal',
+  'no-ack',
+]) {
+  test(`cooperative ${cooperative} cannot claim success or signal an already closed launcher`, async () => {
+    const h = fixtureHarness({ cooperative });
+    const f = await h.create();
+    const error = await failure(() => f.close());
+    assert.ok(phases(error).includes('cooperative-shutdown'));
+    assert.ok(
+      !h.operations.some((item) =>
+        ['terminate', 'query', 'kill'].includes(item[0]),
+      ),
+    );
+    assert.ok(
+      !f
+        .diagnostics()
+        .events.some((event) => event.phase === 'cooperative-close'),
+    );
+    assert.equal(h.operations.filter((item) => item[0] === 'rm').length, 1);
+    safe(f.diagnostics());
+  });
+}
+test('failed cooperative publish keeps strict forced fallback and cannot emit cooperative success', async () => {
+  const h = fixtureHarness({ cooperative: 'write-error' });
+  const f = await h.create();
+  await f.close();
+  assert.equal(
+    h.operations.filter((item) => item[0] === 'terminate').length,
+    1,
+  );
+  assert.ok(
+    f
+      .diagnostics()
+      .events.some((event) => event.phase === 'cooperative-shutdown'),
+  );
+  assert.ok(
+    !f
+      .diagnostics()
+      .events.some((event) => event.phase === 'cooperative-close'),
+  );
+  safe(f.diagnostics());
+});
+test('cooperative publication consumes the one deadline before the close wait', async () => {
+  const h = fixtureHarness({
+    cooperative: 'no-close',
+    afterCooperativeWrite: () => h.advance(2500),
+  });
+  const f = await h.create();
+  const pending = f.close();
+  for (let i = 0; i < 20 && !h.timers.length; i++) await Promise.resolve();
+  assert.ok(h.timers[0].ms > 0 && h.timers[0].ms <= 500);
+  h.timers[0].fn();
+  await pending;
+  assert.equal(
+    h.operations.filter((item) => item[0] === 'terminate').length,
+    1,
+  );
+  assert.ok(!h.operations.some((item) => item[0] === 'cooperative-reply'));
+  assert.ok(
+    !f
+      .diagnostics()
+      .events.some((event) => event.phase === 'cooperative-close'),
+  );
+  assert.equal(h.timeouts.length, 0);
+});
+test('expired synchronous publication never renames a late shutdown request', async () => {
+  const h = fixtureHarness({
+    cooperative: 'success',
+    afterCooperativeWrite: () => h.advance(3001),
+  });
+  const f = await h.create();
+  await f.close();
+  assert.ok(!h.operations.some((item) => item[0] === 'cooperative-publish'));
+  assert.equal(
+    h.operations.filter((item) => item[0] === 'terminate').length,
+    1,
+  );
+  assert.ok(
+    !f
+      .diagnostics()
+      .events.some((event) => event.phase === 'cooperative-close'),
+  );
+});
+test('expired reply validation cannot qualify already observed zero-code close', async () => {
+  const h = fixtureHarness({
+    cooperative: 'success',
+    afterCooperativeRead: () => h.advance(3001),
+  });
+  const f = await h.create();
+  const error = await failure(() => f.close());
+  assert.deepEqual([...phases(error)], ['cooperative-shutdown']);
+  assert.ok(!h.operations.some((item) => item[0] === 'terminate'));
+  assert.ok(
+    !f
+      .diagnostics()
+      .events.some((event) => event.phase === 'cooperative-close'),
+  );
+  assert.equal(
+    h.operations.filter((item) => item[0] === 'cooperative-reply-handle-close')
+      .length,
+    1,
+  );
+});
+for (const rawCooperativeReply of [
+  'null',
+  '{broken',
+  JSON.stringify({ id: '1', ok: true, result: true }),
+  JSON.stringify({ id: 1, ok: 1, result: true }),
+  JSON.stringify({ id: 1, ok: true, result: 1 }),
+  'X'.repeat(4097) + forbidden,
+]) {
+  test(`bounded cooperative reply rejects ${rawCooperativeReply.length > 4096 ? 'oversized private payload' : rawCooperativeReply}`, async () => {
+    const h = fixtureHarness({ cooperative: 'success', rawCooperativeReply });
+    const f = await h.create();
+    const error = await failure(() => f.close());
+    assert.ok(error);
+    assert.equal(
+      f
+        .diagnostics()
+        .events.filter((event) => event.phase === 'cooperative-shutdown')
+        .length,
+      1,
+    );
+    assert.ok(
+      !f
+        .diagnostics()
+        .events.some((event) => event.phase === 'cooperative-close'),
+    );
+    assert.equal(
+      h.operations.filter(
+        (item) => item[0] === 'cooperative-reply-handle-close',
+      ).length,
+      1,
+    );
+    safe(f.diagnostics());
+  });
+}
+test('short bounded reply read fails and closes its owned descriptor', async () => {
+  const h = fixtureHarness({ cooperative: 'success', shortReplyRead: true });
+  const f = await h.create();
+  await failure(() => f.close());
+  assert.equal(
+    h.operations.filter((item) => item[0] === 'cooperative-reply-handle-close')
+      .length,
+    1,
+  );
+  assert.ok(
+    !f
+      .diagnostics()
+      .events.some((event) => event.phase === 'cooperative-close'),
+  );
+});
+for (const operation of ['statError', 'readError']) {
+  test(`cooperative ${operation} and descriptor close failure retain both original errors in order`, async () => {
+    const primary = Error('ORIGINAL_DESCRIPTOR_READ_ERROR');
+    const secondary = Error('ORIGINAL_DESCRIPTOR_CLOSE_ERROR');
+    const h = fixtureHarness({
+      cooperative: 'success',
+      [operation]: primary,
+      descriptorCloseError: secondary,
+    });
+    const f = await h.create();
+    const error = await failure(() => f.close());
+    assert.deepEqual([...error.errors], [primary, secondary]);
+    assert.equal(error.errors[0], primary);
+    assert.equal(error.errors[1], secondary);
+    assert.equal(
+      h.operations.filter(
+        (item) => item[0] === 'cooperative-reply-handle-close',
+      ).length,
+      1,
+    );
+    assert.equal(h.operations.filter((item) => item[0] === 'rm').length, 1);
+    assert.ok(
+      !h.operations.some((item) =>
+        ['terminate', 'query', 'kill'].includes(item[0]),
+      ),
+    );
+    assert.ok(
+      !f
+        .diagnostics()
+        .events.some((event) => event.phase === 'cooperative-close'),
+    );
+    safe(f.diagnostics());
+  });
+}
+test('cooperative descriptor close-only failure retains the original close error', async () => {
+  const original = Error('ORIGINAL_DESCRIPTOR_CLOSE_ERROR');
+  const h = fixtureHarness({
+    cooperative: 'success',
+    descriptorCloseError: original,
+  });
+  const f = await h.create();
+  assert.equal(await failure(() => f.close()), original);
+  assert.equal(
+    h.operations.filter((item) => item[0] === 'cooperative-reply-handle-close')
+      .length,
+    1,
+  );
+  assert.ok(
+    !f
+      .diagnostics()
+      .events.some((event) => event.phase === 'cooperative-close'),
+  );
+});
+test('successful cooperative descriptor release happens once before qualification and removal', async () => {
+  const h = fixtureHarness({ cooperative: 'success' });
+  const f = await h.create();
+  await f.close();
+  const operations = h.operations.map((item) => item[0]);
+  assert.equal(
+    operations.filter((name) => name === 'cooperative-reply-handle-close')
+      .length,
+    1,
+  );
+  assert.ok(
+    operations.indexOf('cooperative-reply-handle-close') <
+      operations.indexOf('rm'),
+  );
+  assert.equal(
+    f
+      .diagnostics()
+      .events.filter((event) => event.phase === 'cooperative-close').length,
+    1,
+  );
+});
+test('cooperative close is idempotent and its receipt follows the physical close event', async () => {
+  const h = fixtureHarness({ cooperative: 'success' });
+  const f = await h.create();
+  await f.close();
+  await f.close();
+  assert.equal(
+    h.operations.filter((item) => item[0] === 'cooperative-write').length,
+    1,
+  );
+  const events = f.diagnostics().events;
+  const close = events.findIndex((event) => event.phase === 'close');
+  const receipt = events.findIndex(
+    (event) => event.phase === 'cooperative-close',
+  );
+  assert.ok(close >= 0 && receipt > close);
+  assert.ok(events[receipt].at >= events[close].at);
+  assert.deepEqual(Object.keys(events[receipt]).sort(), ['at', 'phase']);
+});
+test('cooperative request advances the existing task identity after a body RPC', async () => {
+  const h = fixtureHarness({ cooperative: 'success' });
+  const f = await h.create();
+  await failure(() => f.evaluate(() => true));
+  await f.close();
+  const packet = JSON.parse(h.writes.get('/FAKE/owned/task.json.tmp'));
+  assert.equal(packet.id, 2);
+  assert.equal(
+    f
+      .diagnostics()
+      .events.filter((event) => event.phase === 'cooperative-close').length,
+    1,
+  );
+});
+test('cooperative receipt does not recover removal failure', async () => {
+  const original = Error('REMOVE');
+  const h = fixtureHarness({ cooperative: 'success', rmError: original });
+  const f = await h.create();
+  assert.equal(await failure(() => f.close()), original);
+  assert.equal(
+    f
+      .diagnostics()
+      .events.filter((event) => event.phase === 'cooperative-close').length,
+    1,
+  );
+});
+test('existing generated handler publishes exact reply before scheduled exit', async () => {
+  const h = fixtureHarness({ cooperative: 'success' });
+  const fixture = await h.create();
+  await fixture.close();
+  const actualRequest = JSON.parse(h.writes.get('/FAKE/owned/task.json.tmp'));
+  const line = fixtureSource
+    .split('\n')
+    .find((value) => value.startsWith('fs.watchFile(taskPath'));
+  assert.ok(line);
+  const calls = [],
+    callbacks = [];
+  let observe;
+  const context = vm.createContext({
+    taskPath: '/FAKE/task.json',
+    owned: '/FAKE',
+    lastTask: 0,
+    path,
+    setImmediate: (fn) => callbacks.push(fn),
+    require: (name) => {
+      assert.equal(name, 'electron');
+      return { app: { exit: (code) => calls.push(['exit', code]) } };
+    },
+    fs: {
+      watchFile: (_target, _options, fn) => {
+        observe = fn;
+      },
+      existsSync: () => true,
+      readFileSync: () =>
+        JSON.stringify({
+          id: 17,
+          source: actualRequest.source,
+        }),
+      writeFileSync: (_name, body) => calls.push(['reply', JSON.parse(body)]),
+      renameSync: () => calls.push(['publish']),
+    },
+  });
+  vm.runInContext(line, context);
+  await observe();
+  assert.deepEqual(calls, [
+    ['reply', { id: 17, ok: true, result: true }],
+    ['publish'],
+  ]);
+  assert.equal(callbacks.length, 1);
+  callbacks[0]();
+  assert.deepEqual(calls.at(-1), ['exit', 0]);
+});
 test('close preserves initial termination and fallback PID errors without signaling', async () => {
   const initial = Error('INITIAL_TERMINATION_ERROR'),
     pidError = Error('PID_ERROR');
@@ -368,8 +806,11 @@ test('close preserves initial termination and fallback PID errors without signal
   const f = await h.create();
   h.launched.emit('close', null, null);
   const error = await failure(() => f.close());
-  assert.deepEqual([...error.errors], [initial, pidError]);
-  assert.deepEqual([...phases(error)], ['terminate', 'fallback-query']);
+  assert.deepEqual([...error.errors], [h.cooperativeError, initial, pidError]);
+  assert.deepEqual(
+    [...phases(error)],
+    ['cooperative-shutdown', 'terminate', 'fallback-query'],
+  );
   assert.ok(!h.operations.some((item) => item[0] === 'kill'));
   assert.equal(h.operations.filter((item) => item[0] === 'rm').length, 1);
   await f.close();
@@ -404,10 +845,13 @@ test('close signal/exit-wait and removal errors retain phase order', async () =>
     });
     const f = await h.create();
     const error = await failure(() => f.close());
-    assert.deepEqual([...error.errors], [initial, fallback, removal]);
+    assert.deepEqual(
+      [...error.errors],
+      [h.cooperativeError, initial, fallback, removal],
+    );
     assert.deepEqual(
       [...phases(error)],
-      ['terminate', 'fallback-signal-wait', 'remove'],
+      ['cooperative-shutdown', 'terminate', 'fallback-signal-wait', 'remove'],
     );
   }
 });
@@ -422,11 +866,12 @@ test('close wait failure skips removal and retains prior errors at unchanged 300
   assert.equal(h.timers.at(-1).ms, 3000);
   h.timers.at(-1).fn();
   const error = await rejected;
-  assert.equal(error.errors[0], initial);
-  assert.equal(error.errors[1], pidError);
+  assert.equal(error.errors[0], h.cooperativeError);
+  assert.equal(error.errors[1], initial);
+  assert.equal(error.errors[2], pidError);
   assert.deepEqual(
     [...phases(error)],
-    ['terminate', 'fallback-query', 'close-wait'],
+    ['cooperative-shutdown', 'terminate', 'fallback-query', 'close-wait'],
   );
   assert.ok(!h.operations.some((item) => item[0] === 'rm'));
 });
@@ -439,6 +884,7 @@ test('startup primary error survives cleanup rejection and stops capture', async
   assert.equal(h.launched.listenerCount('exit'), 0);
   assert.equal(h.launched.stderr.listenerCount('data'), 0);
   assert.ok(!h.operations.some((item) => item[0] === 'rm'));
+  assert.ok(!h.operations.some((item) => item[0] === 'cooperative-write'));
   safe(error.nativeDiagnostics);
 });
 test('query launcher death keeps exact outer assertion and original query failure', async () => {
@@ -673,7 +1119,10 @@ test('diagnostic getters and frozen thrown values cannot replace failures', asyn
   const f = await close.create();
   close.launched.emit('close', 0, null);
   const error = await failure(() => f.close());
-  assert.deepEqual([...error.errors], [proxy, original]);
+  assert.deepEqual(
+    [...error.errors],
+    [close.cooperativeError, proxy, original],
+  );
   safe(f.diagnostics());
   const host = hostHarness({ bodyError: proxy, cleanupError: original });
   assert.deepEqual([...(await failure(host.run)).errors], [proxy, original]);
@@ -908,7 +1357,11 @@ async function runPathFacade(defaultPath) {
     queueMicrotask,
   });
   vm.runInContext(source.slice(0, source.indexOf(marker)), context);
-  assert.equal(cases.length, 30, 'complete original pure-control pipeline');
+  assert.equal(
+    cases.length,
+    56,
+    'complete original and cooperative pure-control pipeline',
+  );
   const failed = [];
   for (const entry of cases) {
     try {
