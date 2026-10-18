@@ -16,6 +16,10 @@ export interface ScrobblerPluginConfig {
   /** Deprecated saved preference; use artistSource for an explicit choice. */
   alternativeArtist: boolean;
   artistSource?: 'primary' | 'first-tag';
+  regexFiltersEnabled?: boolean;
+  customRegexFilters?: string[];
+  useMusicBrainz?: boolean;
+  musicBrainzEmail?: string;
   scrobblers: {
     lastfm: CompatibleAccountConfig;
     librefm: CompatibleAccountConfig;
@@ -44,6 +48,10 @@ export const defaultConfig: ScrobblerPluginConfig = {
   alternativeTitles: true,
   alternativeArtist: false,
   artistSource: 'primary',
+  regexFiltersEnabled: false,
+  customRegexFilters: [],
+  useMusicBrainz: false,
+  musicBrainzEmail: '',
   scrobblers: {
     lastfm: {
       enabled: false,

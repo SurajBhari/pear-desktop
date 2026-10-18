@@ -1205,3 +1205,316 @@ test('Electron navigation details in the first argument retire only full main do
   expect(manager.services.get('lastfm')).not.toBe(original);
   manager.stop();
 });
+
+test('metadata is disabled by default and one frozen projection reaches all transports without changing SongInfo', async () => {
+  const f = await fixture();
+  expect(f.config.regexFiltersEnabled).toBe(false);
+  expect(f.config.customRegexFilters).toEqual([]);
+  expect(f.config.useMusicBrainz).toBe(false);
+  expect(f.config.musicBrainzEmail).toBe('');
+  for (const name of ['lastfm', 'librefm'])
+    f.config.scrobblers[name] = {
+      ...f.config.scrobblers.lastfm,
+      enabled: true,
+      sessionKey: 'session',
+    };
+  f.config.scrobblers.listenbrainz = {
+    enabled: true,
+    token: 'token',
+    apiRoot: 'https://listen.invalid/',
+  };
+  f.config.regexFiltersEnabled = true;
+  const gate = deferred();
+  let preparations = 0;
+  let aborted = false;
+  const manager = f.module.createScrobblerManager(f.context, {
+    metadata: {
+      prepare: (_input: any, _config: any, signal: AbortSignal) => {
+        preparations++;
+        signal.addEventListener('abort', () => {
+          aborted = true;
+        });
+        return gate.promise;
+      },
+      stop() {},
+    },
+  });
+  await manager.start();
+  const info = {
+    videoId: 'A',
+    title: 'Primary',
+    alternativeTitle: 'Alternative',
+    artist: 'Artist',
+    tags: ['Tag'],
+    album: 'Album',
+    songDuration: 120,
+    elapsedSeconds: 0,
+    isPaused: false,
+    mediaType: 'AUDIO',
+  };
+  const token = {};
+  f.boundary.currentProvenance = token;
+  f.boundary.provenance.set(info, token);
+  for (const cb of f.callbacks) cb(info, 'peard:video-src-changed');
+  await flush();
+  expect(preparations).toBe(1);
+  expect(f.calls).toHaveLength(0);
+  gate.resolve({
+    title: 'Prepared',
+    artist: 'Artist',
+    album: 'Album',
+    duration: 120,
+  });
+  await flush();
+  expect(f.calls).toHaveLength(3);
+  const timer: any = [...f.timers].find((t: any) => t.delay === 60000);
+  expect(timer).toBeTruthy();
+  info.elapsedSeconds = 60;
+  timer.fn();
+  await flush();
+  expect(f.calls).toHaveLength(6);
+  for (const call of f.calls) {
+    if (call.url.includes('listen.invalid'))
+      expect(
+        (
+          JSON.parse(call.options.body) as {
+            payload: { track_metadata: { track_name: string } }[];
+          }
+        ).payload[0].track_metadata.track_name,
+      ).toBe('Prepared');
+    else
+      expect(new URLSearchParams(call.options.body).get('track')).toBe(
+        'Prepared',
+      );
+  }
+  expect(info.title).toBe('Primary');
+  expect(info.alternativeTitle).toBe('Alternative');
+  expect(info.tags).toEqual(['Tag']);
+  expect(f.boundary.provenance.get(info)).toBe(token);
+  expect(aborted).toBe(true);
+  manager.stop();
+});
+
+test('metadata preparation cannot delay the admitted timer, publish after retirement or change frozen fallback', async () => {
+  const f = await fixture();
+  f.config.scrobblers.lastfm.sessionKey = 'session';
+  f.config.regexFiltersEnabled = true;
+  const pending: any[] = [];
+  const manager = f.module.createScrobblerManager(f.context, {
+    metadata: {
+      prepare: (_i: any, _c: any, signal: AbortSignal) => {
+        const gate = deferred();
+        pending.push({ gate, signal });
+        return gate.promise;
+      },
+      stop() {},
+    },
+  });
+  await manager.start();
+  const info = {
+    videoId: 'A',
+    title: 'Song',
+    artist: 'Artist',
+    songDuration: 120,
+    elapsedSeconds: 59,
+    isPaused: false,
+    mediaType: 'AUDIO',
+  };
+  const token = {};
+  f.boundary.currentProvenance = token;
+  f.boundary.provenance.set(info, token);
+  for (const cb of f.callbacks) cb(info, 'peard:video-src-changed');
+  await flush();
+  const timer: any = [...f.timers].find((t: any) => t.delay === 1000);
+  expect(timer).toBeTruthy();
+  info.elapsedSeconds = 60;
+  timer.fn();
+  await flush();
+  expect(f.calls).toHaveLength(2);
+  expect(pending[0].signal.aborted).toBe(true);
+  pending[0].gate.resolve({ title: 'Late', artist: 'Wrong', duration: 120 });
+  await flush();
+  for (const call of f.calls)
+    expect(new URLSearchParams(call.options.body).get('track')).toBe('Song');
+  const next = { ...info, elapsedSeconds: 0 };
+  const nextToken = {};
+  f.boundary.currentProvenance = nextToken;
+  f.boundary.provenance.set(next, nextToken);
+  for (const cb of f.callbacks) cb(next, 'peard:video-src-changed');
+  await flush();
+  manager.stop();
+  expect(pending[1].signal.aborted).toBe(true);
+  pending[1].gate.resolve({ title: 'Retired', artist: 'Wrong', duration: 120 });
+  await flush();
+  expect(f.calls).toHaveLength(2);
+});
+
+test('metadata menu requires explicit consent, writes leaves and fences stale contact prompts', async () => {
+  const f = await fixture();
+  let menu = await f.module.onMenu(f.context);
+  const entry = (key: string) =>
+    menu.find((item: any) => item.label === 'plugins.scrobbler.menu.' + key);
+  f.boundary.prompt = async () => 'person@example.invalid';
+  const item = { checked: true };
+  expect(entry('use-musicbrainz')).toBeTruthy();
+  await entry('use-musicbrainz').click(item);
+  expect(f.writes).toEqual([
+    { musicBrainzEmail: 'person@example.invalid', useMusicBrainz: true },
+  ]);
+  const gate = deferred();
+  f.boundary.prompt = () => gate.promise;
+  menu = await f.module.onMenu(f.context);
+  const pending = entry('musicbrainz-email').click();
+  await flush();
+  f.config.musicBrainzEmail = 'newer@example.invalid';
+  gate.resolve('stale@example.invalid');
+  await pending;
+  expect(f.config.musicBrainzEmail).toBe('newer@example.invalid');
+  expect(f.writes).toHaveLength(1);
+  f.boundary.prompt = async () => '';
+  menu = await f.module.onMenu(f.context);
+  await entry('musicbrainz-email').click();
+  expect(f.writes.at(-1)).toEqual({
+    musicBrainzEmail: '',
+    useMusicBrainz: false,
+  });
+});
+
+test('real isolated cleanup uses a preference snapshot and leaves provider metadata intact', async () => {
+  const f = await fixture();
+  f.config.scrobblers.lastfm.sessionKey = 'session';
+  f.config.regexFiltersEnabled = true;
+  f.config.customRegexFilters = ['\\s\\(Official Video\\)$'];
+  f.boundary.fetcher = async (url: string, options: any) => {
+    f.calls.push({ url, options });
+    return Response.json(
+      url.startsWith('https://musicbrainz.org/') ? { recordings: [] } : {},
+    );
+  };
+  const manager = f.module.createScrobblerManager(f.context);
+  await manager.start();
+  const info = {
+    videoId: 'A',
+    title: 'Песня (Live) (Official Video)',
+    artist: 'Artist feat. Guest',
+    songDuration: 120,
+    elapsedSeconds: 0,
+    isPaused: false,
+    mediaType: 'AUDIO',
+  };
+  const token = {};
+  f.boundary.currentProvenance = token;
+  f.boundary.provenance.set(info, token);
+  for (const cb of f.callbacks) cb(info, 'peard:video-src-changed');
+  f.config.useMusicBrainz = true;
+  f.config.musicBrainzEmail = 'changed@example.invalid';
+  await expect
+    .poll(
+      () =>
+        f.calls.filter((call: any) => !call.url.includes('musicbrainz.org'))
+          .length,
+    )
+    .toBe(1);
+  expect(
+    f.calls.filter((call: any) => call.url.includes('musicbrainz.org')),
+  ).toHaveLength(0);
+  const body = new URLSearchParams(f.calls[0].options.body);
+  expect(body.get('track')).toBe('Песня (Live)');
+  expect(body.get('artist')).toBe('Artist feat. Guest');
+  expect(info.title).toBe('Песня (Live) (Official Video)');
+  manager.stop();
+});
+
+test('malformed prepared metadata fails closed without escaping the boolean transport contract', async () => {
+  const f = await fixture();
+  f.config.scrobblers.lastfm.sessionKey = 'session';
+  const service = f.module.createLastFmService(f.runtime, f.dependencies);
+  await expect(
+    service.setNowPlaying(
+      { title: 'Song', artist: 'Artist', songDuration: 120 },
+      f.config,
+      {
+        signal: new AbortController().signal,
+        isCurrent: () => true,
+        metadata: null,
+      },
+    ),
+  ).resolves.toBe(false);
+  expect(f.calls).toHaveLength(0);
+  service.stop();
+});
+
+test('MusicBrainz split correction carries independent original duration through the real metadata layer', async () => {
+  const f = await fixture();
+  f.config.scrobblers.lastfm.sessionKey = 'session';
+  f.config.useMusicBrainz = true;
+  f.config.musicBrainzEmail = 'person@example.invalid';
+  let lookups = 0;
+  f.boundary.fetcher = async (url: string, options: any) => {
+    f.calls.push({ url, options });
+    if (url.startsWith('https://musicbrainz.org/'))
+      return Response.json({
+        recordings:
+          ++lookups === 1
+            ? []
+            : [
+                {
+                  title: 'Песня (Live)',
+                  score: 100,
+                  length: 180000,
+                  'artist-credit': [
+                    { name: 'Artist', joinphrase: ' & ' },
+                    { name: 'Guest' },
+                  ],
+                },
+              ],
+      });
+    return Response.json({});
+  };
+  const manager = f.module.createScrobblerManager(f.context);
+  await manager.start();
+  const info = {
+    videoId: 'A',
+    title: 'Artist & Guest - Песня (Live)',
+    artist: 'Upload Channel',
+    album: 'Album',
+    url: 'https://music.youtube.com/watch?v=A',
+    songDuration: 180,
+    elapsedSeconds: 0,
+    isPaused: false,
+    mediaType: 'AUDIO',
+  };
+  const token = {};
+  f.boundary.currentProvenance = token;
+  f.boundary.provenance.set(info, token);
+  for (const cb of f.callbacks) cb(info, 'peard:video-src-changed');
+  await expect
+    .poll(
+      () =>
+        f.calls.filter((call: any) => !call.url.includes('musicbrainz.org'))
+          .length,
+    )
+    .toBe(1);
+  expect(lookups).toBe(2);
+  const timer: any = [...f.timers].find((t: any) => t.delay === 90000);
+  expect(timer).toBeTruthy();
+  info.elapsedSeconds = 90;
+  timer.fn();
+  await flush();
+  const sent = f.calls.filter(
+    (call: any) => !call.url.includes('musicbrainz.org'),
+  );
+  expect(sent).toHaveLength(2);
+  for (const call of sent) {
+    const body = new URLSearchParams(call.options.body);
+    expect(body.get('track')).toBe('Песня (Live)');
+    expect(body.get('artist')).toBe('Artist & Guest');
+    expect(body.get('duration')).toBe('180');
+    expect(body.get('album')).toBe('Album');
+  }
+  expect(info.title).toBe('Artist & Guest - Песня (Live)');
+  expect(info.artist).toBe('Upload Channel');
+  expect(info.songDuration).toBe(180);
+  expect(f.boundary.provenance.get(info)).toBe(token);
+  manager.stop();
+});

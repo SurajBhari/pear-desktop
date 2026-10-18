@@ -6,7 +6,15 @@ import {
   writeFile,
   rename,
 } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -318,6 +326,7 @@ function nativeDiagnostics(child?: ChildProcess) {
             'query',
             'launcher-validation',
             'owned-query-close',
+            'cooperative-shutdown',
           ].includes(label)
         )
           return;
@@ -368,6 +377,9 @@ function nativeDiagnostics(child?: ChildProcess) {
     },
     task(facts: ErrorFacts | undefined) {
       if (!stopped && facts && taskRecords.length < 32) taskRecords.push(facts);
+    },
+    cooperativeClose() {
+      record({ phase: 'cooperative-close', at: elapsed() });
     },
     snapshot: () => finalSnapshot ?? snapshot(),
     stop() {
@@ -451,19 +463,21 @@ app.on('browser-window-created',(_event,win)=>{created.push(win);globalThis.Auth
   const env = { ...process.env, PEAR_TEST_STARTUP_FACTS: facts };
   delete env.ELECTRON_RUN_AS_NODE;
   let app: Awaited<ReturnType<typeof electron.launch>> | undefined;
-  let processClosed: Promise<void> | undefined;
+  let processClosed:
+    | Promise<{ code: number | null; signal: string | null }>
+    | undefined;
   let diagnostics: ReturnType<typeof nativeDiagnostics> | undefined;
-  const waitForProcessClose = async () => {
+  const waitForProcessClose = async (budget = 3000) => {
     if (!processClosed) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([
+      return await Promise.race([
         processClosed,
         new Promise<never>((_, reject) => {
           timer = setTimeout(
             () =>
               reject(Error('Owned auth fixture process close budget expired')),
-            3000,
+            budget,
           );
         }),
       ]);
@@ -492,7 +506,7 @@ app.on('browser-window-created',(_event,win)=>{created.push(win);globalThis.Auth
       }),
     );
     processClosed = new Promise((resolve) =>
-      child.once('close', () => resolve()),
+      child.once('close', (code, signal) => resolve({ code, signal })),
     );
     const startup = await waitForStartupFacts(child, facts);
     await assertStartupFacts(child, startup, profile);
@@ -562,27 +576,120 @@ app.on('browser-window-created',(_event,win)=>{created.push(win);globalThis.Auth
         try {
           try {
             if (child.exitCode === null && child.signalCode === null) {
+              let cooperativeFailure: unknown;
+              let cooperativeFailed = false;
+              const deadline = performance.now() + 3000;
+              const remaining = () => {
+                const budget = deadline - performance.now();
+                if (budget <= 0)
+                  throw Error(
+                    'Owned auth fixture cooperative deadline expired',
+                  );
+                return budget;
+              };
               try {
-                await terminateStartupProcess(child);
-              } catch (error) {
-                retain('terminate', error);
-                if (child.exitCode === null && child.signalCode === null) {
-                  let pid: number;
+                const id = ++nextTask;
+                const target = path.join(directory, 'task.json');
+                remaining();
+                writeFileSync(
+                  target + '.tmp',
+                  JSON.stringify({
+                    id,
+                    source:
+                      '({app})=>{setImmediate(()=>app.exit(0));return true;}',
+                  }),
+                );
+                remaining();
+                renameSync(target + '.tmp', target);
+                const outcome = await waitForProcessClose(remaining());
+                remaining();
+                if (outcome?.code !== 0 || outcome.signal !== null)
+                  throw Error(
+                    'Owned auth fixture cooperative exit was not clean',
+                  );
+                const replyHandle = openSync(
+                  path.join(directory, 'result.json'),
+                  'r',
+                );
+                let reply: string;
+                let replyFailed = false;
+                let replyFailure: unknown;
+                try {
+                  const size = fstatSync(replyHandle).size;
+                  if (!Number.isSafeInteger(size) || size < 1 || size > 4096)
+                    throw Error(
+                      'Owned auth fixture cooperative reply size was invalid',
+                    );
+                  const bytes = Buffer.alloc(size);
+                  if (readSync(replyHandle, bytes, 0, size, 0) !== size)
+                    throw Error(
+                      'Owned auth fixture cooperative reply was incomplete',
+                    );
+                  reply = bytes.toString('utf8');
+                } catch (error) {
+                  replyFailed = true;
+                  replyFailure = error;
+                  throw error;
+                } finally {
                   try {
-                    pid = await nativeStartupPid(child);
+                    closeSync(replyHandle);
                   } catch (error) {
-                    retain('fallback-query', error);
+                    if (replyFailed)
+                      throw phaseFailure(
+                        [
+                          {
+                            phase: 'cooperative-shutdown',
+                            error: replyFailure,
+                          },
+                          { phase: 'cooperative-shutdown', error },
+                        ],
+                        'Owned auth fixture reply read and close failed',
+                      );
                     throw error;
                   }
-                  try {
-                    const exited = once(child, 'exit', {
-                      signal: AbortSignal.timeout(1000),
-                    });
-                    process.kill(pid, 'SIGKILL');
-                    await exited;
-                  } catch (error) {
-                    retain('fallback-signal-wait', error);
-                    throw error;
+                }
+                remaining();
+                const packet = JSON.parse(reply);
+                if (
+                  packet?.id !== id ||
+                  packet?.ok !== true ||
+                  packet?.result !== true
+                )
+                  throw Error(
+                    'Owned auth fixture cooperative reply was invalid',
+                  );
+                remaining();
+                diagnostics?.cooperativeClose();
+              } catch (error) {
+                cooperativeFailed = true;
+                cooperativeFailure = error;
+                retain('cooperative-shutdown', error);
+              }
+              if (cooperativeFailed) {
+                if (child.exitCode !== null || child.signalCode !== null)
+                  throw cooperativeFailure;
+                try {
+                  await terminateStartupProcess(child);
+                } catch (error) {
+                  retain('terminate', error);
+                  if (child.exitCode === null && child.signalCode === null) {
+                    let pid: number;
+                    try {
+                      pid = await nativeStartupPid(child);
+                    } catch (error) {
+                      retain('fallback-query', error);
+                      throw error;
+                    }
+                    try {
+                      const exited = once(child, 'exit', {
+                        signal: AbortSignal.timeout(1000),
+                      });
+                      process.kill(pid, 'SIGKILL');
+                      await exited;
+                    } catch (error) {
+                      retain('fallback-signal-wait', error);
+                      throw error;
+                    }
                   }
                 }
               }

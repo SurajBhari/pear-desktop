@@ -13,6 +13,35 @@ export interface ServiceRuntime {
 export interface SubmissionOwner {
   signal: AbortSignal;
   isCurrent: () => boolean;
+  metadata?: ProjectedSong;
+}
+export type ProjectedSong = {
+  title: string;
+  artist: string;
+  duration: number;
+  album?: string;
+};
+export const hasControls = (value: string) =>
+  Array.from(value).some(
+    (character) =>
+      character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+  );
+export function readProjectedSong(value: unknown): ProjectedSong | undefined {
+  if (!value || typeof value !== 'object') return;
+  const fields = value as Record<string, unknown>;
+  if (
+    typeof fields.title !== 'string' ||
+    typeof fields.artist !== 'string' ||
+    !fields.artist.trim() ||
+    fields.artist.length > 4096 ||
+    hasControls(fields.artist) ||
+    typeof fields.duration !== 'number' ||
+    !Number.isFinite(fields.duration) ||
+    fields.duration < 0 ||
+    (fields.album !== undefined && typeof fields.album !== 'string')
+  )
+    return;
+  return value as ProjectedSong;
 }
 export abstract class ScrobblerBase {
   abstract readonly fingerprint: string;
@@ -31,7 +60,10 @@ export abstract class ScrobblerBase {
     owner: SubmissionOwner,
   ): Promise<boolean>;
 }
-export function projectSong(info: SongInfo, config: ScrobblerPluginConfig) {
+export function projectSong(
+  info: SongInfo,
+  config: ScrobblerPluginConfig,
+): ProjectedSong | undefined {
   if (info.tags !== undefined && !Array.isArray(info.tags)) return;
   const title =
     config.alternativeTitles && info.alternativeTitle !== undefined

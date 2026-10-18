@@ -3,6 +3,7 @@ import { net } from 'electron';
 import {
   ScrobblerBase,
   projectSong,
+  readProjectedSong,
   type ServiceRuntime,
   type SubmissionOwner,
 } from './base';
@@ -162,7 +163,10 @@ export class CompatibleScrobbler extends ScrobblerBase {
     )
       return false;
     const account = this.capture(),
-      song = projectSong(info, config);
+      song =
+        owner.metadata === undefined
+          ? projectSong(info, config)
+          : readProjectedSong(owner.metadata);
     if (!account?.key || !song || owner.signal.aborted) return false;
     const scope = new AbortController();
     this.requests.add(scope);
