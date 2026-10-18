@@ -16,7 +16,8 @@ type ContextLoader = (mode: Mode) => {
   load: { handler: (id: string) => { code: string } };
 };
 const root = fileURLToPath(new URL('..', import.meta.url));
-const entry = normalizePath(join(root, 'src/plugins/visualizer/index.ts'));
+const rawEntry = join(root, 'src/plugins/visualizer/index.ts');
+const entry = normalizePath(rawEntry);
 const loaderPath = join(root, 'vite-plugins/plugin-loader.mts');
 const marker = 'SYNTHETIC_VISUALIZER_BROWSER_BOUNDARY';
 const stubs: Record<string, string> = {
@@ -28,6 +29,31 @@ const stubs: Record<string, string> = {
   './visualizers/visualizer': 'export class Visualizer{};',
 };
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+
+function createClosedCompilerPlugin(
+  rawEntry: string,
+  entry: string,
+  transformed: string,
+  seen: string[],
+) {
+  return {
+    name: 'closed-visualizer-context-boundary',
+    enforce: 'pre' as const,
+    resolveId(id: string) {
+      seen.push(id);
+      if (id === rawEntry || id === entry) return entry;
+      if (Object.hasOwn(stubs, id)) return '\0stub:' + id;
+      if (id === 'node:module') return { id, external: true };
+      throw new Error('Unexpected compiler dependency: ' + id);
+    },
+    load(id: string) {
+      if (id === rawEntry || id === entry) return transformed;
+      if (id.startsWith('\0stub:') && Object.hasOwn(stubs, id.slice(6)))
+        return stubs[id.slice(6)];
+      throw new Error('Unexpected compiler module: ' + id);
+    },
+  };
+}
 
 function contextSource(mode: Mode, source: string): string {
   const loaderSource = stripTypeScriptTypes(
@@ -90,23 +116,7 @@ for (const mode of ['backend', 'preload', 'none', 'renderer'] as const) {
         cacheDir: join(fixtureRoot, 'cache'),
         logLevel: 'silent',
         plugins: [
-          {
-            name: 'closed-visualizer-context-boundary',
-            enforce: 'pre',
-            resolveId(id) {
-              seen.push(id);
-              if (id === entry) return entry;
-              if (Object.hasOwn(stubs, id)) return '\0stub:' + id;
-              if (id === 'node:module') return { id, external: true };
-              throw new Error('Unexpected compiler dependency: ' + id);
-            },
-            load(id) {
-              if (id === entry) return transformed;
-              if (id.startsWith('\0stub:') && Object.hasOwn(stubs, id.slice(6)))
-                return stubs[id.slice(6)];
-              throw new Error('Unexpected compiler module: ' + id);
-            },
-          },
+          createClosedCompilerPlugin(rawEntry, entry, transformed, seen),
         ],
         build: {
           lib: { entry, formats: ['es'], fileName: 'context' },
@@ -215,3 +225,67 @@ for (const mode of ['backend', 'preload', 'none', 'renderer'] as const) {
     }
   });
 }
+
+test('closed compiler handlers accept only exact raw and canonical Windows entry IDs', () => {
+  const raw = String.raw`D:\a\pear-desktop\pear-desktop\src\plugins\visualizer\index.ts`;
+  const canonical =
+    'D:/a/pear-desktop/pear-desktop/src/plugins/visualizer/index.ts';
+  const transformed = 'OWNED_TRANSFORMED_ENTRY_DATA';
+  const seen: string[] = [];
+  // These are data inputs to the same handlers used by the actual compiler
+  // pipeline above. No synthetic Windows file is opened or compiled.
+  const plugin = createClosedCompilerPlugin(raw, canonical, transformed, seen);
+  const attempt = (call: () => unknown) => {
+    try {
+      return { ok: true, value: call() };
+    } catch {
+      return { ok: false };
+    }
+  };
+  const actual = [raw, canonical].map((id) => ({
+    id,
+    resolved: attempt(() => plugin.resolveId(id)),
+    loaded: attempt(() => plugin.load(id)),
+  }));
+  assert.deepEqual(
+    actual,
+    [raw, canonical].map((id) => ({
+      id,
+      resolved: { ok: true, value: canonical },
+      loaded: { ok: true, value: transformed },
+    })),
+    'Both actual handlers must admit the two exact entry spellings',
+  );
+  for (const [id, body] of Object.entries(stubs)) {
+    assert.equal(plugin.resolveId(id), '\0stub:' + id);
+    assert.equal(plugin.load('\0stub:' + id), body);
+  }
+  assert.deepEqual(plugin.resolveId('node:module'), {
+    id: 'node:module',
+    external: true,
+  });
+  const unknown = [
+    raw.replace('visualizer\\index.ts', 'visualizer-other\\index.ts'),
+    canonical.replace('/visualizer/', '/visualizer-other/'),
+    'src/plugins/visualizer/index.ts',
+    './src/plugins/visualizer/index.ts',
+    raw + '?v=1',
+    canonical + '?v=1',
+    raw + '.backup',
+    canonical + '.backup',
+    canonical + '/child',
+    'D:/unrelated/index.ts',
+    '@/unknown',
+    '\0stub:unknown',
+  ];
+  for (const id of unknown) {
+    assert.throws(() => plugin.resolveId(id), /Unexpected compiler dependency/);
+    assert.throws(() => plugin.load(id), /Unexpected compiler module/);
+  }
+  assert.throws(() => plugin.load('node:module'), /Unexpected compiler module/);
+  assert.equal(
+    seen[0],
+    raw,
+    'Resolver observations retain the original requested ID',
+  );
+});
