@@ -51,6 +51,15 @@ let generation = 0;
 let nextAttempt = 0;
 let running = false;
 let currentVideoId: string | null = null;
+const maxSearchCacheEntries = 32;
+const touchSearchCache = (videoId: string, cache: SearchCache) => {
+  searchCache.delete(videoId);
+  searchCache.set(videoId, cache);
+  for (const key of searchCache.keys()) {
+    if (searchCache.size <= maxSearchCacheEntries) break;
+    if (key !== currentVideoId) searchCache.delete(key);
+  }
+};
 
 export const stopLyricsSession = () => {
   running = false;
@@ -124,6 +133,7 @@ export const fetchLyrics = (info: SongInfo) => {
   const previous = searchCache.get(info.videoId);
   if (previous?.state === 'done') {
     if (getSongInfo().videoId !== info.videoId) return;
+    touchSearchCache(info.videoId, previous);
     const changed = previous.ytMusicWithoutProxy !== ytMusicWithoutProxy();
     if (changed) {
       previous.ytMusicWithoutProxy = ytMusicWithoutProxy();
@@ -149,7 +159,7 @@ export const fetchLyrics = (info: SongInfo) => {
     data: initialData(),
     ytMusicWithoutProxy: ytMusicWithoutProxy(),
   };
-  searchCache.set(info.videoId, cache);
+  touchSearchCache(info.videoId, cache);
   if (getSongInfo().videoId === info.videoId)
     setLyricsStore('lyrics', initialData());
   Promise.allSettled(

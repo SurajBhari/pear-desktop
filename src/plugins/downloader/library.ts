@@ -390,6 +390,14 @@ export async function scanLibrary(
     }
   };
   const index = await readIndex(canonical, () => validateChain(rootChain));
+  const byPath = new Map<string, LibraryRecord>();
+  const bySize = new Map<number, LibraryRecord[]>();
+  for (const record of index.records) {
+    if (!byPath.has(record.path)) byPath.set(record.path, record);
+    const bucket = bySize.get(record.size);
+    if (bucket) bucket.push(record);
+    else bySize.set(record.size, [record]);
+  }
   const report: LibraryReport = {
     files: [],
     errors: index.errors,
@@ -480,7 +488,7 @@ export async function scanLibrary(
       report.visited++;
       const relative = path.relative(canonical, full).split(path.sep).join('/');
       seen.add(relative);
-      const record = index.records.find((r) => r.path === relative);
+      const record = byPath.get(relative);
       const row: LibraryFile = {
         path: relative,
         size: size,
@@ -515,7 +523,7 @@ export async function scanLibrary(
           report.truncated = true;
         }
       } else {
-        for (const previous of index.records.filter((r) => r.size === size)) {
+        for (const previous of bySize.get(size) ?? []) {
           if (size > budget) {
             report.truncated = true;
             break;
