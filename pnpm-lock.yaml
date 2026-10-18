@@ -12,7 +12,7 @@ overrides:
   node-fetch: 3.3.2
   '@electron/universal': 3.0.4
   '@babel/runtime': 8.0.0
-  '@xmldom/xmldom@<0.8.12': 0.8.13
+  '@xmldom/xmldom@<0.8.15': 0.8.15
 
 patchedDependencies:
   '@malept/flatpak-bundler@0.4.0': c787371eeb2af011ea934e8818a0dad6d7dcb2df31bbb1686babc7231af0183c
@@ -1617,8 +1617,8 @@ packages:
     resolution: {integrity: sha512-ff0uEXuibh9wi+l4vOj7xInLUjtlTaQBje/SCyQkeXZ0j2V0y+Zge5PQIQFRHH9TjjGaYJkTofEcQhncM2q7/w==}
     engines: {node: '>=20'}
 
-  '@xmldom/xmldom@0.8.13':
-    resolution: {integrity: sha512-KRYzxepc14G/CEpEGc3Yn+JKaAeT63smlDr+vjB8jRfgTBBI9wRj/nkQEO+ucV8p8I9bfKLWp37uHgFrbntPvw==}
+  '@xmldom/xmldom@0.8.15':
+    resolution: {integrity: sha512-/5NV/vDALVFDXgLmfsy9TRCBlKwO2LNBFzpzvb9iIj+jR+eSc6DLYYvVOdivT/jm7MtU6TebYuRmzEOI7w40UA==}
     engines: {node: '>=10.0.0'}
 
   '@zeit/schemas@2.36.0':
@@ -5237,7 +5237,7 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@xmldom/xmldom@0.8.13': {}
+  '@xmldom/xmldom@0.8.15': {}
 
   '@zeit/schemas@2.36.0': {}
 
@@ -7102,7 +7102,7 @@ snapshots:
 
   plist@3.1.0:
     dependencies:
-      '@xmldom/xmldom': 0.8.13
+      '@xmldom/xmldom': 0.8.15
       base64-js: 1.5.1
       xmlbuilder: 15.1.1
 
