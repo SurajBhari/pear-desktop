@@ -7,7 +7,11 @@ import { createPlugin, createBackend } from '@/utils';
 import { registerOwnedGlobalShortcut } from '@/utils/global-shortcut-owner';
 
 import { overrideListener } from './override';
-import { onConfigChange, onPlayerApiReady } from './renderer';
+import {
+  onConfigChange,
+  onPlayerApiReady,
+  stop as stopRenderer,
+} from './renderer';
 import hudStyle from './volume-hud.css?inline';
 
 export type PreciseVolumePluginConfig = {
@@ -324,5 +328,6 @@ export default createPlugin({
     },
     onPlayerApiReady,
     onConfigChange,
+    stop: stopRenderer,
   },
 });
