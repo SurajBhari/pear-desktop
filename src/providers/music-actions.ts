@@ -320,12 +320,18 @@ export function dispatchMusicControl(
   }
   let target: () => unknown;
   let after: (() => void) | undefined;
-  if (command.action === 'previous' || command.action === 'next')
-    target = bound(
-      node(`.${command.action}-button.ytmusic-player-bar`)!,
-      'click',
-    );
-  else if (command.action === 'play' || command.action === 'pause')
+  if (command.action === 'previous' || command.action === 'next') {
+    // New YouTube Music controls no longer expose the legacy player-bar buttons.
+    // Keep both the absent node and selected API method in the ownership fence.
+    // Adapted from pear-devs/pear-desktop#4750 by @adriellpz.
+    const button = node(`.${command.action}-button.ytmusic-player-bar`, true);
+    target = button
+      ? bound(button, 'click')
+      : bound(
+          api,
+          command.action === 'previous' ? 'previousVideo' : 'nextVideo',
+        );
+  } else if (command.action === 'play' || command.action === 'pause')
     target = bound(api, command.action === 'play' ? 'playVideo' : 'pauseVideo');
   else if (command.action === 'toggle_playback') {
     const state = bound(api, 'getPlayerState')();

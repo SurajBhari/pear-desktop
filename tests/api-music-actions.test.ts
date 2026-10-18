@@ -103,6 +103,16 @@ test.beforeAll(async () => {
         'async function onApiLoaded() {'.length,
       core.indexOf('  // Workaround for macOS traffic lights'),
     );
+    const navigationStart = core.indexOf(
+      "  window.ipcRenderer.on('peard:previous-video'",
+    );
+    const navigationEnd = core.indexOf(
+      "  window.ipcRenderer.on('peard:play'",
+      navigationStart,
+    );
+    expect(navigationStart).toBeGreaterThan(0);
+    expect(navigationEnd).toBeGreaterThan(navigationStart);
+    const navigationHandlers = core.slice(navigationStart, navigationEnd);
     await writeFile(
       entry,
       [
@@ -113,6 +123,7 @@ test.beforeAll(async () => {
         `import {createRepeatPreference} from ${JSON.stringify(path.join(root, 'src/providers/repeat-preference.ts'))};`,
         `import {createPlaylistQueueController} from ${JSON.stringify(path.join(root, 'src/providers/queue-playlist-renderer.ts'))};`,
         `let api,repeatPreference,playlistQueue,disposeMusicActionsOwner; export function initializeCore(next){api=next;${coreInit};return{repeatPreference,playlistQueue,disposeMusicActionsOwner};}`,
+        `export function registerLegacyNavigation(){${navigationHandlers}}`,
       ].join('\n'),
     );
     await build({
@@ -1747,3 +1758,105 @@ test('C9-MR-2 unsupported non-DOM bridge publication does not throw or admit new
     f.close();
   }
 });
+
+// Adapted from pear-devs/pear-desktop#4750 by @adriellpz.
+// Exercise actual registered core handlers and the owned native C9 controller.
+for (const action of ['previous', 'next'] as const) {
+  test(`player UI ${action}: C9 uses captured API without legacy controls`, async () => {
+    const f = actionsFixture();
+    try {
+      f.bar.remove();
+      f.api[action + 'Video'] = function (...args: unknown[]) {
+        f.calls.push({ name: action, receiver: this, args });
+      };
+      expect(await f.control({ action })).toEqual({
+        ok: true,
+        value: { version: 1, phase: 'owned_control_dispatch' },
+      });
+      expect(f.calls.map((c: any) => c.name)).toEqual(['guard', action]);
+      expect(f.calls[1].receiver).toBe(f.api);
+      expect(f.calls[1].args).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test(`player UI ${action}: actual legacy IPC prefers button and falls back to API`, () => {
+    for (const legacy of [true, false]) {
+      const f = actionsFixture();
+      try {
+        const handlers = new Map<string, () => void>();
+        f.w.ipcRenderer.on = (channel: string, callback: () => void) =>
+          handlers.set(channel, callback);
+        f.api[action + 'Video'] = function (...args: unknown[]) {
+          f.calls.push({ name: action, receiver: this, args });
+        };
+        const button = f.doc.querySelector('.' + action + '-button');
+        if (!legacy) f.bar.remove();
+        source.registerLegacyNavigation();
+        const handler = handlers.get('peard:' + action + '-video');
+        expect(handler).toBeDefined();
+        handler!();
+        expect(f.calls.map((c: any) => c.name)).toEqual(['guard', action]);
+        expect(f.calls[1].receiver).toBe(legacy ? button : f.api);
+        expect(f.calls[1].args).toEqual([]);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
+  test(`player UI ${action}: C9 absent API stays unavailable without dispatch`, async () => {
+    const f = actionsFixture();
+    try {
+      f.bar.remove();
+      expect(await f.control({ action })).toEqual({
+        ok: true,
+        value: {
+          version: 1,
+          phase: 'pre_effect_denial',
+          reason: 'unavailable',
+        },
+      });
+      expect(f.calls).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test(`player UI ${action}: C9 captured fallback rejects reentrant replacement`, async () => {
+    for (const mode of ['button', 'method', 'owner', 'playback'] as const) {
+      const f = actionsFixture();
+      try {
+        f.bar.remove();
+        const method = action + 'Video';
+        f.api[method] = function () {
+          f.calls.push({ name: action, receiver: this, args: [] });
+        };
+        f.w.blockerSceneGuard.cancelFromUser = () => {
+          f.calls.push({ name: 'guard' });
+          if (mode === 'button') {
+            const button = f.doc.createElement('button');
+            button.className = action + '-button ytmusic-player-bar';
+            button.click = () => {
+              f.calls.push({ name: 'replacement-button' });
+            };
+            f.doc.body.append(button);
+          } else if (mode === 'method') {
+            f.api[method] = () => {
+              f.calls.push({ name: 'replacement-method' });
+            };
+          } else if (mode === 'owner') f.replaceApi();
+          else f.setVideo('replaced001');
+        };
+        expect(await f.control({ action })).toEqual({
+          ok: false,
+          reason: 'retired',
+        });
+        expect(f.calls.map((c: any) => c.name)).toEqual(['guard']);
+      } finally {
+        f.close();
+      }
+    }
+  });
+}
