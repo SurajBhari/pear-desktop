@@ -53,7 +53,10 @@ test('the actual translated 20-band editor fits desktop and narrow viewports wit
     });
     const close = page.getByRole('dialog').locator('header button').first();
     const bounds = await close.boundingBox();
-    expect(bounds, `${name}: close button must have a rendered box`).not.toBeNull();
+    expect(
+      bounds,
+      `${name}: close button must have a rendered box`,
+    ).not.toBeNull();
     if (!bounds) throw new Error('Close button is not rendered');
     expect(bounds.x).toBeGreaterThanOrEqual(0);
     expect(bounds.y).toBeGreaterThanOrEqual(0);
@@ -96,17 +99,26 @@ test('the actual translated 20-band editor fits desktop and narrow viewports wit
   const automatic = page.getByLabel('Automatic preamp', { exact: true });
   await expect(automatic).not.toBeChecked();
   await automatic.check();
-  const firstGain = page.locator('.eq-band').first().locator('input[type="number"]');
+  const firstGain = page
+    .locator('.eq-band')
+    .first()
+    .locator('input[type="number"]');
   await firstGain.fill('8');
   await expect(automatic).toBeChecked();
-  await expect(page.locator('.eq-response output')).toContainText('Applied preamp: -8.1 dB');
+  await expect(page.locator('.eq-response output')).toContainText(
+    'Applied preamp: -8.1 dB',
+  );
   await page.getByLabel('Preamp (dB)', { exact: true }).fill('-4');
   await expect(automatic).not.toBeChecked();
-  await expect(page.locator('.eq-response output')).toContainText('Applied preamp: -4.0 dB');
+  await expect(page.locator('.eq-response output')).toContainText(
+    'Applied preamp: -4.0 dB',
+  );
   await automatic.check();
   await page.getByLabel('Preset', { exact: true }).selectOption('flat');
   await expect(automatic).toBeChecked();
-  await expect(page.locator('.eq-response output')).toContainText('Applied preamp: 0.0 dB');
+  await expect(page.locator('.eq-response output')).toContainText(
+    'Applied preamp: 0.0 dB',
+  );
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await page.evaluate(() =>

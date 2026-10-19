@@ -29,7 +29,10 @@ export class EqualizerResponseSampler {
 
   constructor(private context: BaseAudioContext) {}
 
-  sample(bands: readonly EqualizerBand[], manualPreamp: number): FilterResponse {
+  sample(
+    bands: readonly EqualizerBand[],
+    manualPreamp: number,
+  ): FilterResponse {
     const nyquist = this.context.sampleRate / 2;
     if (
       !Number.isFinite(nyquist) ||
@@ -45,8 +48,7 @@ export class EqualizerResponseSampler {
     };
     // Both scales cover shelf/pass transitions and peaks outside the audible graph range.
     const lower = Math.min(1, nyquist / 1000);
-    for (let i = 0; i < 384; i++)
-      add(lower * (nyquist / lower) ** (i / 383));
+    for (let i = 0; i < 384; i++) add(lower * (nyquist / lower) ** (i / 383));
     for (let i = 1; i < 128; i++) add((nyquist * i) / 128);
     for (const [i, band] of bands.entries()) {
       if (

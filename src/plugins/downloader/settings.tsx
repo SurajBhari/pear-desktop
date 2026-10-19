@@ -438,7 +438,9 @@ export const DownloaderSettings = (props: {
               onClick={() =>
                 run(async () => {
                   setLibrary(
-                    (await props.api.invoke('downloader-scan')) as LibraryReport,
+                    (await props.api.invoke(
+                      'downloader-scan',
+                    )) as LibraryReport,
                   );
                   setMessage(tr('scanDone'));
                 })

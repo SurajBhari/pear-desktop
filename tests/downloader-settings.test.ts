@@ -74,7 +74,10 @@ export const t=instance.t.bind(instance);
       });
       const close = page.getByRole('dialog').locator('header button').first();
       const bounds = await close.boundingBox();
-      expect(bounds, `${name}: close button must have a rendered box`).not.toBeNull();
+      expect(
+        bounds,
+        `${name}: close button must have a rendered box`,
+      ).not.toBeNull();
       if (!bounds) throw new Error('Close button is not rendered');
       expect(bounds.x).toBeGreaterThanOrEqual(0);
       expect(bounds.y).toBeGreaterThanOrEqual(0);
@@ -85,7 +88,10 @@ export const t=instance.t.bind(instance);
           const rect = button.getBoundingClientRect();
           return (
             document
-              .elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
+              .elementFromPoint(
+                rect.x + rect.width / 2,
+                rect.y + rect.height / 2,
+              )
               ?.closest('button') === button
           );
         }),
@@ -122,7 +128,9 @@ export const t=instance.t.bind(instance);
       duplicatePolicy: 'keep-better',
     });
     await page.getByRole('dialog').evaluate((el) => (el.scrollTop = 0));
-    await page.screenshot({ path: testInfo.outputPath('downloader-settings.png') });
+    await page.screenshot({
+      path: testInfo.outputPath('downloader-settings.png'),
+    });
     await page
       .getByRole('button', { name: 'Show available qualities', exact: true })
       .click();
@@ -138,7 +146,9 @@ export const t=instance.t.bind(instance);
     await page
       .getByRole('group', { name: 'Available audio for current track' })
       .scrollIntoViewIfNeeded();
-    await page.screenshot({ path: testInfo.outputPath('downloader-chooser.png') });
+    await page.screenshot({
+      path: testInfo.outputPath('downloader-chooser.png'),
+    });
     await page
       .getByRole('button', { name: 'Download selected quality', exact: true })
       .click();
@@ -165,7 +175,9 @@ export const t=instance.t.bind(instance);
         .getByRole('dialog')
         .evaluate((el) => el.scrollWidth <= el.clientWidth + 1),
     ).toBe(true);
-    await page.screenshot({ path: testInfo.outputPath('downloader-library.png') });
+    await page.screenshot({
+      path: testInfo.outputPath('downloader-library.png'),
+    });
     const closeBounds = await page
       .getByRole('dialog')
       .locator('header button')
@@ -201,7 +213,9 @@ export const t=instance.t.bind(instance);
         exact: true,
       }),
     ).toBeVisible();
-    await page.screenshot({ path: testInfo.outputPath('downloader-settings-ru.png') });
+    await page.screenshot({
+      path: testInfo.outputPath('downloader-settings-ru.png'),
+    });
     await page.keyboard.press('Escape');
     await expect(page.getByRole('dialog')).not.toBeVisible();
   } finally {

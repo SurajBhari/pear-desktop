@@ -1,5 +1,6 @@
 import { MAX_BANDS, type EqualizerBand, type EqualizerProfile } from './config';
 import { EqualizerResponseSampler, type EqualizerResponse } from './response';
+
 import type { RendererAudioGraph } from '@/providers/renderer-audio';
 
 export type { EqualizerResponse } from './response';
@@ -78,7 +79,12 @@ export class EqualizerController {
     const bands = bypass
       ? []
       : profile.bands.filter((b) => b.frequency < context.sampleRate / 2);
-    const requestKey = JSON.stringify([bands, profile.preamp, bypass, autoPreamp]);
+    const requestKey = JSON.stringify([
+      bands,
+      profile.preamp,
+      bypass,
+      autoPreamp,
+    ]);
     if (this.requestKey === requestKey) return;
     const enabledAuto = autoPreamp && !bypass;
     // Validate the original manual profile before deriving attenuation. Auto must not
@@ -274,10 +280,9 @@ export class EqualizerController {
   private levelAt(chain: Chain, now: number) {
     const { from, to, start, end } = chain.envelope;
     const progress =
-      end > start
-        ? Math.min(1, Math.max(0, (now - start) / (end - start)))
-        : 1;
-    return from + (to - from) * progress;
+      end > start ? Math.min(1, Math.max(0, (now - start) / (end - start))) : 1;
+    const change = (to - from) * progress;
+    return from + change;
   }
 
   private validateResponse(bands: EqualizerBand[], preamp: number) {

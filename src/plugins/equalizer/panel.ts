@@ -10,8 +10,8 @@ import {
   type EqualizerPluginConfig,
   type EqualizerProfile,
 } from './config';
-import { stockPresets, stockProfile } from './stock-presets';
 import { createResponseView } from './response-view';
+import { stockPresets, stockProfile } from './stock-presets';
 import style from './style.css?inline';
 
 import type { EqualizerResponse } from './controller';
@@ -181,7 +181,8 @@ export function openEqualizerPanel(
     const automatic = document.createElement('input');
     automatic.type = 'checkbox';
     automatic.checked = state.autoPreamp;
-    automatic.onchange = () => commit(active(), { autoPreamp: automatic.checked });
+    automatic.onchange = () =>
+      commit(active(), { autoPreamp: automatic.checked });
     const manual = numeric(profile.preamp, -24, 12, 0.1, (preamp) =>
       commit({ ...active(), preamp }, { autoPreamp: false }),
     );
@@ -252,7 +253,9 @@ export function openEqualizerPanel(
             ),
           ),
         );
-        const q = numeric(band.Q, 0.001, 1000, 0.001, (value) => edit('Q', value));
+        const q = numeric(band.Q, 0.001, 1000, 0.001, (value) =>
+          edit('Q', value),
+        );
         q.disabled = band.type === 'lowshelf' || band.type === 'highshelf';
         row.append(label(t('plugins.equalizer.editor.q'), q));
         const remove = button(t('plugins.equalizer.editor.remove-band'), () => {
@@ -272,7 +275,8 @@ export function openEqualizerPanel(
       bands.append(row);
     });
     const bandScroll = document.createElement('div');
-    bandScroll.className = profile.mode === 'custom' ? 'eq-custom-wrap' : 'eq-graphic-scroll';
+    bandScroll.className =
+      profile.mode === 'custom' ? 'eq-custom-wrap' : 'eq-graphic-scroll';
     bandScroll.append(bands);
     body.append(bandScroll);
     if (profile.mode === 'custom') {

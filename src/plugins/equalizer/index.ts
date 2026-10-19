@@ -48,7 +48,11 @@ function apply() {
   }
   const controller = state.controller ?? new EqualizerController(state.graph);
   try {
-    controller.apply(normalized.profile, state.raw.bypass, normalized.autoPreamp);
+    controller.apply(
+      normalized.profile,
+      state.raw.bypass,
+      normalized.autoPreamp,
+    );
     state.controller = controller;
     state.audioError = false;
     state.panel?.reportError(

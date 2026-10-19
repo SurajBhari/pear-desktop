@@ -40,15 +40,30 @@ export function createResponseView(read: () => EqualizerResponse | null) {
         })
       : t('plugins.equalizer.editor.response-unavailable');
     if (!response) return;
-    const top = Math.max(12, Math.ceil(Math.max(...response.gainsDb) / 12) * 12);
-    const bottom = Math.min(-24, Math.floor(response.effectivePreampDb / 12) * 12 - 12);
+    const top = Math.max(
+      12,
+      Math.ceil(Math.max(...response.gainsDb) / 12) * 12,
+    );
+    const bottomStep = Math.floor(response.effectivePreampDb / 12) * 12;
+    const bottom = Math.min(-24, bottomStep - 12);
     const end = Math.min(20000, response.sampleRate / 2);
     const start = Math.min(20, end / 2);
-    const x = (frequency: number) =>
-      40 + (Math.log(frequency / start) / Math.log(end / start)) * 744;
-    const y = (gain: number) =>
-      12 + ((top - Math.max(bottom, Math.min(top, gain))) / (top - bottom)) * 140;
-    const text = (content: string, px: number, py: number, anchor = 'middle') => {
+    const x = (frequency: number) => {
+      const position =
+        (Math.log(frequency / start) / Math.log(end / start)) * 744;
+      return 40 + position;
+    };
+    const y = (gain: number) => {
+      const position =
+        ((top - Math.max(bottom, Math.min(top, gain))) / (top - bottom)) * 140;
+      return 12 + position;
+    };
+    const text = (
+      content: string,
+      px: number,
+      py: number,
+      anchor = 'middle',
+    ) => {
       const node = document.createElementNS(ns, 'text');
       node.textContent = content;
       node.setAttribute('x', String(px));
@@ -65,7 +80,11 @@ export function createResponseView(read: () => EqualizerResponse | null) {
     for (const frequency of [20, 100, 1000, 10000, 20000]) {
       if (frequency < start || frequency > end) continue;
       lines += `M${x(frequency)} 12V152 `;
-      text(frequency >= 1000 ? `${frequency / 1000}k` : `${frequency}`, x(frequency), 174);
+      text(
+        frequency >= 1000 ? `${frequency / 1000}k` : `${frequency}`,
+        x(frequency),
+        174,
+      );
     }
     grid.setAttribute('d', lines);
     let path = '';
