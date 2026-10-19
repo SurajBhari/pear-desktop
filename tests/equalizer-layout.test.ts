@@ -62,6 +62,19 @@ test('the actual translated 20-band editor fits desktop and narrow viewports wit
     expect(geometry.scroll, JSON.stringify(geometry)).toBeLessThanOrEqual(
       geometry.client + 1,
     );
+    const ticks = await page
+      .locator('.eq-response [data-frequency]')
+      .evaluateAll((nodes) =>
+        nodes.map((node) => {
+          const bounds = node.getBoundingClientRect();
+          return { left: bounds.left, right: bounds.right, height: bounds.height };
+        }),
+      );
+    for (const [i, tick] of ticks.entries()) {
+      expect(tick.height).toBeGreaterThanOrEqual(11);
+      if (i > 0)
+        expect(tick.left - ticks[i - 1].right).toBeGreaterThanOrEqual(4);
+    }
     await page.getByRole('dialog').evaluate((node) => {
       const scrollport =
         node.querySelector<HTMLElement>('[data-panel-scroll]') ?? node;
@@ -130,7 +143,9 @@ test('the actual translated 20-band editor fits desktop and narrow viewports wit
     'Applied preamp: -4.0 dB',
   );
   await automatic.check();
-  await page.getByLabel('Preset', { exact: true }).selectOption('flat');
+  await page
+    .getByRole('combobox', { name: 'Preset', exact: true })
+    .selectOption('flat');
   await expect(automatic).toBeChecked();
   await expect(page.locator('.eq-response output')).toContainText(
     'Applied preamp: 0.0 dB',

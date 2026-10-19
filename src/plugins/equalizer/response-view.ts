@@ -77,6 +77,7 @@ export function createResponseView(read: () => EqualizerResponse | null) {
       node.setAttribute('y', String(py));
       node.setAttribute('text-anchor', anchor);
       labels.append(node);
+      return node;
     };
     labels.replaceChildren();
     let lines = '';
@@ -87,12 +88,13 @@ export function createResponseView(read: () => EqualizerResponse | null) {
     for (const frequency of [20, 100, 1000, 10000, 20000]) {
       if (frequency < start || frequency > end) continue;
       lines += `M${x(frequency)} 12V152 `;
-      text(
-        frequency >= 1000 ? `${frequency / 1000}k` : `${frequency}`,
-        x(frequency),
-        174,
-        frequency === 20000 ? 'end' : 'middle',
-      );
+      if (frequency !== 10000 || plotWidth >= 400)
+        text(
+          frequency >= 1000 ? `${frequency / 1000}k` : `${frequency}`,
+          x(frequency),
+          174,
+          frequency === 20000 ? 'end' : 'middle',
+        ).setAttribute('data-frequency', String(frequency));
     }
     grid.setAttribute('d', lines);
     let path = '';
