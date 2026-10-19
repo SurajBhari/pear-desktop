@@ -89,6 +89,24 @@ test('the actual translated 20-band editor fits desktop and narrow viewports wit
   await page.evaluate(() =>
     (window as any).EqualizerFixture.plugin.renderer.openEditor(),
   );
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await expect(
+    page.getByRole('img', { name: 'Target frequency response' }),
+  ).toBeVisible();
+  const automatic = page.getByLabel('Automatic preamp', { exact: true });
+  await expect(automatic).not.toBeChecked();
+  await automatic.check();
+  const firstGain = page.locator('.eq-band').first().locator('input[type="number"]');
+  await firstGain.fill('8');
+  await expect(automatic).toBeChecked();
+  await expect(page.locator('.eq-response output')).toContainText('Applied preamp: -8.1 dB');
+  await page.getByLabel('Preamp (dB)', { exact: true }).fill('-4');
+  await expect(automatic).not.toBeChecked();
+  await expect(page.locator('.eq-response output')).toContainText('Applied preamp: -4.0 dB');
+  await automatic.check();
+  await page.getByLabel('Preset', { exact: true }).selectOption('flat');
+  await expect(automatic).toBeChecked();
+  await expect(page.locator('.eq-response output')).toContainText('Applied preamp: 0.0 dB');
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await page.evaluate(() =>

@@ -92,7 +92,7 @@ test('legacy shelf/settings are retained without mutating raw config or truncati
   expect(normalized.profile?.bands[1].Q).toBe(100);
   expect(raw).toEqual(before);
   for (const unsupported of [
-    { ...raw, schemaVersion: 3 },
+    { ...raw, schemaVersion: 4 },
     { ...raw, filters: Array.from({ length: 65 }, () => raw.filters[0]) },
   ]) {
     const snapshot = structuredClone(unsupported);

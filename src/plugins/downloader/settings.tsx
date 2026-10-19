@@ -84,334 +84,410 @@ export const DownloaderSettings = (props: {
     setSource({ ...source(), ...patch });
   return (
     <>
-      <header>
-        <h2 id="pear-downloader-heading">{tr('title')}</h2>
+      <header class="downloader-panel-header">
+        <div class="downloader-panel-title">
+          <svg aria-hidden="true" viewBox="0 0 24 24">
+            <path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4" />
+          </svg>
+          <h2 id="pear-downloader-heading">{tr('title')}</h2>
+        </div>
         <button
           aria-label={tr('close')}
+          class="downloader-panel-close"
           onClick={() => props.api.close()}
           type="button"
         >
-          ×
+          <svg aria-hidden="true" viewBox="0 0 24 24">
+            <path d="m6 6 12 12M6 18 18 6" />
+          </svg>
         </button>
       </header>
-      <p>{tr('summary')}</p>
-      <fieldset disabled={busy()}>
-        <legend>{tr('preferences')}</legend>
-        <label>
-          {tr('source')}
-          <select
-            onChange={(e) =>
-              patchSource({
-                mode: e.currentTarget.value as AudioPreference['mode'],
-                bitrate:
-                  Number.isFinite(source().bitrate) &&
-                  source().bitrate! > 0 &&
-                  source().bitrate! <= 10000
-                    ? source().bitrate
-                    : 160,
-                itag:
-                  Number.isSafeInteger(source().itag) && source().itag! > 0
-                    ? source().itag
-                    : 251,
-              })
-            }
-            value={source().mode}
-          >
-            <option value="best">{tr('best')}</option>
-            <option value="opus">{tr('opus')}</option>
-            <option value="aac">{tr('aac')}</option>
-            <option value="bitrate">{tr('bitrateMode')}</option>
-            <option value="itag">{tr('itagMode')}</option>
-          </select>
-        </label>
-        <Show when={source().mode === 'bitrate'}>
-          <label>
-            {tr('bitrate')}
-            <input
-              max="10000"
-              min="1"
-              onInput={(e) =>
-                patchSource({ bitrate: e.currentTarget.valueAsNumber })
-              }
-              type="number"
-              value={source().bitrate ?? 160}
-            />
-          </label>
-        </Show>
-        <Show when={source().mode === 'itag'}>
-          <label>
-            {tr('itag')}
-            <input
-              min="1"
-              onInput={(e) =>
-                patchSource({ itag: e.currentTarget.valueAsNumber })
-              }
-              type="number"
-              value={source().itag ?? 251}
-            />
-          </label>
-        </Show>
-        <label>
-          {tr('language')}
-          <select
-            onChange={(e) =>
-              patchSource({
-                language:
-                  e.currentTarget.value === 'original' ? 'original' : 'en',
-              })
-            }
-            value={
-              !source().language || source().language === 'original'
-                ? 'original'
-                : 'custom'
-            }
-          >
-            <option value="original">{tr('originalLanguage')}</option>
-            <option value="custom">{tr('specificLanguage')}</option>
-          </select>
-        </label>
-        <Show when={source().language && source().language !== 'original'}>
-          <label>
-            {tr('languageCode')}
-            <input
-              maxlength={40}
-              onInput={(e) => patchSource({ language: e.currentTarget.value })}
-              value={source().language}
-            />
-          </label>
-        </Show>
-        <label class="check">
-          <input
-            checked={!!source().drc}
-            onChange={(e) => patchSource({ drc: e.currentTarget.checked })}
-            type="checkbox"
-          />
-          {tr('drc')}
-        </label>
-        <label>
-          {tr('output')}
-          <select
-            onChange={(e) => setPreset(e.currentTarget.value)}
-            value={preset()}
-          >
-            <option value="mp3 (256kbps)">{tr('outputMp3')}</option>
-            <option value="Source">{tr('outputSource')}</option>
-            <option value="Custom">{tr('outputCustom')}</option>
-          </select>
-        </label>
-        <p>{tr('sourceHelp')}</p>
-        <label>
-          {tr('duplicate')}
-          <select
-            onChange={(e) =>
-              setPolicy(e.currentTarget.value as DuplicatePolicy)
-            }
-            value={policy()}
-          >
-            <option value="legacy">{tr('legacy')}</option>
-            <option value="skip-any">{tr('skipAny')}</option>
-            <option value="keep-better">{tr('better')}</option>
-            <option value="save-variant">{tr('variantPolicy')}</option>
-            <option value="ask">{tr('ask')}</option>
-          </select>
-        </label>
-        <p>{tr('duplicateHelp')}</p>
-        <label class="check">
-          <input
-            checked={fallback()}
-            onChange={(e) => setFallback(e.currentTarget.checked)}
-            type="checkbox"
-          />
-          {tr('fallback')}
-        </label>
-        <button
-          onClick={() =>
-            run(async () => {
-              await props.api.invoke('downloader-save-settings', {
-                sourceAudio: source(),
-                selectedPreset: preset(),
-                duplicatePolicy: policy(),
-                sourceFallback: fallback(),
-              });
-              setMessage(tr('saved'));
-            })
-          }
-          type="button"
-        >
-          {tr('save')}
-        </button>
-      </fieldset>
-      <fieldset disabled={busy()}>
-        <legend>{tr('formats')}</legend>
-        <button
-          onClick={() =>
-            run(async () => {
-              const result = (await props.api.invoke(
-                'downloader-formats',
-                props.api.currentUrl(),
-              )) as { id: string; title?: string; formats: AudioDescriptor[] };
-              setTrack(result);
-              setFormats(result.formats);
-              setSelected(result.formats.find((f) => f.supported)?.key ?? '');
-              setMessage(tr('refreshed'));
-            })
-          }
-          type="button"
-        >
-          {tr('inspect')}
-        </button>
-        <Show when={track()}>
-          <p>
-            {track()?.title} · {track()?.id}
-          </p>
-          <label>
-            {tr('variant')}
-            <select
-              onChange={(e) => setSelected(e.currentTarget.value)}
-              value={selected()}
+      <div class="downloader-panel-scroll" data-panel-scroll>
+        <p class="downloader-panel-summary">{tr('summary')}</p>
+        <fieldset class="downloader-section" disabled={busy()}>
+          <legend>{tr('preferences')}</legend>
+          <div class="downloader-preferences">
+            <div
+              aria-labelledby="pear-downloader-source-label"
+              class="downloader-preference-group downloader-source-group"
+              role="group"
             >
-              <For each={formats()}>
-                {(f) => (
-                  <option disabled={!f.supported} value={f.key}>
-                    {f.codec || tr('unknownCodec')} ·{' '}
-                    {f.muxed ? tr('tvExtraction') : ''}
-                    {f.container || tr('unknownContainer')} ·{' '}
-                    {(f.averageBitrate ?? f.bitrate)
-                      ? tr('rate', {
-                          bitrate: Math.round(
-                            (f.averageBitrate ?? f.bitrate!) / 1000,
-                          ),
-                        })
-                      : tr('unknownBitrate')}{' '}
-                    ·{' '}
-                    {f.language === 'original'
-                      ? f.original
-                        ? tr('originalVariant')
-                        : tr('unknownLanguage')
-                      : f.language}
-                    {f.drc ? tr('drcVariant') : ''} ·{' '}
-                    {tr('itagDetail', { itag: f.itag })}
-                    {f.track ? ` · ${tr('trackDetail', { id: f.track })}` : ''}
-                    {f.reason ? ` · ${translatedReason(f.reason)}` : ''}
-                  </option>
-                )}
-              </For>
-            </select>
-          </label>
-          <p>{tr('unavailable')}</p>
+              <div class="downloader-form-grid">
+                <label>
+                  <span
+                    class="downloader-field-title"
+                    id="pear-downloader-source-label"
+                  >
+                    {tr('source')}
+                  </span>
+                  <select
+                    onChange={(e) =>
+                      patchSource({
+                        mode: e.currentTarget.value as AudioPreference['mode'],
+                        bitrate:
+                          Number.isFinite(source().bitrate) &&
+                          source().bitrate! > 0 &&
+                          source().bitrate! <= 10000
+                            ? source().bitrate
+                            : 160,
+                        itag:
+                          Number.isSafeInteger(source().itag) &&
+                          source().itag! > 0
+                            ? source().itag
+                            : 251,
+                      })
+                    }
+                    value={source().mode}
+                  >
+                    <option value="best">{tr('best')}</option>
+                    <option value="opus">{tr('opus')}</option>
+                    <option value="aac">{tr('aac')}</option>
+                    <option value="bitrate">{tr('bitrateMode')}</option>
+                    <option value="itag">{tr('itagMode')}</option>
+                  </select>
+                </label>
+                <Show when={source().mode === 'bitrate'}>
+                  <label>
+                    {tr('bitrate')}
+                    <input
+                      max="10000"
+                      min="1"
+                      onInput={(e) =>
+                        patchSource({ bitrate: e.currentTarget.valueAsNumber })
+                      }
+                      type="number"
+                      value={source().bitrate ?? 160}
+                    />
+                  </label>
+                </Show>
+                <Show when={source().mode === 'itag'}>
+                  <label>
+                    {tr('itag')}
+                    <input
+                      min="1"
+                      onInput={(e) =>
+                        patchSource({ itag: e.currentTarget.valueAsNumber })
+                      }
+                      type="number"
+                      value={source().itag ?? 251}
+                    />
+                  </label>
+                </Show>
+                <label>
+                  {tr('language')}
+                  <select
+                    onChange={(e) =>
+                      patchSource({
+                        language:
+                          e.currentTarget.value === 'original'
+                            ? 'original'
+                            : 'en',
+                      })
+                    }
+                    value={
+                      !source().language || source().language === 'original'
+                        ? 'original'
+                        : 'custom'
+                    }
+                  >
+                    <option value="original">{tr('originalLanguage')}</option>
+                    <option value="custom">{tr('specificLanguage')}</option>
+                  </select>
+                </label>
+                <Show
+                  when={source().language && source().language !== 'original'}
+                >
+                  <label>
+                    {tr('languageCode')}
+                    <input
+                      maxlength={40}
+                      onInput={(e) =>
+                        patchSource({ language: e.currentTarget.value })
+                      }
+                      value={source().language}
+                    />
+                  </label>
+                </Show>
+              </div>
+              <label class="check">
+                <input
+                  checked={!!source().drc}
+                  onChange={(e) =>
+                    patchSource({ drc: e.currentTarget.checked })
+                  }
+                  type="checkbox"
+                />
+                {tr('drc')}
+              </label>
+              <label class="check">
+                <input
+                  checked={fallback()}
+                  onChange={(e) => setFallback(e.currentTarget.checked)}
+                  type="checkbox"
+                />
+                {tr('fallback')}
+              </label>
+            </div>
+            <div
+              aria-labelledby="pear-downloader-output-label"
+              class="downloader-preference-group"
+              role="group"
+            >
+              <label>
+                <span
+                  class="downloader-field-title"
+                  id="pear-downloader-output-label"
+                >
+                  {tr('output')}
+                </span>
+                <select
+                  onChange={(e) => setPreset(e.currentTarget.value)}
+                  value={preset()}
+                >
+                  <option value="mp3 (256kbps)">{tr('outputMp3')}</option>
+                  <option value="Source">{tr('outputSource')}</option>
+                  <option value="Custom">{tr('outputCustom')}</option>
+                </select>
+              </label>
+              <p>{tr('sourceHelp')}</p>
+            </div>
+            <div
+              aria-labelledby="pear-downloader-duplicate-label"
+              class="downloader-preference-group"
+              role="group"
+            >
+              <label>
+                <span
+                  class="downloader-field-title"
+                  id="pear-downloader-duplicate-label"
+                >
+                  {tr('duplicate')}
+                </span>
+                <select
+                  onChange={(e) =>
+                    setPolicy(e.currentTarget.value as DuplicatePolicy)
+                  }
+                  value={policy()}
+                >
+                  <option value="legacy">{tr('legacy')}</option>
+                  <option value="skip-any">{tr('skipAny')}</option>
+                  <option value="keep-better">{tr('better')}</option>
+                  <option value="save-variant">{tr('variantPolicy')}</option>
+                  <option value="ask">{tr('ask')}</option>
+                </select>
+              </label>
+              <p>{tr('duplicateHelp')}</p>
+            </div>
+          </div>
+          <div class="downloader-actions">
+            <button
+              class="downloader-primary"
+              onClick={() =>
+                run(async () => {
+                  await props.api.invoke('downloader-save-settings', {
+                    sourceAudio: source(),
+                    selectedPreset: preset(),
+                    duplicatePolicy: policy(),
+                    sourceFallback: fallback(),
+                  });
+                  setMessage(tr('saved'));
+                })
+              }
+              type="button"
+            >
+              {tr('save')}
+            </button>
+          </div>
+        </fieldset>
+        <fieldset class="downloader-section" disabled={busy()}>
+          <legend>{tr('formats')}</legend>
           <button
-            disabled={!selected()}
+            class="downloader-secondary"
             onClick={() =>
               run(async () => {
                 const result = (await props.api.invoke(
-                  'downloader-selected',
-                  track()!.id,
-                  selected(),
-                )) as
-                  | { status?: string; error?: string; path?: string }
-                  | undefined;
-                if (result?.status === 'failed')
-                  throw new Error(result.error ?? tr('downloadFailed'));
-                setMessage(
-                  result?.status === 'saved'
-                    ? tr('savedVariant', { path: result.path ?? '' })
-                    : tr('result', { status: result?.status ?? 'skipped' }),
-                );
+                  'downloader-formats',
+                  props.api.currentUrl(),
+                )) as {
+                  id: string;
+                  title?: string;
+                  formats: AudioDescriptor[];
+                };
+                setTrack(result);
+                setFormats(result.formats);
+                setSelected(result.formats.find((f) => f.supported)?.key ?? '');
+                setMessage(tr('refreshed'));
               })
             }
             type="button"
           >
-            {tr('download')}
+            {tr('inspect')}
           </button>
-        </Show>
-      </fieldset>
-      <fieldset>
-        <legend>{tr('library')}</legend>
-        <Show when={props.initial.review?.length}>
-          <p>{tr('review')}</p>
-          <ul>
-            <For each={props.initial.review}>
-              {(row) => (
-                <li>
-                  {row.title}: {row.reason}
-                  <button
-                    disabled={busy()}
-                    onClick={() =>
-                      run(async () => {
-                        const result = (await props.api.invoke(
-                          'downloader-formats',
-                          `https://music.youtube.com/watch?v=${encodeURIComponent(row.id)}`,
-                        )) as {
-                          id: string;
-                          title?: string;
-                          formats: AudioDescriptor[];
-                        };
-                        setTrack(result);
-                        setFormats(result.formats);
-                        setSelected(
-                          result.formats.find((f) => f.supported)?.key ?? '',
-                        );
-                        setMessage(tr('chooseAbove'));
-                      })
-                    }
-                    type="button"
-                  >
-                    {tr('reviewChoose')}
-                  </button>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
-        <p>{tr('scanHelp')}</p>
-        <button
-          disabled={busy()}
-          onClick={() =>
-            run(async () => {
-              setLibrary(
-                (await props.api.invoke('downloader-scan')) as LibraryReport,
-              );
-              setMessage(tr('scanDone'));
-            })
-          }
-          type="button"
-        >
-          {tr('scan')}
-        </button>
-        <Show when={busy()}>
-          <button
-            onClick={() => props.api.invoke('downloader-scan-cancel')}
-            type="button"
-          >
-            {tr('cancelScan')}
-          </button>
-        </Show>
-        <Show when={library()}>
-          <p>
-            {tr('scanSummary', { count: library()!.visited })}
-            {library()!.truncated ? tr('limited') : ''}.{' '}
-            {library()!.errors.join('; ')}
-          </p>
-          <ul>
-            <For each={library()!.files.slice(0, 100)}>
-              {(file) => (
-                <li>
-                  <strong>{tr(`status.${file.status}`)}</strong> · {file.path}
-                  {file.videoId ? ` · ${file.videoId}` : ''}
-                  {file.reason ? ` — ${translatedReason(file.reason)}` : ''}
-                </li>
-              )}
-            </For>
-          </ul>
-          <Show when={library()!.files.length > 100}>
-            <p>{tr('first100')}</p>
+          <Show when={track()}>
+            <p class="downloader-track">
+              {track()?.title} · {track()?.id}
+            </p>
+            <label>
+              {tr('variant')}
+              <select
+                onChange={(e) => setSelected(e.currentTarget.value)}
+                value={selected()}
+              >
+                <For each={formats()}>
+                  {(f) => (
+                    <option disabled={!f.supported} value={f.key}>
+                      {f.codec || tr('unknownCodec')} ·{' '}
+                      {f.muxed ? tr('tvExtraction') : ''}
+                      {f.container || tr('unknownContainer')} ·{' '}
+                      {(f.averageBitrate ?? f.bitrate)
+                        ? tr('rate', {
+                            bitrate: Math.round(
+                              (f.averageBitrate ?? f.bitrate!) / 1000,
+                            ),
+                          })
+                        : tr('unknownBitrate')}{' '}
+                      ·{' '}
+                      {f.language === 'original'
+                        ? f.original
+                          ? tr('originalVariant')
+                          : tr('unknownLanguage')
+                        : f.language}
+                      {f.drc ? tr('drcVariant') : ''} ·{' '}
+                      {tr('itagDetail', { itag: f.itag })}
+                      {f.track
+                        ? ` · ${tr('trackDetail', { id: f.track })}`
+                        : ''}
+                      {f.reason ? ` · ${translatedReason(f.reason)}` : ''}
+                    </option>
+                  )}
+                </For>
+              </select>
+            </label>
+            <p>{tr('unavailable')}</p>
+            <button
+              class="downloader-primary"
+              disabled={!selected()}
+              onClick={() =>
+                run(async () => {
+                  const result = (await props.api.invoke(
+                    'downloader-selected',
+                    track()!.id,
+                    selected(),
+                  )) as
+                    | { status?: string; error?: string; path?: string }
+                    | undefined;
+                  if (result?.status === 'failed')
+                    throw new Error(result.error ?? tr('downloadFailed'));
+                  setMessage(
+                    result?.status === 'saved'
+                      ? tr('savedVariant', { path: result.path ?? '' })
+                      : tr('result', { status: result?.status ?? 'skipped' }),
+                  );
+                })
+              }
+              type="button"
+            >
+              {tr('download')}
+            </button>
           </Show>
-        </Show>
-      </fieldset>
-      <p aria-live="polite" role="status">
-        {busy() ? tr('working') : message()}
-      </p>
-      <p role="alert">{error()}</p>
+        </fieldset>
+        <fieldset class="downloader-section downloader-library">
+          <legend>{tr('library')}</legend>
+          <Show when={props.initial.review?.length}>
+            <p>{tr('review')}</p>
+            <ul class="downloader-review-list">
+              <For each={props.initial.review}>
+                {(row) => (
+                  <li>
+                    <span>
+                      {row.title}: {row.reason}
+                    </span>
+                    <button
+                      disabled={busy()}
+                      onClick={() =>
+                        run(async () => {
+                          const result = (await props.api.invoke(
+                            'downloader-formats',
+                            `https://music.youtube.com/watch?v=${encodeURIComponent(row.id)}`,
+                          )) as {
+                            id: string;
+                            title?: string;
+                            formats: AudioDescriptor[];
+                          };
+                          setTrack(result);
+                          setFormats(result.formats);
+                          setSelected(
+                            result.formats.find((f) => f.supported)?.key ?? '',
+                          );
+                          setMessage(tr('chooseAbove'));
+                        })
+                      }
+                      type="button"
+                    >
+                      {tr('reviewChoose')}
+                    </button>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
+          <p>{tr('scanHelp')}</p>
+          <div class="downloader-actions">
+            <button
+              disabled={busy()}
+              onClick={() =>
+                run(async () => {
+                  setLibrary(
+                    (await props.api.invoke('downloader-scan')) as LibraryReport,
+                  );
+                  setMessage(tr('scanDone'));
+                })
+              }
+              type="button"
+            >
+              {tr('scan')}
+            </button>
+            <Show when={busy()}>
+              <button
+                onClick={() => props.api.invoke('downloader-scan-cancel')}
+                type="button"
+              >
+                {tr('cancelScan')}
+              </button>
+            </Show>
+          </div>
+          <Show when={library()}>
+            <p>
+              {tr('scanSummary', { count: library()!.visited })}
+              {library()!.truncated ? tr('limited') : ''}.{' '}
+              {library()!.errors.join('; ')}
+            </p>
+            <ul class="downloader-library-list">
+              <For each={library()!.files.slice(0, 100)}>
+                {(file) => (
+                  <li>
+                    <strong>{tr(`status.${file.status}`)}</strong>
+                    <span>
+                      {file.path}
+                      {file.videoId ? ` · ${file.videoId}` : ''}
+                      {file.reason ? ` — ${translatedReason(file.reason)}` : ''}
+                    </span>
+                  </li>
+                )}
+              </For>
+            </ul>
+            <Show when={library()!.files.length > 100}>
+              <p>{tr('first100')}</p>
+            </Show>
+          </Show>
+        </fieldset>
+        <p aria-live="polite" class="downloader-feedback" role="status">
+          {busy() ? tr('working') : message()}
+        </p>
+        <p class="downloader-feedback" role="alert">
+          {error()}
+        </p>
+      </div>
     </>
   );
 };

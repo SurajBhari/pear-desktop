@@ -20,6 +20,7 @@ export type EqualizerPluginConfig = {
   enabled: boolean;
   schemaVersion: number;
   bypass: boolean;
+  autoPreamp: boolean;
   profile: EqualizerProfile;
   rememberedProfiles: Partial<Record<EqualizerMode, EqualizerProfile>>;
   userPresets: UserPreset[];
@@ -40,6 +41,7 @@ export const defaultConfig: EqualizerPluginConfig = {
   enabled: false,
   schemaVersion: 0,
   bypass: false,
+  autoPreamp: false,
   profile: { mode: 'graphic-8', bands: [], preamp: 0 },
   rememberedProfiles: {},
   userPresets: [],
@@ -129,9 +131,13 @@ export function normalizeConfig(raw: EqualizerPluginConfig) {
   const errors: string[] = [];
   let profile: EqualizerProfile | null = null;
   let legacy: EqualizerPluginConfig['legacy'];
-  if (raw.schemaVersion > 2) errors.push('future-version');
-  else if (raw.schemaVersion === 2) profile = readProfile(raw.profile);
-  else if (raw.schemaVersion !== undefined && raw.schemaVersion !== 0)
+  const autoPreamp = raw.schemaVersion === 3 && raw.autoPreamp === true;
+  if (raw.schemaVersion > 3) errors.push('future-version');
+  else if (raw.schemaVersion === 2 || raw.schemaVersion === 3) {
+    profile = readProfile(raw.profile);
+    if (raw.schemaVersion === 3 && typeof raw.autoPreamp !== 'boolean')
+      errors.push('invalid-config');
+  } else if (raw.schemaVersion !== undefined && raw.schemaVersion !== 0)
     errors.push('invalid-config');
   else {
     const filters = raw.filters ?? [];
@@ -189,6 +195,7 @@ export function normalizeConfig(raw: EqualizerPluginConfig) {
         });
     }
   return {
+    autoPreamp,
     profile,
     rememberedProfiles,
     userPresets,
@@ -210,12 +217,13 @@ export function editedConfig(
       'Equalizer configuration requires a supported schema/profile',
     );
   const next = {
-    schemaVersion: 2,
+    autoPreamp: normalized.autoPreamp,
     profile: structuredClone(profile),
     rememberedProfiles: normalized.rememberedProfiles,
     userPresets: normalized.userPresets,
     ...(normalized.legacy ? { legacy: normalized.legacy } : {}),
     ...changes,
+    schemaVersion: 3,
   };
   if (!normalizeConfig({ ...raw, ...next }).editable)
     throw new Error('Invalid equalizer edit');

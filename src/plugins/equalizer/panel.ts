@@ -11,13 +11,17 @@ import {
   type EqualizerProfile,
 } from './config';
 import { stockPresets, stockProfile } from './stock-presets';
+import { createResponseView } from './response-view';
 import style from './style.css?inline';
+
+import type { EqualizerResponse } from './controller';
 
 export function openEqualizerPanel(
   getConfig: () => EqualizerPluginConfig,
   change: (value: Partial<EqualizerPluginConfig>) => void,
   flush: () => void,
   sampleRate: () => number | undefined,
+  response: () => EqualizerResponse | null = () => null,
 ) {
   const previousFocus =
     document.activeElement instanceof HTMLElement
@@ -32,11 +36,14 @@ export function openEqualizerPanel(
   const title = document.createElement('h2');
   title.textContent = t('plugins.equalizer.editor.title');
   const body = document.createElement('div');
+  body.className = 'eq-content';
+  body.dataset.panelScroll = '';
   const error = document.createElement('p');
   error.setAttribute('role', 'alert');
   error.hidden = true;
   const button = (text: string, click: () => void) => {
     const node = document.createElement('button');
+    node.type = 'button';
     node.textContent = text;
     node.onclick = click;
     return node;
@@ -50,6 +57,7 @@ export function openEqualizerPanel(
   };
   let disposed = false;
   let selectedPreset = '';
+  let updateResponse = () => {};
   const dispose = () => {
     if (disposed) return;
     disposed = true;
@@ -58,15 +66,20 @@ export function openEqualizerPanel(
     dialog.remove();
     previousFocus?.focus();
   };
-  header.append(title, button(t('plugins.equalizer.editor.close'), dispose));
-  dialog.append(css, header, error, body);
+  const close = button('×', dispose);
+  close.className = 'eq-close';
+  close.setAttribute('aria-label', t('plugins.equalizer.editor.close'));
+  header.append(title, close);
+  dialog.append(css, header, body);
   dialog.addEventListener('cancel', (event) => {
     event.preventDefault();
     dispose();
   });
   function render() {
     if (disposed) return;
+    updateResponse = () => {};
     body.replaceChildren();
+    body.append(error);
     const raw = getConfig();
     const state = normalizeConfig(raw);
     const profile = state.profile;
@@ -89,6 +102,7 @@ export function openEqualizerPanel(
     ) => {
       change(editedConfig(getConfig(), next, changes));
       if (redraw) render();
+      else updateResponse();
     };
     const numeric = (
       value: number,
@@ -140,7 +154,10 @@ export function openEqualizerPanel(
     const bypass = document.createElement('input');
     bypass.type = 'checkbox';
     bypass.checked = raw.bypass;
-    bypass.onchange = () => change({ bypass: bypass.checked });
+    bypass.onchange = () => {
+      change({ bypass: bypass.checked });
+      updateResponse();
+    };
     toolbar.append(
       label(t('plugins.equalizer.editor.bypass'), bypass),
       button(t('plugins.equalizer.editor.reset'), () => {
@@ -158,18 +175,33 @@ export function openEqualizerPanel(
           commit({ ...active(), mode: 'custom' }, {}, true),
         ),
       );
-    body.append(
-      toolbar,
-      label(
-        t('plugins.equalizer.editor.preamp'),
-        numeric(profile.preamp, -24, 12, 0.1, (preamp) =>
-          commit({ ...active(), preamp }),
-        ),
-      ),
+    body.append(toolbar);
+    const gainControls = document.createElement('div');
+    gainControls.className = 'eq-gain-controls';
+    const automatic = document.createElement('input');
+    automatic.type = 'checkbox';
+    automatic.checked = state.autoPreamp;
+    automatic.onchange = () => commit(active(), { autoPreamp: automatic.checked });
+    const manual = numeric(profile.preamp, -24, 12, 0.1, (preamp) =>
+      commit({ ...active(), preamp }, { autoPreamp: false }),
     );
+    gainControls.append(
+      label(t('plugins.equalizer.editor.auto-preamp'), automatic),
+      label(t('plugins.equalizer.editor.preamp'), manual),
+    );
+    const autoHelp = document.createElement('p');
+    autoHelp.className = 'eq-notice';
+    autoHelp.textContent = t('plugins.equalizer.editor.auto-preamp-help');
+    const preview = createResponseView(response);
+    updateResponse = () => {
+      automatic.checked = normalizeConfig(getConfig()).autoPreamp;
+      preview.refresh();
+    };
+    body.append(gainControls, autoHelp, preview.element);
     const bands = document.createElement('div');
     bands.className =
       profile.mode === 'custom' ? 'eq-bands eq-custom' : 'eq-bands';
+    bands.style.setProperty('--eq-count', String(profile.bands.length));
     profile.bands.forEach((band, i) => {
       const row = document.createElement('fieldset');
       row.className = 'eq-band';
@@ -177,7 +209,9 @@ export function openEqualizerPanel(
       legend.textContent =
         profile.mode === 'custom'
           ? `${i + 1} · ${band.type}`
-          : `${Number(band.frequency.toFixed(1))} Hz`;
+          : band.frequency >= 1000
+            ? `${Number((band.frequency / 1000).toFixed(1))}k`
+            : `${Math.round(band.frequency)}`;
       row.append(legend);
       const edit = (key: 'frequency' | 'gain' | 'Q', value: number) => {
         const p = active();
@@ -188,14 +222,15 @@ export function openEqualizerPanel(
           ),
         });
       };
-      const gain = numeric(band.gain, -24, 24, 0.1, (value) => {
+      const limit = profile.mode === 'custom' ? 48 : 24;
+      const gain = numeric(band.gain, -limit, limit, 0.1, (value) => {
         range.value = String(value);
         edit('gain', value);
       });
       const range = document.createElement('input');
       range.type = 'range';
-      range.min = '-24';
-      range.max = '24';
+      range.min = String(-limit);
+      range.max = String(limit);
       range.step = '0.1';
       range.value = String(band.gain);
       range.setAttribute(
@@ -212,12 +247,12 @@ export function openEqualizerPanel(
         row.append(
           label(
             t('plugins.equalizer.editor.frequency'),
-            numeric(band.frequency, 20, 20000, 0.1, (value) =>
+            numeric(band.frequency, 0, 20000, 0.1, (value) =>
               edit('frequency', value),
             ),
           ),
         );
-        const q = numeric(band.Q, 0.1, 30, 0.1, (value) => edit('Q', value));
+        const q = numeric(band.Q, 0.001, 1000, 0.001, (value) => edit('Q', value));
         q.disabled = band.type === 'lowshelf' || band.type === 'highshelf';
         row.append(label(t('plugins.equalizer.editor.q'), q));
         const remove = button(t('plugins.equalizer.editor.remove-band'), () => {
@@ -236,7 +271,10 @@ export function openEqualizerPanel(
       }
       bands.append(row);
     });
-    body.append(bands);
+    const bandScroll = document.createElement('div');
+    bandScroll.className = profile.mode === 'custom' ? 'eq-custom-wrap' : 'eq-graphic-scroll';
+    bandScroll.append(bands);
+    body.append(bandScroll);
     if (profile.mode === 'custom') {
       const add = button(t('plugins.equalizer.editor.add-band'), () => {
         const p = active();
@@ -385,6 +423,7 @@ export function openEqualizerPanel(
   return {
     dispose,
     refresh: render,
+    updateResponse: () => updateResponse(),
     reportError: (message: string | null) => {
       error.textContent = message ?? '';
       error.hidden = !message;

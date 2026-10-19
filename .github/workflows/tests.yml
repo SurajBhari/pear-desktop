@@ -50,3 +50,51 @@ jobs:
         run: node scripts/run-ci-tests.cjs
       - name: Release staging tests
         run: node --test scripts/verify-release.test.cjs
+      - name: Upload browser test evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: browser-test-evidence-${{ matrix.os }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  source-checks:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 11
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: pnpm lint
+      - name: Typecheck
+        if: ${{ !cancelled() }}
+        run: pnpm typecheck
+      - name: Check panel formatting
+        id: format
+        if: ${{ !cancelled() }}
+        run: pnpm exec oxfmt --check src/plugins/equalizer src/plugins/downloader/settings.tsx src/plugins/downloader/style.css src/i18n/resources/en.json src/i18n/resources/ru.json tests/equalizer-auto-preamp.test.ts tests/equalizer-config.test.ts tests/equalizer-safety.test.ts tests/equalizer-layout.test.ts tests/downloader-settings.test.ts
+      - name: Preserve proposed formatting patch
+        if: ${{ failure() && steps.format.outcome == 'failure' }}
+        run: |
+          pnpm exec oxfmt --write src/plugins/equalizer src/plugins/downloader/settings.tsx src/plugins/downloader/style.css src/i18n/resources/en.json src/i18n/resources/ru.json tests/equalizer-auto-preamp.test.ts tests/equalizer-config.test.ts tests/equalizer-safety.test.ts tests/equalizer-layout.test.ts tests/downloader-settings.test.ts
+          git diff --binary --output=panel-format.patch
+      - name: Upload proposed formatting patch
+        if: ${{ failure() && steps.format.outcome == 'failure' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: panel-format-patch
+          path: panel-format.patch
+          retention-days: 7
+          if-no-files-found: error
