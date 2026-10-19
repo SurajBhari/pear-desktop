@@ -67,7 +67,11 @@ test('the actual translated 20-band editor fits desktop and narrow viewports wit
       .evaluateAll((nodes) =>
         nodes.map((node) => {
           const bounds = node.getBoundingClientRect();
-          return { left: bounds.left, right: bounds.right, height: bounds.height };
+          return {
+            left: bounds.left,
+            right: bounds.right,
+            height: bounds.height,
+          };
         }),
       );
     for (const [i, tick] of ticks.entries()) {
