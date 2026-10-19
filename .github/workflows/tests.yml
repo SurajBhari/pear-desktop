@@ -6,17 +6,26 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      source_only:
+        description: Run source checks without rebuilding and running the full test matrix
+        type: boolean
+        default: false
+      panels_only:
+        description: Run the audio panel browser tests and source checks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.panels_only && 'panels' || inputs.source_only && 'source' || 'full' }}
   cancel-in-progress: true
 
 jobs:
   test:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && inputs.source_only != true && inputs.panels_only != true
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -50,3 +59,79 @@ jobs:
         run: node scripts/run-ci-tests.cjs
       - name: Release staging tests
         run: node --test scripts/verify-release.test.cjs
+      - name: Upload browser test evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: browser-test-evidence-${{ matrix.os }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  panel-tests:
+    if: github.event_name == 'workflow_dispatch' && inputs.panels_only == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 11
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: Run native audio and constrained panel regressions
+        run: pnpm exec playwright test tests/equalizer-auto-preamp.test.ts tests/equalizer-layout.test.ts tests/downloader-settings.test.ts --workers=1 --reporter=line
+      - name: Upload panel evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: panel-test-evidence
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  source-checks:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 11
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: pnpm lint
+      - name: Typecheck
+        if: ${{ !cancelled() }}
+        run: pnpm typecheck
+      - name: Check panel formatting
+        id: format
+        if: ${{ !cancelled() }}
+        run: pnpm exec oxfmt --check src/plugins/equalizer src/plugins/downloader/settings.tsx src/plugins/downloader/style.css src/i18n/resources/en.json src/i18n/resources/ru.json tests/equalizer-auto-preamp.test.ts tests/equalizer-config.test.ts tests/equalizer-safety.test.ts tests/equalizer-layout.test.ts tests/downloader-settings.test.ts
+      - name: Preserve proposed formatting patch
+        if: ${{ failure() && steps.format.outcome == 'failure' }}
+        run: |
+          pnpm exec oxfmt --write src/plugins/equalizer src/plugins/downloader/settings.tsx src/plugins/downloader/style.css src/i18n/resources/en.json src/i18n/resources/ru.json tests/equalizer-auto-preamp.test.ts tests/equalizer-config.test.ts tests/equalizer-safety.test.ts tests/equalizer-layout.test.ts tests/downloader-settings.test.ts
+          git diff --binary --output=panel-format.patch
+      - name: Upload proposed formatting patch
+        if: ${{ failure() && steps.format.outcome == 'failure' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: panel-format-patch
+          path: panel-format.patch
+          retention-days: 7
+          if-no-files-found: error

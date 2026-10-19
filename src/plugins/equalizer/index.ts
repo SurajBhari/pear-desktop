@@ -48,12 +48,17 @@ function apply() {
   }
   const controller = state.controller ?? new EqualizerController(state.graph);
   try {
-    controller.apply(normalized.profile, state.raw.bypass);
+    controller.apply(
+      normalized.profile,
+      state.raw.bypass,
+      normalized.autoPreamp,
+    );
     state.controller = controller;
     state.audioError = false;
     state.panel?.reportError(
       state.saveError ? t('plugins.equalizer.editor.save-error') : null,
     );
+    state.panel?.updateResponse();
   } catch (error) {
     if (!state.controller) controller.stop();
     state.audioError = true;
@@ -101,6 +106,7 @@ function openEditor() {
     change,
     flush,
     () => state.graph?.audioContext.sampleRate,
+    () => state.controller?.getResponse() ?? null,
   );
   state.panel.reportError(
     state.audioError

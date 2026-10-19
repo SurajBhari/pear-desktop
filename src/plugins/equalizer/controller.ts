@@ -1,11 +1,17 @@
-import type { EqualizerBand, EqualizerProfile } from './config';
+import { MAX_BANDS, type EqualizerBand, type EqualizerProfile } from './config';
+import { EqualizerResponseSampler, type EqualizerResponse } from './response';
+
 import type { RendererAudioGraph } from '@/providers/renderer-audio';
+
+export type { EqualizerResponse } from './response';
 
 type Chain = {
   preamp: GainNode;
   filters: BiquadFilterNode[];
   bands: EqualizerBand[];
   level: GainNode;
+  key: string;
+  autoPreamp: boolean;
   envelope: { from: number; to: number; start: number; end: number };
   retire?: ReturnType<typeof setTimeout>;
 };
@@ -17,7 +23,20 @@ export class EqualizerController {
   private release: (() => void) | null = null;
   private chains = new Set<Chain>();
   private current: Chain | null = null;
-  private safetyFilters: BiquadFilterNode[] = [];
+  private sampler: EqualizerResponseSampler | null = null;
+  private response: EqualizerResponse | null = null;
+  private target: {
+    bands: EqualizerBand[];
+    preamp: number;
+    autoPreamp: boolean;
+    bypass: boolean;
+  } | null = null;
+  private pending: {
+    profile: EqualizerProfile;
+    bypass: boolean;
+    autoPreamp: boolean;
+  } | null = null;
+  private requestKey: string | null = null;
   private stopped = false;
 
   constructor(private graph: RendererAudioGraph) {
@@ -25,21 +44,91 @@ export class EqualizerController {
     this.output = graph.audioContext.createGain();
   }
 
-  apply(profile: EqualizerProfile, bypass: boolean) {
+  apply(profile: EqualizerProfile, bypass: boolean, autoPreamp = false) {
     if (this.stopped) return;
     const context = this.graph.audioContext;
+    if (
+      !Number.isFinite(profile.preamp) ||
+      profile.preamp < -24 ||
+      profile.preamp > 12 ||
+      !Array.isArray(profile.bands) ||
+      profile.bands.length > MAX_BANDS ||
+      profile.bands.some(
+        (band) =>
+          !Number.isFinite(band.frequency) ||
+          band.frequency < 0 ||
+          band.frequency > 20000 ||
+          !Number.isFinite(band.gain) ||
+          Math.abs(band.gain) > 48 ||
+          !Number.isFinite(band.Q) ||
+          band.Q <= 0 ||
+          band.Q > 1000 ||
+          ![
+            'peaking',
+            'lowshelf',
+            'highshelf',
+            'lowpass',
+            'highpass',
+            'bandpass',
+            'notch',
+            'allpass',
+          ].includes(band.type),
+      )
+    )
+      throw new Error('Invalid equalizer response input');
     const bands = bypass
       ? []
       : profile.bands.filter((b) => b.frequency < context.sampleRate / 2);
-    const preamp = bypass ? 1 : 10 ** (profile.preamp / 20);
+    const requestKey = JSON.stringify([
+      bands,
+      profile.preamp,
+      bypass,
+      autoPreamp,
+    ]);
+    if (this.requestKey === requestKey) return;
+    const enabledAuto = autoPreamp && !bypass;
+    // Validate the original manual profile before deriving attenuation. Auto must not
+    // expand the supported DSP range or hide a massive gain behind underflow.
     const smoothAllowed = this.validateResponse(
       bands,
       bypass ? 0 : profile.preamp,
     );
+    const sampled = enabledAuto ? this.sample(bands, profile.preamp) : null;
+    // A sampled response is not a continuum peak limiter. The small margin covers
+    // native Float32 response rounding and residual error between refined samples.
+    const peak = sampled?.peakGainDb ?? 0;
+    const effectivePreamp = bypass
+      ? 0
+      : enabledAuto
+        ? peak > 0.0001
+          ? -peak - 0.1
+          : 0
+        : profile.preamp;
+    const preamp = 10 ** (effectivePreamp / 20);
+    const key = JSON.stringify([bands, effectivePreamp, enabledAuto]);
+    const commitTarget = () => {
+      this.requestKey = requestKey;
+      this.target = {
+        bands: structuredClone(bands),
+        preamp: effectivePreamp,
+        autoPreamp,
+        bypass,
+      };
+      this.response = sampled
+        ? this.responseSnapshot(sampled, effectivePreamp, autoPreamp)
+        : null;
+    };
     const current = this.current;
     const now = context.currentTime;
+    if (current?.key === key) {
+      this.pending = null;
+      commitTarget();
+      return;
+    }
     if (
       current &&
+      !enabledAuto &&
+      !current.autoPreamp &&
       smoothAllowed &&
       current.bands.length === bands.length &&
       current.bands.every(
@@ -57,11 +146,25 @@ export class EqualizerController {
         smooth(filter.Q, bands[i].Q);
       });
       current.bands = structuredClone(bands);
+      current.key = key;
+      this.pending = null;
+      commitTarget();
+      return;
+    }
+    // A busy or suspended context must not accumulate an unbounded number of
+    // correlated fading chains. The existing retirement owner drains the latest edit.
+    // Keep incoming chains until their replacement is connected. A failed
+    // connection must leave the previous target intact, even at zero fade level.
+    if (this.chains.size >= 4) {
+      this.pending = { profile: structuredClone(profile), bypass, autoPreamp };
+      commitTarget();
       return;
     }
     const chain: Chain = {
       preamp: context.createGain(),
       filters: [],
+      key,
+      autoPreamp: enabledAuto,
       bands: structuredClone(bands),
       level: context.createGain(),
       envelope: { from: current ? 0 : 1, to: 1, start: now, end: now },
@@ -93,13 +196,7 @@ export class EqualizerController {
       const end = now + 0.02;
       for (const old of this.chains) {
         if (old.retire) clearTimeout(old.retire);
-        const envelope = old.envelope;
-        const elapsed = now - envelope.start;
-        const duration = envelope.end - envelope.start;
-        const progress =
-          duration > 0 ? Math.min(1, Math.max(0, elapsed / duration)) : 1;
-        const change = (envelope.to - envelope.from) * progress;
-        const level = envelope.from + change;
+        const level = this.levelAt(old, now);
         if (level === 0) {
           this.chains.delete(old);
           this.destroy(old);
@@ -119,6 +216,13 @@ export class EqualizerController {
           else {
             this.chains.delete(old);
             this.destroy(old);
+            const pending = this.pending;
+            if (context.state === 'closed') this.pending = null;
+            else if (pending && this.chains.size < 4) {
+              this.pending = null;
+              this.requestKey = null;
+              this.apply(pending.profile, pending.bypass, pending.autoPreamp);
+            }
           }
         };
         old.retire = setTimeout(retire, 30);
@@ -130,6 +234,51 @@ export class EqualizerController {
     }
     this.chains.add(chain);
     this.current = chain;
+    this.pending = null;
+    commitTarget();
+  }
+
+  getResponse(): EqualizerResponse | null {
+    if (this.stopped || !this.target) return null;
+    if (!this.response) {
+      const target = this.target;
+      this.response = this.responseSnapshot(
+        this.sample(target.bands, target.bypass ? 0 : target.preamp),
+        target.preamp,
+        target.autoPreamp,
+      );
+    }
+    return this.response;
+  }
+
+  private sample(bands: EqualizerBand[], preamp: number) {
+    this.sampler ??= new EqualizerResponseSampler(this.graph.audioContext);
+    return this.sampler.sample(bands, preamp);
+  }
+
+  private responseSnapshot(
+    sampled: ReturnType<EqualizerResponseSampler['sample']>,
+    preamp: number,
+    autoPreamp: boolean,
+  ): EqualizerResponse {
+    return Object.freeze({
+      sampleRate: this.graph.audioContext.sampleRate,
+      autoPreamp,
+      peakGainDb: sampled.peakGainDb,
+      effectivePreampDb: preamp,
+      frequencies: Object.freeze(sampled.frequencies),
+      gainsDb: Object.freeze(
+        sampled.gainsDb.map((gain) => Math.max(-300, gain + preamp)),
+      ),
+    });
+  }
+
+  private levelAt(chain: Chain, now: number) {
+    const { from, to, start, end } = chain.envelope;
+    const progress =
+      end > start ? Math.min(1, Math.max(0, (now - start) / (end - start))) : 1;
+    const change = (to - from) * progress;
+    return from + change;
   }
 
   private validateResponse(bands: EqualizerBand[], preamp: number) {
@@ -150,35 +299,7 @@ export class EqualizerController {
       )
     )
       return true;
-    const context = this.graph.audioContext;
-    const nyquist = context.sampleRate / 2;
-    const upper = nyquist - 0.01;
-    const frequencies = new Float32Array([
-      ...Array.from(
-        { length: 256 },
-        (_, i) => 20 * Math.pow(upper / 20, i / 255),
-      ),
-      ...bands.map((b) => b.frequency),
-    ]);
-    const response = new Float64Array(frequencies.length).fill(preamp);
-    const magnitude = new Float32Array(frequencies.length);
-    const phase = new Float32Array(frequencies.length);
-    bands.forEach((band, i) => {
-      const probe = this.safetyFilters[i] ?? context.createBiquadFilter();
-      this.safetyFilters[i] = probe;
-      probe.type = band.type;
-      probe.frequency.value = band.frequency;
-      probe.Q.value = band.Q;
-      probe.gain.value = band.gain;
-      probe.getFrequencyResponse(frequencies, magnitude, phase);
-      for (let j = 0; j < magnitude.length; j++) {
-        if (!Number.isFinite(magnitude[j]))
-          throw new Error('Equalizer response is not finite');
-        response[j] += 20 * Math.log10(magnitude[j]);
-        if (response[j] > limit)
-          throw new Error('Overlapping gain exceeds the DSP response range');
-      }
-    });
+    this.sample(bands, preamp);
     // Large aggregate gains use a linear chain handover instead of coefficient morphing.
     return false;
   }
@@ -205,7 +326,11 @@ export class EqualizerController {
     this.input.disconnect();
     this.output.disconnect();
     this.current = null;
-    this.safetyFilters.forEach((filter) => filter.disconnect());
-    this.safetyFilters = [];
+    this.sampler?.stop();
+    this.sampler = null;
+    this.response = null;
+    this.target = null;
+    this.pending = null;
+    this.requestKey = null;
   }
 }

@@ -23,10 +23,16 @@ test('low sample rate keeps the configured 20 bands while excluding frequencies 
     source.buffer.getChannelData(0).fill(0.2);
     fixture.initializeAudioGraph(context, source);
     const filters: BiquadFilterNode[] = [];
+    const audible = new Set<BiquadFilterNode>();
     const create = context.createBiquadFilter.bind(context);
     context.createBiquadFilter = () => {
       const node = create();
       filters.push(node);
+      const connect = node.connect.bind(node);
+      node.connect = ((target: AudioNode) => {
+        audible.add(node);
+        return connect(target);
+      }) as typeof node.connect;
       return node;
     };
     const config = {
@@ -47,7 +53,7 @@ test('low sample rate keeps the configured 20 bands while excluding frequencies 
     const sample = (await context.startRendering()).getChannelData(0)[6000];
     fixture.plugin.renderer.stop();
     return {
-      count: filters.length,
+      count: audible.size,
       highest: Math.max(...filters.map((node) => node.frequency.value)),
       retained: config.profile.bands.length,
       sample,

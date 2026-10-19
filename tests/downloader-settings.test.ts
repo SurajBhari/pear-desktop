@@ -7,7 +7,7 @@ import solid from 'vite-plugin-solid';
 
 test('actual Solid settings persist independent preferences, choose offered variant and show local uncertain/error states accessibly', async ({
   page,
-}) => {
+}, testInfo) => {
   const root = path.resolve(import.meta.dirname, '..');
   const temp = await mkdtemp(path.join(root, '.tmp-dl-ui-'));
   try {
@@ -61,6 +61,47 @@ export const t=instance.t.bind(instance);
     });
     await page.addScriptTag({ content: chunk.code });
     await expect(page.getByRole('dialog')).toBeVisible();
+    for (const [name, width, height] of [
+      ['desktop', 1024, 768],
+      ['short', 900, 280],
+      ['small', 375, 320],
+    ] as const) {
+      await page.setViewportSize({ width, height });
+      await page.getByRole('dialog').evaluate((node) => {
+        const scrollport =
+          node.querySelector<HTMLElement>('[data-panel-scroll]') ?? node;
+        scrollport.scrollTop = scrollport.scrollHeight;
+      });
+      const close = page.getByRole('dialog').locator('header button').first();
+      const bounds = await close.boundingBox();
+      expect(
+        bounds,
+        `${name}: close button must have a rendered box`,
+      ).not.toBeNull();
+      if (!bounds) throw new Error('Close button is not rendered');
+      expect(bounds.x).toBeGreaterThanOrEqual(0);
+      expect(bounds.y).toBeGreaterThanOrEqual(0);
+      expect(bounds.x + bounds.width).toBeLessThanOrEqual(width);
+      expect(bounds.y + bounds.height).toBeLessThanOrEqual(height);
+      expect(
+        await close.evaluate((button) => {
+          const rect = button.getBoundingClientRect();
+          return (
+            document
+              .elementFromPoint(
+                rect.x + rect.width / 2,
+                rect.y + rect.height / 2,
+              )
+              ?.closest('button') === button
+          );
+        }),
+        `${name}: close button must be hit-testable after scrolling`,
+      ).toBe(true);
+      await page.screenshot({
+        path: testInfo.outputPath(`downloader-${name}.png`),
+      });
+    }
+    await page.setViewportSize({ width: 480, height: 800 });
     await page
       .getByRole('combobox', { name: 'Source audio', exact: true })
       .selectOption('itag');
@@ -87,7 +128,9 @@ export const t=instance.t.bind(instance);
       duplicatePolicy: 'keep-better',
     });
     await page.getByRole('dialog').evaluate((el) => (el.scrollTop = 0));
-    await page.screenshot({ path: '/tmp/pear-dl-settings-ui.png' });
+    await page.screenshot({
+      path: testInfo.outputPath('downloader-settings.png'),
+    });
     await page
       .getByRole('button', { name: 'Show available qualities', exact: true })
       .click();
@@ -103,7 +146,9 @@ export const t=instance.t.bind(instance);
     await page
       .getByRole('group', { name: 'Available audio for current track' })
       .scrollIntoViewIfNeeded();
-    await page.screenshot({ path: '/tmp/pear-dl-chooser-ui.png' });
+    await page.screenshot({
+      path: testInfo.outputPath('downloader-chooser.png'),
+    });
     await page
       .getByRole('button', { name: 'Download selected quality', exact: true })
       .click();
@@ -130,8 +175,19 @@ export const t=instance.t.bind(instance);
         .getByRole('dialog')
         .evaluate((el) => el.scrollWidth <= el.clientWidth + 1),
     ).toBe(true);
-    await page.screenshot({ path: '/tmp/pear-dl-library-ui.png' });
-    await page.keyboard.press('Escape');
+    await page.screenshot({
+      path: testInfo.outputPath('downloader-library.png'),
+    });
+    const closeBounds = await page
+      .getByRole('dialog')
+      .locator('header button')
+      .first()
+      .boundingBox();
+    if (!closeBounds) throw new Error('Close button is not rendered');
+    await page.mouse.click(
+      closeBounds.x + closeBounds.width / 2,
+      closeBounds.y + closeBounds.height / 2,
+    );
     await expect(page.getByRole('dialog')).not.toBeVisible();
     await page.setContent('<html><body></body></html>');
     await page.addScriptTag({ content: 'window.fixtureLanguage="ru";' });
@@ -157,7 +213,11 @@ export const t=instance.t.bind(instance);
         exact: true,
       }),
     ).toBeVisible();
-    await page.screenshot({ path: '/tmp/pear-dl-settings-ru.png' });
+    await page.screenshot({
+      path: testInfo.outputPath('downloader-settings-ru.png'),
+    });
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('dialog')).not.toBeVisible();
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

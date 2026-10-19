@@ -51,7 +51,7 @@ export async function equalizerBundle(extra = '', translate = false) {
               return 'export const createPlugin=value=>value;';
             if (id === '\0@/i18n')
               return translate
-                ? `const resources=${readFileSync(path.join(root, 'src/i18n/resources/en.json'), 'utf8')};export const t=key=>key.split('.').reduce((value,part)=>value?.[part],resources)??key;`
+                ? `import i18next from 'i18next';const resources=${readFileSync(path.join(root, 'src/i18n/resources/en.json'), 'utf8')};const instance=i18next.createInstance();instance.init({initImmediate:false,lng:'en',resources:{en:{translation:resources}},interpolation:{escapeValue:false}});export const t=instance.t.bind(instance);`
                 : 'export const t=key=>key;';
             if (id === '\0custom-electron-prompt')
               return 'export default async()=>undefined;';
