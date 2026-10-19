@@ -7,6 +7,72 @@ import {
   normalizeConfig,
 } from '../src/plugins/equalizer/config';
 
+test('a failed same-time replacement retains the incoming audible target', async ({
+  page,
+}) => {
+  await fixturePage(
+    page,
+    await equalizerBundle(
+      "export {EqualizerController} from '@/plugins/equalizer/controller';",
+    ),
+  );
+  const result = await page.evaluate(async () => {
+    const { EqualizerController } = (window as any).EqualizerFixture;
+    const context = new OfflineAudioContext(1, 4800, 48000);
+    const tone = context.createOscillator();
+    const quiet = context.createGain();
+    tone.frequency.value = 440;
+    quiet.gain.value = 0.01;
+    tone.connect(quiet);
+    const controller = new EqualizerController({
+      audioContext: context,
+      insertMaster: (input: AudioNode, output: AudioNode) => {
+        quiet.connect(input);
+        output.connect(context.destination);
+        return () => {
+          quiet.disconnect(input);
+          output.disconnect(context.destination);
+        };
+      },
+    });
+    const profile = (gain: number) => ({
+      mode: 'custom',
+      preamp: 0,
+      bands: [{ id: 'a', type: 'peaking', frequency: 1000, gain, Q: 1 }],
+    });
+    controller.apply(profile(0), false, true);
+    controller.apply(profile(6), false, true);
+    const original = controller.input.connect;
+    let rejected = false;
+    controller.input.connect = () => {
+      throw new Error('Owned connection failure');
+    };
+    try {
+      controller.apply(profile(9), false, true);
+    } catch {
+      rejected = true;
+    } finally {
+      controller.input.connect = original;
+    }
+    // Retrying the previous target must not deduplicate a disconnected chain.
+    controller.apply(profile(6), false, true);
+    const target = controller.getResponse();
+    tone.start();
+    const rendered = await context.startRendering();
+    const tail = rendered.getChannelData(0).slice(3360, 4320);
+    const rms = Math.sqrt(
+      tail.reduce((sum, sample) => sum + sample * sample, 0) / tail.length,
+    );
+    controller.stop();
+    tone.disconnect();
+    quiet.disconnect();
+    return { rejected, rms, preamp: target.effectivePreampDb };
+  });
+  expect(result.rejected).toBe(true);
+  expect(result.rms).toBeGreaterThan(0.001);
+  expect(result.preamp).toBeCloseTo(-6.1, 1);
+});
+
 test('auto preamp is opt-in across legacy schemas and persists only on explicit edits', () => {
   for (const schemaVersion of [0, 2]) {
     const raw = { ...defaultConfig, schemaVersion, autoPreamp: true };

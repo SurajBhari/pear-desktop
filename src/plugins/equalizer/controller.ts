@@ -151,14 +151,10 @@ export class EqualizerController {
       commitTarget();
       return;
     }
-    // Same-time edits often replace an inaudible incoming chain. Prune those first.
-    for (const old of this.chains)
-      if (this.levelAt(old, now) === 0) {
-        this.chains.delete(old);
-        this.destroy(old);
-      }
     // A busy or suspended context must not accumulate an unbounded number of
     // correlated fading chains. The existing retirement owner drains the latest edit.
+    // Keep incoming chains until their replacement is connected. A failed
+    // connection must leave the previous target intact, even at zero fade level.
     if (this.chains.size >= 4) {
       this.pending = { profile: structuredClone(profile), bypass, autoPreamp };
       commitTarget();

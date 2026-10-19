@@ -90,7 +90,7 @@ export function createResponseView(read: () => EqualizerResponse | null) {
     let path = '';
     response.frequencies.forEach((frequency, i) => {
       if (frequency < start || frequency > end) return;
-      path += `${path ? 'L' : 'M'}${x(frequency).toFixed(2)} ${y(response!.gainsDb[i]).toFixed(2)} `;
+      path += `${path ? 'L' : 'M'}${x(frequency).toFixed(2)} ${y(response.gainsDb[i]).toFixed(2)} `;
     });
     curve.setAttribute('d', path);
   };

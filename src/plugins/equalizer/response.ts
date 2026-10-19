@@ -48,7 +48,10 @@ export class EqualizerResponseSampler {
     };
     // Both scales cover shelf/pass transitions and peaks outside the audible graph range.
     const lower = Math.min(1, nyquist / 1000);
-    for (let i = 0; i < 384; i++) add(lower * (nyquist / lower) ** (i / 383));
+    for (let i = 0; i < 384; i++) {
+      const scale = (nyquist / lower) ** (i / 383);
+      add(lower * scale);
+    }
     for (let i = 1; i < 128; i++) add((nyquist * i) / 128);
     for (const [i, band] of bands.entries()) {
       if (
@@ -70,8 +73,9 @@ export class EqualizerResponseSampler {
       // Narrow centers need local samples even when two peaks share one coarse interval.
       const width = Math.min(band.frequency, nyquist - band.frequency) / band.Q;
       for (const offset of [0.0625, 0.125, 0.25, 0.5, 1, 2, 4, 8]) {
-        add(band.frequency - width * offset);
-        add(band.frequency + width * offset);
+        const distance = width * offset;
+        add(band.frequency - distance);
+        add(band.frequency + distance);
       }
     }
     let frequencies: number[] = [];
@@ -116,8 +120,10 @@ export class EqualizerResponseSampler {
       for (const { index } of peaks) {
         const left = frequencies[index - 1];
         const right = frequencies[index + 1];
-        for (let step = 1; step < 16; step++)
-          add(left + ((right - left) * step) / 16);
+        for (let step = 1; step < 16; step++) {
+          const distance = ((right - left) * step) / 16;
+          add(left + distance);
+        }
       }
       if (points.size === before) break;
     }
