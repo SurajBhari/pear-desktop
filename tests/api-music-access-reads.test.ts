@@ -129,7 +129,7 @@ async function fixture(rest = false) {
   );
   const g = m;
   const folder = await mkdtemp(path.join(tmpdir(), 'pear-access-reads-'));
-  let now = Date.now();
+  const now = Date.now;
   const config = {
     enabled: true,
     musicApiEnabled: rest,
@@ -137,7 +137,7 @@ async function fixture(rest = false) {
     port: 26538,
     useHttps: false,
   };
-  const store = new g.MusicGrantStore(path.join(folder, 'owned'), () => now);
+  const store = new g.MusicGrantStore(path.join(folder, 'owned'), now);
   const grant = await store.issue(
     'Owned MCP',
     'mcp',
@@ -155,7 +155,7 @@ async function fixture(rest = false) {
     config,
     grants: store,
     broker: f.broker,
-    now: () => now,
+    now,
     resolveAccessOwner: (transport: string, audience: string) =>
       transport === 'mcp' && audience === resource ? registered : undefined,
     commentsWeb: {
@@ -221,9 +221,6 @@ async function fixture(rest = false) {
     finish,
     webCalls,
     webResponses,
-    advance: (ms: number) => {
-      now += ms;
-    },
     register: (value: any) => {
       registered = value;
     },
