@@ -58,9 +58,11 @@ export function openEqualizerPanel(
   let disposed = false;
   let selectedPreset = '';
   let updateResponse = () => {};
+  let disposeResponse = () => {};
   const dispose = () => {
     if (disposed) return;
     disposed = true;
+    disposeResponse();
     flush();
     dialog.close();
     dialog.remove();
@@ -77,6 +79,8 @@ export function openEqualizerPanel(
   });
   function render() {
     if (disposed) return;
+    disposeResponse();
+    disposeResponse = () => {};
     updateResponse = () => {};
     body.replaceChildren();
     body.append(error);
@@ -194,6 +198,7 @@ export function openEqualizerPanel(
     autoHelp.className = 'eq-notice';
     autoHelp.textContent = t('plugins.equalizer.editor.auto-preamp-help');
     const preview = createResponseView(response);
+    disposeResponse = preview.dispose;
     updateResponse = () => {
       automatic.checked = normalizeConfig(getConfig()).autoPreamp;
       preview.refresh();

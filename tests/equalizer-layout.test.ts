@@ -39,13 +39,29 @@ test('the actual translated 20-band editor fits desktop and narrow viewports wit
     ['small', 375, 280],
   ] as const) {
     await page.setViewportSize({ width, height });
-    const geometry = await page.locator('dialog').evaluate((node) => ({
-      width: node.getBoundingClientRect().width,
-      scroll: node.scrollWidth,
-      client: node.clientWidth,
-    }));
+    const geometry = await page.locator('dialog').evaluate((node) => {
+      const children = node.querySelectorAll<HTMLElement>(
+        '.eq-content, .eq-response, .eq-graphic-scroll, .eq-bands',
+      );
+      return {
+        width: node.getBoundingClientRect().width,
+        scroll: node.scrollWidth,
+        client: node.clientWidth,
+        children: Array.from(children, (child) => ({
+          name: child.className,
+          width: child.getBoundingClientRect().width,
+          scroll: child.scrollWidth,
+          client: child.clientWidth,
+        })),
+      };
+    });
+    await page.screenshot({
+      path: testInfo.outputPath(`EQ-20-${name}-initial.png`),
+    });
     expect(geometry.width).toBeLessThan(width);
-    expect(geometry.scroll).toBeLessThanOrEqual(geometry.client + 1);
+    expect(geometry.scroll, JSON.stringify(geometry)).toBeLessThanOrEqual(
+      geometry.client + 1,
+    );
     await page.getByRole('dialog').evaluate((node) => {
       const scrollport =
         node.querySelector<HTMLElement>('[data-panel-scroll]') ?? node;

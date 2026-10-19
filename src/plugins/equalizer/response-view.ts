@@ -26,7 +26,9 @@ export function createResponseView(read: () => EqualizerResponse | null) {
   help.className = 'eq-response-help';
   help.textContent = t('plugins.equalizer.editor.response-help');
   element.append(caption, svg, help);
+  let disposed = false;
   const refresh = () => {
+    if (disposed) return;
     let response: EqualizerResponse | null = null;
     try {
       response = read();
@@ -40,6 +42,11 @@ export function createResponseView(read: () => EqualizerResponse | null) {
         })
       : t('plugins.equalizer.editor.response-unavailable');
     if (!response) return;
+    const width = Math.max(240, svg.getBoundingClientRect().width || 800);
+    const right = width - 12;
+    const plotWidth = width - 68;
+    // Keep axis text at CSS-pixel size when the panel gets narrower.
+    svg.setAttribute('viewBox', `0 0 ${width} 180`);
     const top = Math.max(
       12,
       Math.ceil(Math.max(...response.gainsDb) / 12) * 12,
@@ -50,8 +57,8 @@ export function createResponseView(read: () => EqualizerResponse | null) {
     const start = Math.min(20, end / 2);
     const x = (frequency: number) => {
       const position =
-        (Math.log(frequency / start) / Math.log(end / start)) * 744;
-      return 40 + position;
+        (Math.log(frequency / start) / Math.log(end / start)) * plotWidth;
+      return 56 + position;
     };
     const y = (gain: number) => {
       const position =
@@ -74,8 +81,8 @@ export function createResponseView(read: () => EqualizerResponse | null) {
     labels.replaceChildren();
     let lines = '';
     for (const gain of [top, 0, bottom]) {
-      lines += `M40 ${y(gain)}H784 `;
-      text(`${gain} dB`, 32, y(gain) + 4, 'end');
+      lines += `M56 ${y(gain)}H${right} `;
+      text(`${gain} dB`, 48, y(gain) + 4, 'end');
     }
     for (const frequency of [20, 100, 1000, 10000, 20000]) {
       if (frequency < start || frequency > end) continue;
@@ -84,6 +91,7 @@ export function createResponseView(read: () => EqualizerResponse | null) {
         frequency >= 1000 ? `${frequency / 1000}k` : `${frequency}`,
         x(frequency),
         174,
+        frequency === 20000 ? 'end' : 'middle',
       );
     }
     grid.setAttribute('d', lines);
@@ -94,6 +102,15 @@ export function createResponseView(read: () => EqualizerResponse | null) {
     });
     curve.setAttribute('d', path);
   };
+  const observer = new ResizeObserver(refresh);
+  observer.observe(svg);
   refresh();
-  return { element, refresh };
+  return {
+    element,
+    refresh,
+    dispose: () => {
+      disposed = true;
+      observer.disconnect();
+    },
+  };
 }
