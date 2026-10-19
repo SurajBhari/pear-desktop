@@ -6,17 +6,22 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      source_only:
+        description: Run source checks without rebuilding and running the full test matrix
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.source_only && 'source' || 'full' }}
   cancel-in-progress: true
 
 jobs:
   test:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && inputs.source_only != true
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
