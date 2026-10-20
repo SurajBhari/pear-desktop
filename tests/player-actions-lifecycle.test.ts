@@ -186,6 +186,8 @@ test('configuration commits are ordered and an older write echo cannot undo newe
       active: true,
       slow: 0.7,
       reverbIntensity: 0,
+      wetHighpass: 180,
+      wetLowpass: 6500,
     });
     writes[1].resolve();
     await f.settle();

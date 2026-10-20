@@ -854,7 +854,7 @@
         "use-custom": "Use as Custom",
         "preamp": "Preamp (dB)",
         "auto-preamp": "Automatic preamp",
-        "auto-preamp-help": "Reduces gain to leave headroom for overlapping filters. Editing the manual preamp turns automatic mode off. This is not a limiter.",
+        "auto-preamp-help": "Uses filter boosts and the current player volume to reduce gain only when more headroom is needed. With other audio mixed in, it assumes full volume. Editing manual preamp turns automatic mode off. This is not a limiter.",
         "response": "Target frequency response",
         "response-help": "Sampled filter response at the current audio sample rate. A new target may take a moment to become audible during a transition.",
         "response-unavailable": "Play a track to preview the response",
@@ -873,7 +873,9 @@
         "delete": "Delete preset",
         "headroom": "Positive boosts can clip. Reduce preamp for headroom. Shelf filters do not use Q.",
         "unsupported": "These stored settings need a supported version and at most 64 valid bands. Original data is preserved; editing and EQ are bypassed.",
-        "nyquist": "Some bands exceed this audio context frequency range and are inactive. Their settings are preserved."
+        "nyquist": "Some bands exceed this audio context frequency range and are inactive. Their settings are preserved.",
+        "graph-help": "Click the graph to add a peaking band; drag a point to change frequency and gain. Points include the applied preamp. Use arrow keys on a point (one semitone / 0.1 dB), or the Add band button and numeric fields. The headroom scale stays fixed while dragging.",
+        "graph-band": "Band {{number}}: {{frequency}} Hz, {{gain}} dB. Arrow keys change frequency and gain."
       },
       "description": "Adds an equalizer to the player",
       "menu": {
@@ -1437,6 +1439,8 @@
         "active": "Active",
         "reset": "Reset",
         "reverb": "Reverb",
+        "wet-highpass": "Reverb high-pass",
+        "wet-lowpass": "Reverb low-pass",
         "speed": "Speed",
         "title": "Slowed + Reverb"
       }

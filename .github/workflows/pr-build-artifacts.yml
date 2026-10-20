@@ -64,8 +64,9 @@ jobs:
       - name: Build on macOS
         if: startsWith(matrix.os, 'macOS')
         run: |
-          pnpm dist:mac
-          pnpm dist:mac:arm64
+          pnpm clean
+          pnpm build
+          pnpm exec electron-builder --mac -p never
 
       - name: Install Linux dependencies
         if: startsWith(matrix.os, 'ubuntu')
