@@ -11,6 +11,11 @@ export interface RendererAudioGraph {
   registerMedia(element: HTMLMediaElement, gain?: GainNode): () => void;
   readonly auxiliaryMediaCount: number;
   observeAuxiliaryMedia(listener: (count: number) => void): () => void;
+  registerVolumePreparation(
+    phase: 'attenuate' | 'scale',
+    listener: () => void,
+  ): () => void;
+  prepareVolumeChange(): boolean;
 }
 
 let current: RendererAudioGraph | null = null;
@@ -39,9 +44,33 @@ export function initializeAudioGraph(
   dryInput.connect(masterInput);
   masterInput.connect(musicGate);
   musicGate.connect(audioContext.destination);
+  const volumePreparations = {
+    attenuate: new Set<() => void>(),
+    scale: new Set<() => void>(),
+  };
+  let preparingVolume = false;
+  const prepareVolumeChange = () => {
+    if (preparingVolume) return false;
+    preparingVolume = true;
+    try {
+      // Audio can advance between JS event listeners. Complete conservative
+      // attenuation and wet scaling before any owner may relax its target.
+      for (const phase of ['attenuate', 'scale'] as const)
+        for (const listener of [...volumePreparations[phase]])
+          if (volumePreparations[phase].has(listener)) listener();
+      return true;
+    } finally {
+      // A failed preparation must stop the caller's relaxation, while a later
+      // event can retry. Nested preparation cannot reorder phases.
+      preparingVolume = false;
+    }
+  };
   const main = audioSource.mediaElement;
   const syncMute = () => {
-    musicGate.gain.value = main?.muted || main?.volume === 0 ? 0 : 1;
+    if (main?.muted || main?.volume === 0) musicGate.gain.value = 0;
+    // Opening the renderer gate must never expose stale zero/muted EQ gains
+    // before the plugins' later volume listeners get their turn.
+    else if (prepareVolumeChange()) musicGate.gain.value = 1;
   };
   syncMute();
   main?.addEventListener('volumechange', syncMute);
@@ -122,6 +151,13 @@ export function initializeAudioGraph(
       notifyObserver(owned);
       return () => auxiliaryObservers.delete(owned);
     },
+    registerVolumePreparation(phase, listener) {
+      const owned = () => listener();
+      const callbacks = volumePreparations[phase];
+      callbacks.add(owned);
+      return () => callbacks.delete(owned);
+    },
+    prepareVolumeChange,
     registerMedia(element, suppliedGain) {
       if (element === audioSource.mediaElement)
         throw new Error('Main media is already registered');

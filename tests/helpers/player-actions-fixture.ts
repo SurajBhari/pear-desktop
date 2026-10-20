@@ -113,7 +113,16 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
   };
   class Node {
     connections = new Set<any>();
-    gain = { value: 1 };
+    gain = {
+      value: 1,
+      cancelScheduledValues() {
+        return this;
+      },
+      setValueAtTime(value: number) {
+        this.value = value;
+        return this;
+      },
+    };
     frequency = { value: 350 };
     Q = { value: 1 };
     type = 'lowpass';
@@ -297,6 +306,7 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
       destination: { id: 'destination-' + id },
       state: 'running',
       sampleRate: 48000,
+      currentTime: 0,
       addEventListener() {},
       removeEventListener() {},
       createGain: () => new Node(context, 'gain'),

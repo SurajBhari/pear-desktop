@@ -268,7 +268,7 @@ test('silencing during module load retires wet filters and re-engagement builds 
         ),
       ).toHaveLength(2);
       expect(graph.audioSource.connections).toEqual(
-        new Set([graph.audioGraph.dryInput, graph.unrelated, c.reverbNode]),
+        new Set([graph.audioGraph.dryInput, graph.unrelated, c.wetInput]),
       );
       r.onConfigChange({
         ...r.getCurrent(),

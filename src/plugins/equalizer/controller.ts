@@ -12,6 +12,8 @@ type Chain = {
   level: GainNode;
   key: string;
   autoPreamp: boolean;
+  peak: number | null;
+  preampDb: number;
   envelope: { from: number; to: number; start: number; end: number };
   retire?: ReturnType<typeof setTimeout>;
 };
@@ -38,10 +40,65 @@ export class EqualizerController {
   } | null = null;
   private requestKey: string | null = null;
   private stopped = false;
+  private latest: {
+    profile: EqualizerProfile;
+    bypass: boolean;
+    autoPreamp: boolean;
+  } | null = null;
+  private unsubscribeAuxiliary: (() => void) | undefined;
+  private media: HTMLMediaElement | undefined;
+  private unsubscribeVolumePreparation: (() => void) | undefined;
+  private preparedSource: string | null = null;
+  private sourceChanged = () => {
+    if (this.stopped || !this.latest) return;
+    const { profile, bypass, autoPreamp } = this.latest;
+    // Tighten all audible chains before replacing a target. Crossfading alone
+    // would leave the old low-volume compensation audible for another 20 ms.
+    if (!this.prepareVolumeChange()) return;
+    this.apply(profile, bypass, autoPreamp);
+    this.onResponseChange?.();
+  };
 
-  constructor(private graph: RendererAudioGraph) {
+  private prepareVolumeChange() {
+    if (this.graph.prepareVolumeChange) return this.graph.prepareVolumeChange();
+    this.prepareSourceVolume();
+    return true;
+  }
+
+  private sourceBasis() {
+    return JSON.stringify([
+      this.sourceVolume(),
+      this.graph.auxiliaryMediaCount ?? 0,
+    ]);
+  }
+
+  private prepareSourceVolume = () => {
+    if (this.stopped || !this.latest) return;
+    const basis = this.sourceBasis();
+    // Ordinary config echoes must not cut short an existing manual handover.
+    if (basis === this.preparedSource) return;
+    this.protectChains(
+      this.sourceVolume(),
+      this.latest.autoPreamp && !this.latest.bypass,
+    );
+    this.preparedSource = basis;
+  };
+
+  constructor(
+    private graph: RendererAudioGraph,
+    private onResponseChange?: () => void,
+  ) {
     this.input = graph.audioContext.createGain();
     this.output = graph.audioContext.createGain();
+    this.media = graph.audioSource?.mediaElement;
+    this.unsubscribeVolumePreparation = graph.registerVolumePreparation?.(
+      'attenuate',
+      this.prepareSourceVolume,
+    );
+    this.media?.addEventListener('volumechange', this.sourceChanged);
+    this.unsubscribeAuxiliary = graph.observeAuxiliaryMedia?.(
+      this.sourceChanged,
+    );
   }
 
   apply(profile: EqualizerProfile, bypass: boolean, autoPreamp = false) {
@@ -79,14 +136,21 @@ export class EqualizerController {
     const bands = bypass
       ? []
       : profile.bands.filter((b) => b.frequency < context.sampleRate / 2);
+    const enabledAuto = autoPreamp && !bypass;
+    const sourceVolume = enabledAuto ? this.sourceVolume() : 1;
     const requestKey = JSON.stringify([
       bands,
       profile.preamp,
       bypass,
       autoPreamp,
+      sourceVolume,
     ]);
-    if (this.requestKey === requestKey) return;
-    const enabledAuto = autoPreamp && !bypass;
+    if (this.requestKey === requestKey) {
+      // The valid DSP request may be unchanged while a wet volume event is
+      // still queued. Preparation must also precede this deduplicated exit.
+      this.prepareVolumeChange();
+      return;
+    }
     // Validate the original manual profile before deriving attenuation. Auto must not
     // expand the supported DSP range or hide a massive gain behind underflow.
     const smoothAllowed = this.validateResponse(
@@ -94,20 +158,24 @@ export class EqualizerController {
       bypass ? 0 : profile.preamp,
     );
     const sampled = enabledAuto ? this.sample(bands, profile.preamp) : null;
+    // External config edits can precede the queued media volume event. Validate
+    // the requested DSP first, then synchronize source safety before any new
+    // target can relax attenuation. A failed preparation commits nothing.
+    if (!this.prepareVolumeChange()) return;
     // A sampled response is not a continuum peak limiter. The small margin covers
     // native Float32 response rounding and residual error between refined samples.
     const peak = sampled?.peakGainDb ?? 0;
     const effectivePreamp = bypass
       ? 0
       : enabledAuto
-        ? peak > 0.0001
-          ? -peak - 0.1
-          : 0
+        ? this.autoPreamp(peak, sourceVolume)
         : profile.preamp;
     const preamp = 10 ** (effectivePreamp / 20);
     const key = JSON.stringify([bands, effectivePreamp, enabledAuto]);
     const commitTarget = () => {
       this.requestKey = requestKey;
+      this.latest = { profile: structuredClone(profile), bypass, autoPreamp };
+      this.preparedSource = this.sourceBasis();
       this.target = {
         bands: structuredClone(bands),
         preamp: effectivePreamp,
@@ -145,6 +213,8 @@ export class EqualizerController {
         smooth(filter.gain, bands[i].gain);
         smooth(filter.Q, bands[i].Q);
       });
+      current.preampDb = effectivePreamp;
+      current.peak = null;
       current.bands = structuredClone(bands);
       current.key = key;
       this.pending = null;
@@ -165,6 +235,8 @@ export class EqualizerController {
       filters: [],
       key,
       autoPreamp: enabledAuto,
+      peak: sampled?.peakGainDb ?? null,
+      preampDb: effectivePreamp,
       bands: structuredClone(bands),
       level: context.createGain(),
       envelope: { from: current ? 0 : 1, to: 1, start: now, end: now },
@@ -236,6 +308,45 @@ export class EqualizerController {
     this.current = chain;
     this.pending = null;
     commitTarget();
+  }
+
+  private sourceVolume() {
+    // Auxiliary dry inputs have independent gains/volume: the main element's
+    // headroom cannot be assumed for their sum. Keep the full-scale assumption.
+    if (this.graph.auxiliaryMediaCount > 0 || !this.media) return 1;
+    const { volume, muted } = this.media;
+    if (!Number.isFinite(volume) || volume < 0 || volume > 1) return 1;
+    return muted ? 0 : volume;
+  }
+
+  private autoPreamp(peak: number, volume: number) {
+    // MediaElementAudioSource already includes media volume. This only uses
+    // its headroom; it must not multiply the signal by volume a second time.
+    if (volume === 0) return 0;
+    const sourceGainDb = 20 * Math.log10(volume);
+    const total = peak + sourceGainDb;
+    return total > 0.0001 ? -total - 0.1 : 0;
+  }
+
+  private protectChains(volume: number, automaticTarget: boolean) {
+    const now = this.graph.audioContext.currentTime;
+    for (const chain of this.chains) {
+      if (!chain.autoPreamp) {
+        if (!automaticTarget) continue;
+        // Retiring manual filters may still be coefficient-morphing. Silence
+        // that unbounded transition rather than infer its instantaneous peak.
+        chain.preamp.gain.cancelScheduledValues(now);
+        chain.preamp.gain.setValueAtTime(0, now);
+        chain.key = '';
+        continue;
+      }
+      const safe = this.autoPreamp(chain.peak ?? 0, volume);
+      if (safe >= chain.preampDb) continue;
+      chain.preamp.gain.cancelScheduledValues(now);
+      chain.preamp.gain.setValueAtTime(10 ** (safe / 20), now);
+      chain.preampDb = safe;
+      chain.key = JSON.stringify([chain.bands, safe, chain.autoPreamp]);
+    }
   }
 
   getResponse(): EqualizerResponse | null {
@@ -319,6 +430,13 @@ export class EqualizerController {
   stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this.media?.removeEventListener('volumechange', this.sourceChanged);
+    this.unsubscribeAuxiliary?.();
+    this.unsubscribeAuxiliary = undefined;
+    this.unsubscribeVolumePreparation?.();
+    this.unsubscribeVolumePreparation = undefined;
+    this.latest = null;
+    this.preparedSource = null;
     this.release?.();
     this.release = null;
     for (const chain of this.chains) this.destroy(chain);

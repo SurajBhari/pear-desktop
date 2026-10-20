@@ -158,7 +158,12 @@ class DattorroReverbProcessor extends AudioWorkletProcessor {
     const sr = this.sr;
 
     for (let i = 0; i < n; i++) {
-      let x = (L[i] + R[i]) * 0.5;
+      // Native media volume can change before its JS event updates the wet
+      // normalizer. Bound that short mismatch before it enters delay memory;
+      // finite full-scale PCM is unchanged. This is wet input protection only.
+      const left = Number.isFinite(L[i]) ? Math.max(-1, Math.min(1, L[i])) : 0;
+      const right = Number.isFinite(R[i]) ? Math.max(-1, Math.min(1, R[i])) : 0;
+      let x = (left + right) * 0.5;
 
       this.preBuf[this.preIdx] = x;
       this.preIdx = (this.preIdx + 1) % this.preBuf.length;
