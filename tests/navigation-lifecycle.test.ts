@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
 import { test, expect } from '@playwright/test';
 import { Window } from 'happy-dom';
 import { build } from 'vite';
@@ -111,7 +112,10 @@ test('repeated navigation toggles dispose Solid owners and detach their listener
   try {
     const renderer = f.plugin.renderer;
     for (let cycle = 0; cycle < 20; cycle++) {
-      renderer.start();
+      await renderer.start({
+        getConfig: () => ({ enabled: true, swipeNavigation: true }),
+        ipc: { on() {}, removeAllListeners() {} },
+      });
       expect(f.dom.document.querySelectorAll('mdui-button-icon')).toHaveLength(
         2,
       );
@@ -139,6 +143,59 @@ test('repeated navigation toggles dispose Solid owners and detach their listener
         'Native',
       );
     }
+  } finally {
+    await f.close();
+  }
+});
+
+test('native browser commands forward only history intents and release old windows', async () => {
+  const f = await fixture();
+  const window = new EventEmitter() as any;
+  window.isDestroyed = () => false;
+  window.webContents = { isDestroyed: () => false };
+  const sent: unknown[][] = [];
+  const context = {
+    window,
+    ipc: { send: (...args: unknown[]) => sent.push(args) },
+  };
+  try {
+    f.plugin.backend?.start(context);
+    window.emit('app-command', {}, 'browser-backward');
+    window.emit('app-command', {}, 'browser-forward');
+    window.emit('app-command', {}, 'media-play-pause');
+    expect(sent).toEqual([
+      ['navigation-history-command', 'back'],
+      ['navigation-history-command', 'forward'],
+    ]);
+    f.plugin.backend?.start(context);
+    window.emit('app-command', {}, 'browser-backward');
+    expect(sent).toHaveLength(3);
+    window.emit('closed');
+    window.emit('app-command', {}, 'browser-backward');
+    expect(sent).toHaveLength(3);
+    f.plugin.backend?.stop();
+    f.plugin.backend?.stop();
+    expect(window.listenerCount('app-command')).toBe(0);
+    expect(window.listenerCount('closed')).toBe(0);
+  } finally {
+    f.plugin.backend?.stop();
+    await f.close();
+  }
+});
+
+test('a failed settings read leaves no navigation controls or Solid owners behind', async () => {
+  const f = await fixture();
+  try {
+    await expect(
+      f.plugin.renderer.start({
+        getConfig: async () => {
+          throw new Error('Settings unavailable');
+        },
+        ipc: { on() {}, removeAllListeners() {} },
+      }),
+    ).rejects.toThrow('Settings unavailable');
+    expect(f.dom.document.querySelectorAll('mdui-button-icon')).toHaveLength(0);
+    expect(f.probe.live).toBe(0);
   } finally {
     await f.close();
   }
