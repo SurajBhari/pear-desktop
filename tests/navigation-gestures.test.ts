@@ -107,6 +107,12 @@ async function swipe(page: Page, x: number, y = 0) {
   await page.mouse.wheel(x, y);
 }
 
+async function oppositeStroke(page: Page, direction = -1) {
+  // A new stroke can begin with tiny deltas before meaningful movement.
+  for (const delta of [1, 2, 3, 5, 21, 34, 55, 70])
+    await page.mouse.wheel(-direction * delta, 0);
+}
+
 test('trusted horizontal swipes navigate history once per stream in each direction', async ({
   page,
 }) => {
@@ -121,6 +127,309 @@ test('trusted horizontal swipes navigate history once per stream in each directi
   await swipe(page, 80);
   await expect(page).toHaveURL('https://navigation.fixture/two');
 });
+
+for (const direction of [-1, 1] as const) {
+  test(`a deliberate opposite stroke after a long momentum tail can reverse ${direction < 0 ? 'Back' : 'Forward'} after 55 ms`, async ({
+    page,
+  }) => {
+    await fixture(page);
+    await page.mouse.move(700, 500);
+    if (direction > 0) {
+      await page.evaluate(() => history.back());
+      await expect(page).toHaveURL('https://navigation.fixture/one');
+      await page.waitForTimeout(700);
+    }
+    await swipe(page, direction * 80);
+    const destination = direction < 0 ? 'one' : 'two';
+    await expect(page).toHaveURL(`https://navigation.fixture/${destination}`);
+    // Same-direction inertia lasts over a second, with no 600 ms quiet period.
+    for (let sample = 0; sample < 12; sample++) {
+      await page.waitForTimeout(80);
+      await page.mouse.wheel(direction * 2, 1);
+    }
+    await expect(page).toHaveURL(`https://navigation.fixture/${destination}`);
+    await page.waitForTimeout(55);
+    await oppositeStroke(page, direction);
+    await expect(page).toHaveURL(
+      `https://navigation.fixture/${direction < 0 ? 'two' : 'one'}`,
+    );
+  });
+}
+
+test('a reversal needs sustained meaningful movement rather than a single large rebound', async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.mouse.move(700, 500);
+  await swipe(page, -80);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.waitForTimeout(55);
+  for (const delta of [1, 2, 3, 5, 200]) await page.mouse.wheel(delta, 0);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.mouse.wheel(20, 0);
+  await expect(page).toHaveURL('https://navigation.fixture/two');
+});
+
+for (const deltaX of [0, -1]) {
+  test(`small cumulative vertical movement with horizontal delta ${deltaX} revokes reversal eligibility`, async ({
+    page,
+  }) => {
+    await fixture(page);
+    await page.mouse.move(700, 500);
+    await swipe(page, -80);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+    await page.waitForTimeout(55);
+    for (let sample = 0; sample < 4; sample++)
+      await page.mouse.wheel(deltaX, 6);
+    await page.waitForTimeout(55);
+    await oppositeStroke(page);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+  });
+}
+
+test('tiny horizontal noise cannot erase cumulative vertical ownership', async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.mouse.move(700, 500);
+  await swipe(page, -80);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.waitForTimeout(55);
+  for (let sample = 0; sample < 4; sample++) {
+    await page.mouse.wheel(0, 6);
+    await page.mouse.wheel(1, 0);
+  }
+  await page.waitForTimeout(55);
+  await oppositeStroke(page);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+});
+
+for (const guard of ['modal', 'focus'] as const) {
+  test(`a native command blocked by ${guard} still revokes reversal eligibility`, async ({
+    page,
+  }) => {
+    await fixture(page);
+    await page.mouse.move(700, 500);
+    await swipe(page, -80);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+    await page.evaluate((guard) => {
+      if (guard === 'modal') {
+        const overlay = document.createElement('div');
+        overlay.id = 'command-overlay';
+        overlay.setAttribute('role', 'dialog');
+        overlay.textContent = 'Visible overlay';
+        document.body.append(overlay);
+      } else (document.querySelector('#editor') as HTMLInputElement).focus();
+      (window as any).navigationListeners.get('navigation-history-command')(
+        'back',
+      );
+      document.querySelector('#command-overlay')?.remove();
+      (document.activeElement as HTMLElement).blur();
+    }, guard);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+    await page.waitForTimeout(55);
+    await oppositeStroke(page);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+  });
+}
+
+test('same-direction momentum avoids enumerating history entries', async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.mouse.move(700, 500);
+  await swipe(page, -80);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.evaluate(() => {
+    const state = window as any;
+    const original = state.navigation.entries.bind(state.navigation);
+    state.historyEnumerations = 0;
+    state.navigation.entries = () => {
+      state.historyEnumerations++;
+      return original();
+    };
+  });
+  await swipe(page, -120);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  expect(await page.evaluate(() => (window as any).historyEnumerations)).toBe(
+    0,
+  );
+  await page.waitForTimeout(55);
+  await oppositeStroke(page);
+  await expect(page).toHaveURL('https://navigation.fixture/two');
+});
+
+for (const interruption of [
+  'cancellation',
+  'protected target',
+  'vertical tail',
+  'blur',
+  'external traversal',
+  'native command',
+] as const) {
+  test(`a ${interruption} after navigation revokes rapid reversal eligibility`, async ({
+    page,
+  }) => {
+    await fixture(page);
+    await page.mouse.move(700, 500);
+    await swipe(page, -80);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+    if (interruption === 'cancellation') {
+      await page.evaluate(() =>
+        window.addEventListener('wheel', (event) => event.preventDefault(), {
+          passive: false,
+          once: true,
+        }),
+      );
+      await page.mouse.wheel(-2, 0);
+    } else if (interruption === 'protected target') {
+      await page.locator('#range').hover();
+      await page.mouse.wheel(-2, 0);
+      await page.mouse.move(700, 500);
+    } else if (interruption === 'vertical tail') {
+      await page.mouse.wheel(-2, 30);
+    } else if (interruption === 'blur') {
+      await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+    } else {
+      await page.evaluate((interruption) => {
+        if (interruption === 'external traversal') history.forward();
+        else
+          (window as any).navigationListeners.get('navigation-history-command')(
+            'forward',
+          );
+      }, interruption);
+      await expect(page).toHaveURL('https://navigation.fixture/two');
+      await page.evaluate(() => history.back());
+      await expect(page).toHaveURL('https://navigation.fixture/one');
+    }
+    await page.waitForTimeout(55);
+    await oppositeStroke(page);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+  });
+}
+
+test('a missing Navigation API retains the full quiet-period fallback', async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    Object.defineProperty(window, 'navigation', { value: undefined }),
+  );
+  await fixture(page);
+  await page.mouse.move(700, 500);
+  await swipe(page, -80);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.waitForTimeout(55);
+  await oppositeStroke(page);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.waitForTimeout(700);
+  await swipe(page, 80);
+  await expect(page).toHaveURL('https://navigation.fixture/two');
+});
+
+test('a late matching traversal cannot acknowledge an expired wheel request', async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.evaluate(() => {
+    const original = history.back.bind(history);
+    (window as any).delayedHistoryBack = original;
+    history.back = () => {};
+  });
+  await page.mouse.move(700, 500);
+  await swipe(page, -80);
+  await expect(page).toHaveURL('https://navigation.fixture/two');
+  await page.waitForTimeout(700);
+  await page.evaluate(() => (window as any).delayedHistoryBack());
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.waitForTimeout(55);
+  await oppositeStroke(page);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+});
+
+test('a history entry change during a reversal candidate prevents its commit', async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.mouse.move(700, 500);
+  await swipe(page, -80);
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.waitForTimeout(55);
+  await page.mouse.wheel(20, 0);
+  await page.evaluate(() => {
+    history.pushState({}, '', '/replacement');
+    history.pushState({}, '', '/after');
+    history.back();
+  });
+  await expect(page).toHaveURL('https://navigation.fixture/replacement');
+  await swipe(page, 80);
+  await expect(page).toHaveURL('https://navigation.fixture/replacement');
+});
+
+test('queued opposite samples captured before the traversal receipt cannot reverse it', async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.evaluate(() => {
+    (window as any).delayedHistoryBack = history.back.bind(history);
+    history.back = () => {};
+  });
+  await page.mouse.move(700, 500);
+  await swipe(page, -80);
+  await page.evaluate(() => {
+    const state = window as any;
+    const original = window.setTimeout.bind(window);
+    state.originalSetTimeout = original;
+    window.setTimeout = ((callback: Function, delay: number) => {
+      if (delay === 0) {
+        state.deferredWheel = callback;
+        return original(() => {}, 60_000);
+      }
+      return original(callback as TimerHandler, delay);
+    }) as typeof window.setTimeout;
+  });
+  await oppositeStroke(page);
+  await page.evaluate(() => {
+    const state = window as any;
+    window.setTimeout = state.originalSetTimeout;
+    state.delayedHistoryBack();
+  });
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+  await page.evaluate(() => (window as any).deferredWheel());
+  await expect(page).toHaveURL('https://navigation.fixture/one');
+});
+
+for (const obstruction of [
+  'diagonal movement',
+  'canceled sample',
+  'shadow overlay',
+] as const) {
+  test(`a reversal candidate still respects ${obstruction}`, async ({
+    page,
+  }) => {
+    await fixture(page);
+    await page.mouse.move(700, 500);
+    await swipe(page, -80);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+    await page.waitForTimeout(55);
+    await page.mouse.wheel(1, 0);
+    if (obstruction === 'diagonal movement') await page.mouse.wheel(20, 30);
+    else if (obstruction === 'canceled sample') {
+      await page.evaluate(() =>
+        window.addEventListener('wheel', (event) => event.preventDefault(), {
+          passive: false,
+          once: true,
+        }),
+      );
+      await page.mouse.wheel(20, 0);
+    } else {
+      await page.locator('#shadow').evaluate((host) => {
+        host.shadowRoot!.innerHTML = '<div role="dialog">Visible overlay</div>';
+      });
+    }
+    await oppositeStroke(page);
+    await expect(page).toHaveURL('https://navigation.fixture/one');
+  });
+}
 
 for (const [name, selector] of [
   ['horizontal carousel', '#carousel'],
