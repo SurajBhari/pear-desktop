@@ -1,0 +1,52 @@
+name: Sync AutoMix on deruta
+
+# Keeps automix-on-deruta (PR #3) = deruta74/master + our AutoMix branch.
+# Pushes use a deploy key so the push starts the PR's build workflows;
+# pushes made with GITHUB_TOKEN would not.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency: automix-sync
+
+jobs:
+  sync:
+    name: Merge deruta74/master and AutoMix
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEY: ${{ secrets.AUTOMIX_SYNC_KEY != '' }}
+    steps:
+      - name: Skip without the deploy key
+        if: env.HAS_KEY != 'true'
+        run: echo "::warning::AUTOMIX_SYNC_KEY is not set, nothing synced"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        if: env.HAS_KEY == 'true'
+        with:
+          ref: automix-on-deruta
+          fetch-depth: 0
+          ssh-key: ${{ secrets.AUTOMIX_SYNC_KEY }}
+
+      - name: Merge and push
+        if: env.HAS_KEY == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags https://github.com/deruta74/pear-desktop.git master:refs/remotes/deruta/master
+          git fetch --no-tags origin claude/apple-music-auto-mix-plugin-ikpv6k:refs/remotes/origin/automix
+
+          # PR base mirrors deruta74/master
+          git push --force origin refs/remotes/deruta/master:refs/heads/deruta-upstream
+
+          before=$(git rev-parse HEAD)
+          git merge --no-edit -m "Merge deruta74/master into automix-on-deruta" deruta/master
+          git merge --no-edit -m "Merge claude/apple-music-auto-mix-plugin-ikpv6k into automix-on-deruta" origin/automix
+          if [ "$(git rev-parse HEAD)" != "$before" ]; then
+            git push origin HEAD:automix-on-deruta
+          else
+            echo "Already up to date"
+          fi
