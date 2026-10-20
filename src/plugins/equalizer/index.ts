@@ -46,7 +46,9 @@ function apply() {
     state.audioError = false;
     return;
   }
-  const controller = state.controller ?? new EqualizerController(state.graph);
+  const controller =
+    state.controller ??
+    new EqualizerController(state.graph, () => state.panel?.updateResponse());
   try {
     controller.apply(
       normalized.profile,
