@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { mock } from 'node:test';
 import { musicModuleSource } from './helpers/api-music-source';
 import { musicRendererFixture } from './helpers/api-music-renderer';
 import { musicServiceFixture } from './helpers/api-music-service';
@@ -453,18 +454,36 @@ test('M1 current cached remainder replay and nested category reference use minim
 
 test('M1 same total deadline forbids second dispatch and unabortable cancellation retains physical job', async () => {
   const f = await musicRendererFixture();
+  let now = Date.now();
+  const clock = mock.method(Date, 'now', () => now);
   try {
-    const job = f.read(f.query(), {
-      operation: 'lyrics',
-      target: { videoId },
-      deadlineAt: Date.now() + 5,
-    });
-    expect(f.fetches).toHaveLength(1);
-    await new Promise((r) => setTimeout(r, 15));
-    f.fetches[0].resolve(watchNext());
-    await f.flush();
-    expect(f.fetches).toHaveLength(1);
-    expect(f.result(job)).toEqual({ ok: false, reason: 'timeout' });
+    try {
+      const expired = f.read(f.query(), {
+        operation: 'lyrics',
+        target: { videoId },
+        deadlineAt: Date.now(),
+      });
+      await f.flush();
+      expect(f.result(expired)).toEqual({ ok: false, reason: 'timeout' });
+      expect(f.fetches).toHaveLength(0);
+      expect(f.controller.stats().active).toBe(0);
+
+      const job = f.read(f.query(), {
+        operation: 'lyrics',
+        target: { videoId },
+        deadlineAt: Date.now() + 5,
+      });
+      expect(f.fetches).toHaveLength(1);
+      // Spend the same total deadline without depending on CI scheduling.
+      now += 15;
+      f.fetches[0].resolve(watchNext());
+      await f.flush();
+      expect(f.fetches).toHaveLength(1);
+      expect(f.result(job)).toEqual({ ok: false, reason: 'timeout' });
+      expect(f.controller.stats().active).toBe(0);
+    } finally {
+      clock.mock.restore();
+    }
     const canceled = f.read(f.query(), {
       operation: 'lyrics',
       target: { videoId },
@@ -496,7 +515,11 @@ test('M1 same total deadline forbids second dispatch and unabortable cancellatio
     await f.flush();
     expect(f.result(current)).toEqual({ ok: false, reason: 'retired' });
   } finally {
-    f.close();
+    try {
+      f.close();
+    } finally {
+      clock.mock.restore();
+    }
   }
 });
 
