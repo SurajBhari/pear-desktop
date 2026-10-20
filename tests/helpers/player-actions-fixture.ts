@@ -114,6 +114,9 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
   class Node {
     connections = new Set<any>();
     gain = { value: 1 };
+    frequency = { value: 350 };
+    Q = { value: 1 };
+    type = 'lowpass';
     messages: any[] = [];
     portClosed = false;
     port = {
@@ -293,9 +296,11 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
       id,
       destination: { id: 'destination-' + id },
       state: 'running',
+      sampleRate: 48000,
       addEventListener() {},
       removeEventListener() {},
       createGain: () => new Node(context, 'gain'),
+      createBiquadFilter: () => new Node(context, 'biquad'),
       audioWorklet: {
         addModule: (url: string) => {
           const d = deferred();

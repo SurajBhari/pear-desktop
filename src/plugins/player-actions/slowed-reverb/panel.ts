@@ -1,10 +1,19 @@
 import { t } from '@/i18n';
 
-import { clampIntensity, clampSlow, formatPercent, formatRate } from './engine';
+import {
+  clampIntensity,
+  clampSlow,
+  clampWetHighpass,
+  clampWetLowpass,
+  formatPercent,
+  formatRate,
+} from './engine';
 
 export interface SlowedReverbSectionState {
   slow: number;
   reverbIntensity: number;
+  wetHighpass?: number;
+  wetLowpass?: number;
   active: boolean;
 }
 
@@ -14,6 +23,10 @@ export interface SlowedReverbSectionCallbacks {
   onSlowCommit: (value: number) => void;
   onReverbLive: (value: number) => void;
   onReverbCommit: (value: number) => void;
+  onWetHighpassLive: (value: number) => void;
+  onWetHighpassCommit: (value: number) => void;
+  onWetLowpassLive: (value: number) => void;
+  onWetLowpassCommit: (value: number) => void;
   onReset: () => void;
 }
 
@@ -127,6 +140,82 @@ export function createSlowedReverbSection(
   reverbRow.row.append(reverb, reverbRow.value);
   root.appendChild(reverbRow.row);
 
+  // Keep tone controls on the wet branch; their labels and units explain that
+  // the dry music and Equalizer response remain independent.
+  const toneSlider = (
+    labelText: string,
+    initialValue: number,
+    min: number,
+    max: number,
+    step: number,
+    clampValue: (value: unknown) => number,
+    onLive: (value: number) => void,
+    onCommit: (value: number) => void,
+  ) => {
+    const { row, value } = makeSliderRow(labelText);
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.className = 'pbg-range';
+    input.min = String(min);
+    input.max = String(max);
+    input.step = String(step);
+    input.setAttribute('aria-label', labelText);
+    const sync = (next: number) => {
+      input.value = String(next);
+      value.textContent = `${next} Hz`;
+      input.setAttribute('aria-valuetext', `${next} Hz`);
+    };
+    sync(initialValue);
+    const live = throttleLive(onLive);
+    const commit = debounceTrailing(onCommit, WHEEL_COMMIT_MS);
+    input.addEventListener('input', () => {
+      commit.cancel();
+      const next = clampValue(input.value);
+      sync(next);
+      live(next);
+    });
+    input.addEventListener('change', () => {
+      commit.cancel();
+      onCommit(clampValue(input.value));
+    });
+    input.addEventListener(
+      'wheel',
+      (event: WheelEvent) => {
+        event.preventDefault();
+        const next = clampValue(
+          Number(input.value) + (event.deltaY < 0 ? step : -step),
+        );
+        sync(next);
+        live(next);
+        commit(next);
+      },
+      { passive: false },
+    );
+    row.append(input, value);
+    root.appendChild(row);
+    return { sync, cancel: commit.cancel, flush: commit.flush };
+  };
+  const highpass = toneSlider(
+    t('plugins.slowed-reverb.panel.wet-highpass'),
+    clampWetHighpass(initial.wetHighpass),
+    20,
+    1000,
+    10,
+    clampWetHighpass,
+    callbacks.onWetHighpassLive,
+    callbacks.onWetHighpassCommit,
+  );
+  const lowpass = toneSlider(
+    t('plugins.slowed-reverb.panel.wet-lowpass'),
+    clampWetLowpass(initial.wetLowpass),
+    1000,
+    20000,
+    100,
+    clampWetLowpass,
+    callbacks.onWetLowpassLive,
+    callbacks.onWetLowpassCommit,
+  );
+
   const reset = document.createElement('button');
   reset.type = 'button';
   reset.className = 'pbg-button';
@@ -205,6 +294,8 @@ export function createSlowedReverbSection(
   reset.addEventListener('click', () => {
     slowWheelCommit.cancel();
     reverbWheelCommit.cancel();
+    highpass.cancel();
+    lowpass.cancel();
     callbacks.onReset();
   });
 
@@ -216,6 +307,8 @@ export function createSlowedReverbSection(
       reverb.value = String(
         Math.round(clampIntensity(state.reverbIntensity) * 100),
       );
+      highpass.sync(clampWetHighpass(state.wetHighpass));
+      lowpass.sync(clampWetLowpass(state.wetLowpass));
       paint(state);
     },
     destroy: () => {
@@ -223,6 +316,8 @@ export function createSlowedReverbSection(
       // the live rate was applied, keep config in sync with it.
       slowWheelCommit.flush();
       reverbWheelCommit.flush();
+      highpass.flush();
+      lowpass.flush();
       root.remove();
     },
   };

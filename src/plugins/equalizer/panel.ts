@@ -197,10 +197,66 @@ export function openEqualizerPanel(
     const autoHelp = document.createElement('p');
     autoHelp.className = 'eq-notice';
     autoHelp.textContent = t('plugins.equalizer.editor.auto-preamp-help');
-    const preview = createResponseView(response);
+    const bandFields = new Map<
+      string,
+      {
+        gain: HTMLInputElement;
+        range: HTMLInputElement;
+        frequency?: HTMLInputElement;
+      }
+    >();
+    const addBand = (frequency = 1000, gain = 0) => {
+      const p = active();
+      if (p.bands.length >= MAX_BANDS) return;
+      const id = crypto.randomUUID();
+      commit(
+        {
+          ...p,
+          bands: [...p.bands, { id, type: 'peaking', frequency, gain, Q: 1 }],
+        },
+        {},
+        true,
+      );
+      for (const point of body.querySelectorAll<SVGGElement>(
+        '[data-band-id]',
+      )) {
+        if (point.dataset.bandId === id) point.focus();
+      }
+    };
+    const preview = createResponseView(
+      response,
+      profile.mode === 'custom'
+        ? {
+            profile: active,
+            edit: (id, frequency, gain) => {
+              const p = active();
+              commit({
+                ...p,
+                bands: p.bands.map((band) =>
+                  band.id === id ? { ...band, frequency, gain } : band,
+                ),
+              });
+            },
+            add: addBand,
+            flush,
+          }
+        : undefined,
+    );
     disposeResponse = preview.dispose;
     updateResponse = () => {
       automatic.checked = normalizeConfig(getConfig()).autoPreamp;
+      for (const band of active().bands) {
+        const fields = bandFields.get(band.id);
+        if (!fields) continue;
+        for (const [input, value] of [
+          [fields.gain, band.gain],
+          [fields.range, band.gain],
+          [fields.frequency, band.frequency],
+        ] as const) {
+          if (input && document.activeElement !== input)
+            input.value = String(Number(value.toFixed(4)));
+        }
+      }
       preview.refresh();
     };
     body.append(gainControls, autoHelp, preview.element);
@@ -248,16 +304,19 @@ export function openEqualizerPanel(
         edit('gain', range.valueAsNumber);
       };
       range.onchange = flush;
+      const fields: {
+        gain: HTMLInputElement;
+        range: HTMLInputElement;
+        frequency?: HTMLInputElement;
+      } = { gain, range };
+      bandFields.set(band.id, fields);
       row.append(range, label(t('plugins.equalizer.editor.gain'), gain));
       if (profile.mode === 'custom') {
-        row.append(
-          label(
-            t('plugins.equalizer.editor.frequency'),
-            numeric(band.frequency, 0, 20000, 0.1, (value) =>
-              edit('frequency', value),
-            ),
-          ),
+        const frequency = numeric(band.frequency, 0, 20000, 0.1, (value) =>
+          edit('frequency', value),
         );
+        fields.frequency = frequency;
+        row.append(label(t('plugins.equalizer.editor.frequency'), frequency));
         const q = numeric(band.Q, 0.001, 1000, 0.001, (value) =>
           edit('Q', value),
         );
@@ -285,26 +344,9 @@ export function openEqualizerPanel(
     bandScroll.append(bands);
     body.append(bandScroll);
     if (profile.mode === 'custom') {
-      const add = button(t('plugins.equalizer.editor.add-band'), () => {
-        const p = active();
-        commit(
-          {
-            ...p,
-            bands: [
-              ...p.bands,
-              {
-                id: crypto.randomUUID(),
-                type: 'peaking',
-                frequency: 1000,
-                gain: 0,
-                Q: 1,
-              },
-            ],
-          },
-          {},
-          true,
-        );
-      });
+      const add = button(t('plugins.equalizer.editor.add-band'), () =>
+        addBand(),
+      );
       add.disabled = profile.bands.length >= MAX_BANDS;
       const count = document.createElement('span');
       count.textContent = ` ${profile.bands.length} / ${MAX_BANDS}`;

@@ -18,6 +18,10 @@ import { getLatestAudioDetail, type AudioCanPlayDetail } from './audio-graph';
 import {
   clampIntensity,
   clampSlow,
+  clampWetHighpass,
+  clampWetLowpass,
+  WET_HIGHPASS_DEFAULT,
+  WET_LOWPASS_DEFAULT,
   computeDattorroParams,
   isReverbEngaged,
   isSlowEngaged,
@@ -32,6 +36,8 @@ import { DATTORRO_WORKLET_SOURCE } from './worklet';
 export interface SlowedReverbConfig {
   slow: number;
   reverbIntensity: number;
+  wetHighpass?: number;
+  wetLowpass?: number;
   active: boolean;
 }
 
@@ -51,6 +57,8 @@ const registeredWorklets = new WeakSet<AudioContext>();
 const DEFAULT_CONFIG: SlowedReverbConfig = {
   slow: 1,
   reverbIntensity: 0,
+  wetHighpass: WET_HIGHPASS_DEFAULT,
+  wetLowpass: WET_LOWPASS_DEFAULT,
   active: true,
 };
 
@@ -79,6 +87,8 @@ export interface SlowedReverbController {
   audioContext: AudioContext | null;
   audioSource: MediaElementAudioSourceNode | null;
   wetGain: GainNode | null;
+  wetHighpass: BiquadFilterNode | null;
+  wetLowpass: BiquadFilterNode | null;
   reverbNode: AudioWorkletNode | null;
   workletReadyFor: AudioContext | null;
   workletFailed: boolean;
@@ -132,6 +142,8 @@ export function createSlowedReverbController(): SlowedReverbController {
     audioContext: null,
     audioSource: null,
     wetGain: null,
+    wetHighpass: null,
+    wetLowpass: null,
     reverbNode: null,
     workletReadyFor: null,
     workletFailed: false,
@@ -159,8 +171,7 @@ export function createSlowedReverbController(): SlowedReverbController {
       const normalized = normalize(raw);
       this.config = {
         ...raw,
-        slow: normalized.slow,
-        reverbIntensity: normalized.reverbIntensity,
+        ...normalized,
       };
       this.audioHandler = (event: Event) => {
         if (generation !== this.generation) return;
@@ -243,8 +254,7 @@ export function createSlowedReverbController(): SlowedReverbController {
       const previous = this.config;
       this.config = {
         ...newConfig,
-        slow: normalized.slow,
-        reverbIntensity: normalized.reverbIntensity,
+        ...normalized,
       };
       // An external speed/activation change is an explicit intent: take the
       // rate back (reverb-only changes must not steal it from playback-speed).
@@ -284,6 +294,8 @@ export function createSlowedReverbController(): SlowedReverbController {
         {
           slow: clampSlow(current.slow),
           reverbIntensity: clampIntensity(current.reverbIntensity),
+          wetHighpass: clampWetHighpass(current.wetHighpass),
+          wetLowpass: clampWetLowpass(current.wetLowpass),
           active: current.active,
         },
         {
@@ -328,17 +340,45 @@ export function createSlowedReverbController(): SlowedReverbController {
             this.applyReverb();
             this.syncSection();
           },
+          onWetHighpassLive: (value: number) => {
+            if (generation !== this.generation || !this.ctx) return;
+            this.config = { ...this.getCurrent(), wetHighpass: value };
+            this.applyReverb();
+          },
+          onWetHighpassCommit: (value: number) => {
+            if (generation !== this.generation || !this.ctx) return;
+            this.config = { ...this.getCurrent(), wetHighpass: value };
+            this.ctx?.setConfig({ wetHighpass: value });
+            this.applyReverb();
+            this.syncSection();
+          },
+          onWetLowpassLive: (value: number) => {
+            if (generation !== this.generation || !this.ctx) return;
+            this.config = { ...this.getCurrent(), wetLowpass: value };
+            this.applyReverb();
+          },
+          onWetLowpassCommit: (value: number) => {
+            if (generation !== this.generation || !this.ctx) return;
+            this.config = { ...this.getCurrent(), wetLowpass: value };
+            this.ctx?.setConfig({ wetLowpass: value });
+            this.applyReverb();
+            this.syncSection();
+          },
           onReset: () => {
             if (generation !== this.generation || !this.ctx) return;
             this.config = {
               ...this.getCurrent(),
               slow: 1,
               reverbIntensity: 0,
+              wetHighpass: WET_HIGHPASS_DEFAULT,
+              wetLowpass: WET_LOWPASS_DEFAULT,
               active: true,
             };
             this.ctx?.setConfig({
               slow: 1,
               reverbIntensity: 0,
+              wetHighpass: WET_HIGHPASS_DEFAULT,
+              wetLowpass: WET_LOWPASS_DEFAULT,
               active: true,
             });
             this.claimRateIfEngaged();
@@ -366,6 +406,8 @@ export function createSlowedReverbController(): SlowedReverbController {
       handle.sync({
         slow: clampSlow(current.slow),
         reverbIntensity: clampIntensity(current.reverbIntensity),
+        wetHighpass: clampWetHighpass(current.wetHighpass),
+        wetLowpass: clampWetLowpass(current.wetLowpass),
         active: current.active,
       });
     },
@@ -382,6 +424,14 @@ export function createSlowedReverbController(): SlowedReverbController {
       this.teardownAudio();
       try {
         this.wetGain = audioContext.createGain();
+        this.wetHighpass = audioContext.createBiquadFilter();
+        this.wetHighpass.type = 'highpass';
+        this.wetHighpass.Q.value = Math.SQRT1_2;
+        this.wetLowpass = audioContext.createBiquadFilter();
+        this.wetLowpass.type = 'lowpass';
+        this.wetLowpass.Q.value = Math.SQRT1_2;
+        this.wetHighpass.connect(this.wetLowpass);
+        this.wetLowpass.connect(this.wetGain);
         // Wet reverb joins the renderer master mix so EQ/output sink cover it.
         // Raw analyser taps and the compressor's dry insert remain untouched.
         this.wetGain.gain.value = 1;
@@ -536,7 +586,7 @@ export function createSlowedReverbController(): SlowedReverbController {
         // can remove a partially attached source edge as well as its port.
         this.reverbNode = node;
         audioSource.connect(node);
-        node.connect(this.wetGain);
+        node.connect(this.wetHighpass!);
         this.applyReverb();
       } catch (error) {
         // Slow-only fallback: rate/pitch keeps working without reverb.
@@ -560,6 +610,17 @@ export function createSlowedReverbController(): SlowedReverbController {
         ? clampIntensity(current.reverbIntensity)
         : 0;
       const params = computeDattorroParams(intensity);
+      if (this.wetHighpass)
+        this.wetHighpass.frequency.value = clampWetHighpass(
+          current.wetHighpass,
+        );
+      if (this.wetLowpass) {
+        // Stay below Nyquist on low-rate contexts; normal renderer contexts retain the full control range.
+        this.wetLowpass.frequency.value = Math.min(
+          clampWetLowpass(current.wetLowpass),
+          this.wetLowpass.context.sampleRate / 2,
+        );
+      }
       // No dry tap: the base path carries dry at unity. The wet tail is
       // silent at intensity 0 (params.wetGain 0 inside the worklet), so
       // enabling at defaults changes no loudness. Worklet failure just
@@ -764,6 +825,14 @@ export function createSlowedReverbController(): SlowedReverbController {
       try {
         this.wetGain?.disconnect();
       } catch {}
+      try {
+        this.wetHighpass?.disconnect();
+      } catch {}
+      try {
+        this.wetLowpass?.disconnect();
+      } catch {}
+      this.wetHighpass = null;
+      this.wetLowpass = null;
       this.wetGain = null;
       this.reverbNode = null;
       this.wiredSource = null;

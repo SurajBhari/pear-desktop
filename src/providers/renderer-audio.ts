@@ -180,7 +180,12 @@ export function graphFromAnnouncement(detail: {
   audioSource: MediaElementAudioSourceNode;
   audioGraph?: RendererAudioGraph;
 }): RendererAudioGraph {
-  return detail.audioGraph
-    ? (current = detail.audioGraph)
-    : initializeAudioGraph(detail.audioContext, detail.audioSource);
+  if (detail.audioGraph) {
+    // Consumers may later request the source-only fallback (including the
+    // reverb wet tap). Adopt the announced owner so that fallback cannot build
+    // a second dry route around its master inserts such as Equalizer.
+    graphs.set(detail.audioSource, detail.audioGraph);
+    return (current = detail.audioGraph);
+  }
+  return initializeAudioGraph(detail.audioContext, detail.audioSource);
 }
