@@ -7,6 +7,7 @@ import {
   isAlbumOrPlaylist,
   isMusicOrVideoTrack,
 } from '@/plugins/utils/renderer/check';
+import { isolateDialogEscape } from '@/plugins/utils/renderer/dialog';
 import { getSongMenu } from '@/providers/dom-elements';
 import { getSongInfo } from '@/providers/song-info-front';
 
@@ -73,17 +74,28 @@ export const onRendererLoad = ({
       };
       if (!rendererLoaded || generation !== rendererGeneration) return;
       const dialog = document.createElement('dialog');
+      const disposeEscape = isolateDialogEscape(dialog);
       dialog.className = 'pear-downloader-settings';
       dialog.setAttribute('aria-labelledby', 'pear-downloader-heading');
+      let disposed = false;
+      let disposeContent: (() => void) | undefined;
       const close = () => {
-        disposeSettings?.();
-        disposeSettings = undefined;
+        if (disposed) return;
+        disposed = true;
+        disposeEscape();
+        dialog.removeEventListener('close', close);
+        disposeContent?.();
+        disposeContent = undefined;
+        dialog.close();
         dialog.remove();
-        if (settingsDialog === dialog) settingsDialog = undefined;
+        if (settingsDialog === dialog) {
+          settingsDialog = undefined;
+          disposeSettings = undefined;
+        }
         previousFocus?.focus();
       };
       dialog.addEventListener('close', close, { once: true });
-      disposeSettings = render(
+      disposeContent = render(
         () => (
           <DownloaderSettings
             api={{
@@ -98,6 +110,7 @@ export const onRendererLoad = ({
       );
       document.body.append(dialog);
       settingsDialog = dialog;
+      disposeSettings = close;
       dialog.showModal();
     } catch (error) {
       console.error('Downloader settings unavailable', error);
@@ -184,9 +197,6 @@ export const onRendererStop = () => {
   menuObserver.disconnect();
   for (const unsubscribe of subscriptions) unsubscribe();
   subscriptions = [];
-  settingsDialog?.close();
-  settingsDialog?.remove();
-  settingsDialog = undefined;
   disposeSettings?.();
   disposeSettings = undefined;
   disposeButton?.();

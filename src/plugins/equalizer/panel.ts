@@ -1,4 +1,5 @@
 import { t } from '@/i18n';
+import { isolateDialogEscape } from '@/plugins/utils/renderer/dialog';
 
 import {
   bassProfile,
@@ -28,6 +29,7 @@ export function openEqualizerPanel(
       ? document.activeElement
       : null;
   const dialog = document.createElement('dialog');
+  const disposeEscape = isolateDialogEscape(dialog);
   dialog.className = 'eq-panel';
   dialog.setAttribute('aria-label', t('plugins.equalizer.editor.title'));
   const css = document.createElement('style');
@@ -62,6 +64,7 @@ export function openEqualizerPanel(
   const dispose = () => {
     if (disposed) return;
     disposed = true;
+    disposeEscape();
     disposeResponse();
     flush();
     dialog.close();
