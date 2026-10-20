@@ -20,9 +20,29 @@ export function clampIntensity(value: number): number {
   return Math.round(clamp(value, INTENSITY_MIN, INTENSITY_MAX) * 100) / 100;
 }
 
+export const WET_HIGHPASS_DEFAULT = 180;
+export const WET_LOWPASS_DEFAULT = 6500;
+
+// Non-overlapping ranges keep the wet passband valid even for external config edits.
+export function clampWetHighpass(value: unknown): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? Math.round(clamp(numeric, 20, 1000))
+    : WET_HIGHPASS_DEFAULT;
+}
+
+export function clampWetLowpass(value: unknown): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? Math.round(clamp(numeric, 1000, 20000))
+    : WET_LOWPASS_DEFAULT;
+}
+
 export function normalize(raw: unknown): {
   slow: number;
   reverbIntensity: number;
+  wetHighpass: number;
+  wetLowpass: number;
 } {
   const next =
     raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
@@ -32,6 +52,8 @@ export function normalize(raw: unknown): {
         ? (next['slow'] as number)
         : 1,
     ),
+    wetHighpass: clampWetHighpass(next['wetHighpass']),
+    wetLowpass: clampWetLowpass(next['wetLowpass']),
     reverbIntensity: clampIntensity(
       Object.prototype.hasOwnProperty.call(next, 'reverbIntensity')
         ? (next['reverbIntensity'] as number)
@@ -93,8 +115,9 @@ export function computeDattorroParams(intensity: number): DattorroParams {
     inputDiff1: 0.75,
     inputDiff2: 0.625,
     decayDiff1: 0.65 + i * 0.05,
-    decay: Math.pow(i, 0.75) * 0.58,
+    // Keep low settings gentle; reserve the extra tail and level for the upper range.
+    decay: Math.pow(i, 0.75) * 0.58 + Math.pow(i, 3) * 0.2,
     damping: Math.min(0.5 + Math.pow(i, 0.6) * 0.4, 0.78),
-    wetGain: Math.pow(i, 0.75) * 0.42,
+    wetGain: Math.pow(i, 0.75) * 0.42 + Math.pow(i, 3) * 0.68,
   };
 }

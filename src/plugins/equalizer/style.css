@@ -188,6 +188,33 @@
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
+.eq-panel .eq-response-editable {
+  touch-action: none;
+  user-select: none;
+  cursor: crosshair;
+}
+.eq-panel .eq-response-point {
+  fill: var(--eq-accent);
+  stroke: var(--eq-surface);
+  stroke-width: 2;
+  cursor: grab;
+}
+.eq-panel .eq-response-point:active {
+  cursor: grabbing;
+}
+.eq-panel .eq-response-point-hit {
+  fill: transparent;
+  stroke: none;
+  pointer-events: all;
+}
+.eq-panel .eq-response-point:focus-visible {
+  outline: none;
+}
+.eq-panel .eq-response-point:focus-visible .eq-response-point-hit,
+.eq-panel .eq-response-point:hover .eq-response-point-hit {
+  stroke: var(--eq-accent);
+  stroke-width: 2;
+}
 .eq-panel .eq-response text {
   fill: var(--eq-muted);
   font-size: 12px;

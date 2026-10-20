@@ -10,21 +10,28 @@ import { sanitizeSaved, type SavedSongs } from './section-repeat/saved';
 import {
   createSlowedReverbController,
   type SlowedReverbController,
+  type SlowedReverbConfig,
 } from './slowed-reverb/controller';
-import { clampIntensity, clampSlow } from './slowed-reverb/engine';
+import { normalize as normalizeSlowedReverb } from './slowed-reverb/engine';
 
 import type { RendererContext } from '@/types/contexts';
 import type { MusicPlayer } from '@/types/music-player';
 
 export interface PlayerActionsConfig {
   enabled: boolean;
-  slowedReverb: { slow: number; reverbIntensity: number; active: boolean };
+  slowedReverb: SlowedReverbConfig;
   sectionRepeat: { active: boolean; saved: SavedSongs };
 }
 
 const DEFAULT_CONFIG: PlayerActionsConfig = {
   enabled: false,
-  slowedReverb: { slow: 1, reverbIntensity: 0, active: true },
+  slowedReverb: {
+    slow: 1,
+    reverbIntensity: 0,
+    wetHighpass: 180,
+    wetLowpass: 6500,
+    active: true,
+  },
   sectionRepeat: { active: true, saved: [] },
 };
 
@@ -50,8 +57,7 @@ function normalize(raw: Partial<PlayerActionsConfig>): PlayerActionsConfig {
   return {
     enabled: raw.enabled === true,
     slowedReverb: {
-      slow: clampSlow(slowed.slow),
-      reverbIntensity: clampIntensity(slowed.reverbIntensity),
+      ...normalizeSlowedReverb(slowed),
       active: slowed.active !== false,
     },
     sectionRepeat: {

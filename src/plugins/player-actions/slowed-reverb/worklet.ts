@@ -3,8 +3,8 @@
 // <137482711+nathwn12@users.noreply.github.com>, under that repository's MIT license.
 // DSP reference: https://github.com/nathwn12/slowed-reverb-audio/blob/main/dattorro-worklet.js
 // Preserve the repository MIT license and this source attribution.
-// Exact port of slowed-reverb-audio/dattorro-worklet.js, loaded via Blob URL
-// into audioContext.audioWorklet. Keep in sync with the extension source.
+// Based on slowed-reverb-audio/dattorro-worklet.js, loaded via Blob URL.
+// Tone shaping lives in the controller's adjustable wet-only BiquadFilters.
 export const DATTORRO_WORKLET_SOURCE: string = `class DelayLine {
   constructor(maxDelay) {
     let size = 1;
@@ -84,8 +84,6 @@ class DattorroReverbProcessor extends AudioWorkletProcessor {
     this.wetGain = 0;
     this.preFilter = 0;
     this.damping = [0, 0];
-    this.hpf = 0;
-    this.wetLpf = [0, 0];
     this.preBuf = new Float32Array(Math.ceil(sampleRate * 0.1));
     this.preIdx = 0;
 
@@ -171,10 +169,6 @@ class DattorroReverbProcessor extends AudioWorkletProcessor {
       this.preFilter += (x - this.preFilter) * this.preFilterAmt;
       x = this.preFilter;
 
-      const hpfCoeff = 0.025;
-      this.hpf += hpfCoeff * (x - this.hpf);
-      x = x - this.hpf;
-
       for (let j = 0; j < 4; j++) {
         const d = this.inDiff[j];
         const g = j < 2 ? this.inputDiff1Amt : this.inputDiff2Amt;
@@ -211,7 +205,6 @@ class DattorroReverbProcessor extends AudioWorkletProcessor {
       x2 = this.allpassDL(this.decayDiff2[1], this.decayDiff2Amt, x2);
       this.postDampDL[1].write(this.t, x2);
 
-      const lpfCoeff = 0.5;
       const wL = (this.preDampDL[1].readTap(this.t, 'out1')
             + this.preDampDL[1].readTap(this.t, 'out2')
             - this.decayDiff2[1].readTap(this.t, 'out2')
@@ -227,11 +220,8 @@ class DattorroReverbProcessor extends AudioWorkletProcessor {
             - this.decayDiff2[1].readTap(this.t, 'out1')
             + this.postDampDL[1].readTap(this.t, 'out1'));
 
-      this.wetLpf[0] += lpfCoeff * (wL - this.wetLpf[0]);
-      this.wetLpf[1] += lpfCoeff * (wR - this.wetLpf[1]);
-
-      outL[i] = this.wetGain * (this.wetLpf[0] / (1 + Math.abs(this.wetLpf[0])));
-      outR[i] = this.wetGain * (this.wetLpf[1] / (1 + Math.abs(this.wetLpf[1])));
+      outL[i] = this.wetGain * (wL / (1 + Math.abs(wL)));
+      outR[i] = this.wetGain * (wR / (1 + Math.abs(wR)));
 
       this.t++;
     }
