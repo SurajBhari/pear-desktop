@@ -87,6 +87,7 @@ jobs:
       - name: Build on Windows
         if: startsWith(matrix.os, 'windows')
         # Only an offline x64 installer, installed for all users
+        shell: bash
         run: |
           pnpm clean
           pnpm build
