@@ -82,6 +82,8 @@ jobs:
 
       - name: Build on Linux
         if: startsWith(matrix.os, 'ubuntu')
+        env:
+          DEBUG: electron-builder
         run: |
           pnpm dist:linux
 

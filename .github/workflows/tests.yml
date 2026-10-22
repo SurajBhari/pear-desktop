@@ -127,6 +127,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Check passive crash evidence contracts
         run: node --test scripts/collect-macos-node-crashes.node.cjs
+      - name: Check Linux tool preparation ordering
+        run: node --test scripts/prepare-linux-tools.node.cjs
       - name: Lint
         if: ${{ !cancelled() }}
         run: pnpm lint
