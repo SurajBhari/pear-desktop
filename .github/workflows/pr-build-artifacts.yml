@@ -89,14 +89,18 @@ jobs:
 
       - name: Build on Windows
         if: startsWith(matrix.os, 'windows')
+        # Only an offline x64 installer, installed for all users
+        shell: bash
         run: |
-          pnpm dist:win
+          pnpm clean
+          pnpm build
+          pnpm electron-builder --win nsis:x64 -p never -c.nsis.perMachine=true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: build-artifacts-${{ matrix.os }}
-          path: pack/
+          path: ${{ startsWith(matrix.os, 'windows') && 'pack/*.exe' || 'pack/' }}
           retention-days: 7
           if-no-files-found: error
 
