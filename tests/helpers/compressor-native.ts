@@ -114,7 +114,13 @@ for(const key of ['userData','sessionData']){const target=path.join(owned,key);f
     throw error;
   } finally {
     try {
-      await rm(directory, { recursive: true, force: true });
+      // Retry transient filesystem locks only after this owned leader closed.
+      await rm(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: lifecycle.closeObserved ? 5 : 0,
+        retryDelay: 100,
+      });
     } catch (error) {
       console.error('COMPRESSOR_NATIVE_CLEANUP ' + JSON.stringify(lifecycle));
       if (taskFailed)

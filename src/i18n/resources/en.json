@@ -997,6 +997,9 @@
     },
     "navigation": {
       "description": "Next/Back navigation arrows directly integrated in the interface, like in your favorite browser",
+      "menu": {
+        "swipe-navigation": "Experimental history swipes and browser buttons"
+      },
       "name": "Navigation",
       "templates": {
         "back": {
