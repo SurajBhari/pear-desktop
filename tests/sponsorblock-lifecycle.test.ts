@@ -21,7 +21,8 @@ async function fixture() {
       videoDetails: { videoId: api.responseId ?? api.id },
     }),
   };
-  const webContents = {};
+  const frame = {};
+  const webContents = { mainFrame: frame, isDestroyed: () => false };
   const key = `sponsor_${crypto.randomUUID()}`;
   const state = {
     native,
@@ -74,7 +75,7 @@ async function fixture() {
     },
     removeAllListeners: () => responses.clear(),
     send: (id: string, ...args: any[]) =>
-      native.emit(id, { sender: webContents }, ...args),
+      native.emit(id, { sender: webContents, senderFrame: frame }, ...args),
   };
   const backend = plugin.backend;
   const start = async () => {
@@ -90,6 +91,8 @@ async function fixture() {
     video,
     api,
     native,
+    frame,
+    webContents,
     requests,
     sent,
     responses,
@@ -100,7 +103,7 @@ async function fixture() {
     request: (id: string) =>
       native.emit(
         'peard:video-src-changed',
-        { sender: webContents },
+        { sender: webContents, senderFrame: webContents.mainFrame },
         { videoDetails: { videoId: id } },
       ),
     resolve: async (index: number, segments: any) => {
@@ -132,6 +135,109 @@ test('late enable requests current track and applies segments immediately at tim
     expect(f.requests).toHaveLength(1);
     await f.resolve(0, [[0, 5]]);
     expect(f.video.currentTime).toBe(5);
+  } finally {
+    await f.close();
+  }
+});
+
+test('private current-track seed requests SponsorBlock data without shared metadata admission', async () => {
+  const f = await fixture();
+  try {
+    await f.start();
+    const before = f.requests.length;
+    f.native.emit(
+      'sponsorblock-seed',
+      { sender: f.webContents, senderFrame: {} },
+      { videoDetails: { videoId: 'B' } },
+      'B',
+    );
+    f.native.emit(
+      'sponsorblock-seed',
+      { sender: {}, senderFrame: f.frame },
+      { videoDetails: { videoId: 'B' } },
+      'B',
+    );
+    f.native.emit(
+      'sponsorblock-seed',
+      { sender: f.webContents, senderFrame: f.frame },
+      { videoDetails: { videoId: 'B' } },
+      'A',
+    );
+    f.webContents.mainFrame = {};
+    f.native.emit(
+      'sponsorblock-seed',
+      { sender: f.webContents, senderFrame: f.frame },
+      { videoDetails: { videoId: 'B' } },
+      'B',
+    );
+    f.webContents.mainFrame = f.frame;
+    expect(f.requests).toHaveLength(before);
+    f.native.emit(
+      'sponsorblock-seed',
+      { sender: f.webContents, senderFrame: f.frame },
+      { videoDetails: { videoId: 'B' } },
+      'B',
+    );
+    await f.flush();
+    expect(f.requests).toHaveLength(before + 1);
+    expect(new URL(f.requests.at(-1).url).searchParams.get('videoID')).toBe(
+      'B',
+    );
+    expect(f.native.listenerCount('peard:video-src-changed')).toBe(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test('private seeds follow the current main frame after initial navigation', async () => {
+  const f = await fixture();
+  try {
+    await f.start();
+    const before = f.requests.length;
+    const replacementFrame = {};
+    f.webContents.mainFrame = replacementFrame;
+    await f.resolve(0, [[0, 4]]);
+    expect(
+      f.sent.filter(
+        ([channel, packet]) =>
+          channel === 'sponsorblock-skip' && packet.phase === 'result',
+      ),
+    ).toHaveLength(0);
+    f.native.emit(
+      'sponsorblock-seed',
+      { sender: f.webContents, senderFrame: f.frame },
+      { videoDetails: { videoId: 'B' } },
+      'B',
+    );
+    expect(f.requests).toHaveLength(before);
+    f.native.emit(
+      'sponsorblock-seed',
+      { sender: f.webContents, senderFrame: replacementFrame },
+      { videoDetails: { videoId: 'B' } },
+      'B',
+    );
+    await f.flush();
+    expect(f.requests).toHaveLength(before + 1);
+    expect(new URL(f.requests.at(-1).url).searchParams.get('videoID')).toBe(
+      'B',
+    );
+    f.native.emit(
+      'peard:video-src-changed',
+      { sender: f.webContents, senderFrame: f.frame },
+      { videoDetails: { videoId: 'C' } },
+    );
+    await f.flush();
+    expect(f.requests).toHaveLength(before + 1);
+    f.native.emit(
+      'peard:video-src-changed',
+      { sender: f.webContents, senderFrame: replacementFrame },
+      { videoDetails: { videoId: 'C' } },
+    );
+    await f.flush();
+    expect(f.requests).toHaveLength(before + 2);
+    expect(new URL(f.requests.at(-1).url).searchParams.get('videoID')).toBe(
+      'C',
+    );
   } finally {
     await f.close();
   }
@@ -183,6 +289,7 @@ test('stop aborts transfer, removes owned listeners and rejects late delivery', 
     expect(f.video.currentTime).toBe(0);
     expect(f.responses.size).toBe(0);
     expect(f.native.listenerCount('peard:video-src-changed')).toBe(0);
+    expect(f.native.listenerCount('sponsorblock-seed')).toBe(0);
   } finally {
     await f.close();
   }
@@ -207,7 +314,7 @@ test('foreign window requests are ignored and stopping preserves unrelated subsc
     f.stop();
     expect(f.responses.has(unrelated)).toBe(true);
     expect(f.native.listenerCount('peard:video-src-changed')).toBe(1);
-    expect(external).toBe(2);
+    expect(external).toBe(1);
   } finally {
     await f.close();
   }
