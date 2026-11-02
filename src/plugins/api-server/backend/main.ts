@@ -309,7 +309,27 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       server.on('connection', (socket: object) => sockets.add(socket));
       server.on('secureConnection', (socket: object) => sockets.add(socket));
       server.once('listening', () => {
-        if (this.server === server) this.publishMusicHttpOwner();
+        if (this.server !== server) return;
+        this.publishMusicHttpOwner();
+        const owner = this.musicHttpOwner,
+          service = this.musicService,
+          window = this.musicWindow;
+        if (!owner || !service || !window || !service.enabled) return;
+        const isCurrent = () =>
+          this.musicHttpOwner === owner &&
+          this.server === server &&
+          this.musicService === service &&
+          this.musicWindow === window &&
+          !window.isDestroyed() &&
+          !window.webContents.isDestroyed() &&
+          owner.current();
+        // A startup menu may have captured unavailable REST access before bind.
+        // Fence its replacement to this exact listener/authorization lifetime.
+        import('@/menu')
+          .then(({ refreshMenu }) =>
+            isCurrent() ? refreshMenu(window, isCurrent) : undefined,
+          )
+          .catch(() => {});
       });
       const retired = () => {
         if (this.server === server) {

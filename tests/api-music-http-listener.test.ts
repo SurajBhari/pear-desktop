@@ -10,7 +10,7 @@ import { test, expect } from '@playwright/test';
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
 const requireVite = createRequire(requireRoot.resolve('vite'));
-async function fixture() {
+async function fixture({ controlledRestListener = false } = {}) {
   const directory = await mkdtemp(
     path.join(tmpdir(), 'pear-api-music-listener-'),
   );
@@ -23,7 +23,7 @@ export {getMcpGrantTarget} from ${JSON.stringify(path.join(root, 'src/plugins/ap
 export {getMusicService} from ${JSON.stringify(path.join(root, 'src/plugins/api-server/backend/music-service.ts'))};
 export {backend} from ${JSON.stringify(path.join(root, 'src/plugins/api-server/backend/main.ts'))};
 export {onMenu} from ${JSON.stringify(path.join(root, 'src/plugins/api-server/menu.ts'))};
-export {menuState,setMenuContext} from '@/menu';
+export {menuState,setMenuContext,refreshMenu} from '@/menu';
 export {ipcMain,fixtureWindow,createFixtureWindow,fixtureNetwork,app} from 'electron';
 `,
   );
@@ -51,6 +51,8 @@ export const clipboard={writeText:()=>{throw new Error('Fixture prohibits creden
       {
         name: 'controlled-native-boundaries',
         async resolveId(id: string) {
+          if (controlledRestListener && id === '@hono/node-server')
+            return '\0fixture-rest-listener';
           if (id === 'electron') return '\0fixture-electron';
           if (id === '@/config') return '\0fixture-config';
           if (id === '@/i18n') return '\0fixture-i18n';
@@ -85,6 +87,15 @@ export const clipboard={writeText:()=>{throw new Error('Fixture prohibits creden
           return undefined;
         },
         load(id: string) {
+          if (id === '\0fixture-rest-listener')
+            return `
+import {EventEmitter} from 'node:events';
+export const upgradeWebSocket=()=>()=>{throw Error('Fixture prohibits HTTP requests');};
+export const serve=options=>Object.assign(new EventEmitter(),{
+ listening:false,address:()=>({address:options.hostname,port:options.port}),
+ close(){this.listening=false;this.emit('close');},closeAllConnections(){}
+});
+`;
           if (id === '\0fixture-electron') return electron;
           if (id === '\0fixture-config')
             return 'export const get=()=>false; export const set=()=>{};';
@@ -550,6 +561,151 @@ async function mcpMenuFixture() {
     enable: () => f.backend.onConfigChange(config),
   };
 }
+
+async function restMenuFixture() {
+  const f = await fixture({ controlledRestListener: true });
+  Object.assign(f.config, {
+    musicApiEnabled: true,
+    mcpEnabled: false,
+    musicApiRemoteEnabled: false,
+    port: 26538,
+  });
+  const enabled = (template: any[]) =>
+    template
+      .find((item) => item.label === 'Expanded music API')
+      .submenu.filter(
+        (item: any) =>
+          item.label === 'Create local REST grant…' ||
+          item.label === 'Revoke client grants…',
+      )
+      .map((item: any) => item.enabled);
+  return {
+    ...f,
+    enabled,
+    begin: () => f.backend.start(f.ctx),
+    ready: (server = f.backend.server) => {
+      server.listening = true;
+      server.emit('listening');
+    },
+  };
+}
+
+test('actual REST readiness republishes disabled native grants without config writes', async () => {
+  const f = await restMenuFixture();
+  try {
+    await f.begin();
+    await f.source.refreshMenu(f.ctx.window);
+    expect(f.enabled(f.source.menuState.published[0])).toEqual([false, false]);
+    f.ready();
+    expect(f.backend.musicHttpOwner.current()).toBe(true);
+    expect(f.source.getMusicService(f.ctx.window)).toBe(f.backend.musicService);
+    await expect.poll(() => f.source.menuState.published.length).toBe(2);
+    expect(f.enabled(f.source.menuState.published[1])).toEqual([true, true]);
+    expect(f.source.menuState.requests).toHaveLength(2);
+    expect(f.configWrites).toEqual([]);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const retirement of [
+  'stop',
+  'reconfigure',
+  'destroy',
+  'close',
+  'error',
+] as const) {
+  test(`actual REST readiness cannot refresh after ${retirement} before listening`, async () => {
+    const f = await restMenuFixture();
+    try {
+      await f.begin();
+      const listener = f.backend.server;
+      if (retirement === 'stop') f.backend.stop();
+      else if (retirement === 'reconfigure')
+        f.backend.onConfigChange({ ...f.config, port: 26540 });
+      else if (retirement === 'destroy') f.ctx.window.destroy();
+      else listener.emit(retirement);
+      f.ready(listener);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(f.source.menuState.requests).toHaveLength(0);
+      expect(f.source.menuState.published).toHaveLength(0);
+      expect(f.configWrites).toEqual([]);
+      if (retirement === 'reconfigure') {
+        expect(f.backend.server).not.toBe(listener);
+        f.ready();
+        await expect.poll(() => f.source.menuState.published.length).toBe(1);
+        expect(f.enabled(f.source.menuState.published[0])).toEqual([
+          true,
+          true,
+        ]);
+        expect(f.configWrites).toEqual([]);
+      }
+    } finally {
+      await f.close();
+    }
+  });
+
+  test(`held actual REST readiness menu cannot publish after ${retirement}`, async () => {
+    const f = await restMenuFixture();
+    try {
+      f.source.menuState.hold = true;
+      await f.begin();
+      f.ready();
+      await expect.poll(() => f.source.menuState.releases.length).toBe(1);
+      const request = f.source.menuState.requests[0];
+      expect(request.window).toBe(f.ctx.window);
+      expect(request.isCurrent()).toBe(true);
+      if (retirement === 'stop') f.backend.stop();
+      else if (retirement === 'reconfigure') {
+        // Same physical endpoint, changed authorization: owner lifetime still retires.
+        f.backend.oldConfig = { ...f.config };
+        f.backend.onConfigChange({
+          ...f.config,
+          authorizedClients: ['changed'],
+        });
+      } else if (retirement === 'destroy') f.ctx.window.destroy();
+      else f.backend.server.emit(retirement);
+      expect(request.isCurrent()).toBe(false);
+      f.source.menuState.releases.shift()();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(f.source.menuState.published).toHaveLength(0);
+      expect(f.configWrites).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test('actual REST readiness leaves disabled expanded API menus unavailable', async () => {
+  const f = await restMenuFixture();
+  try {
+    Object.assign(f.config, { musicApiEnabled: false });
+    await f.begin();
+    f.ready();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.source.getMusicService(f.ctx.window)).toBeUndefined();
+    expect(f.source.menuState.requests).toHaveLength(0);
+    expect(f.configWrites).toEqual([]);
+  } finally {
+    await f.close();
+  }
+});
+
+test('REST readiness menu refresh failure preserves the current service and owner', async () => {
+  const f = await restMenuFixture();
+  try {
+    f.source.menuState.reject = true;
+    await f.begin();
+    f.ready();
+    await expect.poll(() => f.source.menuState.requests.length).toBe(1);
+    expect(f.backend.musicHttpOwner.current()).toBe(true);
+    expect(f.source.getMusicService(f.ctx.window)).toBe(f.backend.musicService);
+    expect(f.source.menuState.published).toHaveLength(0);
+    expect(f.configWrites).toEqual([]);
+  } finally {
+    await f.close();
+  }
+});
 
 test('actual main refreshes disabled native MCP grant entries when the listener becomes ready without config writes', async () => {
   const f = await mcpMenuFixture();
