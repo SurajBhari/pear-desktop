@@ -506,6 +506,45 @@ test('only the playing current gap breathes, freezes on pause and respects reduc
   await page.evaluate(() => (window as any).fixture.disposeClock());
 });
 
+test('only the current instrumental interval is visible without changing row layout', async ({
+  page,
+}) => {
+  await mount(page, [
+    { ...timed, timeInMs: 0, duration: 10000, text: '', words: [] },
+    { ...timed, timeInMs: 10000 },
+    { ...timed, timeInMs: 20000 },
+  ]);
+  const markers = page.locator('.instrumental-indicator');
+  await expect(markers).toHaveCount(2);
+  const layout = () =>
+    markers.evaluateAll((nodes) =>
+      nodes.map((node) => {
+        const marker = node as HTMLElement;
+        const row = marker.closest('.synced-line') as HTMLElement;
+        return [marker.offsetWidth, marker.offsetHeight, row.offsetHeight];
+      }),
+    );
+  const initialLayout = await layout();
+  for (const dimensions of initialLayout)
+    for (const dimension of dimensions) expect(dimension).toBeGreaterThan(0);
+
+  await expect(markers.nth(0)).toBeVisible();
+  await expect(markers.nth(1)).toBeHidden();
+  await page.evaluate(() => (window as any).fixture.setTime(11000));
+  await expect(markers.nth(0)).toBeHidden();
+  await expect(markers.nth(1)).toBeHidden();
+  await page.evaluate(() => (window as any).fixture.setTime(15000));
+  await expect(markers.nth(0)).toBeHidden();
+  await expect(markers.nth(1)).toBeVisible();
+  await page.evaluate(() => (window as any).fixture.setTime(21000));
+  await expect(markers.nth(0)).toBeHidden();
+  await expect(markers.nth(1)).toBeHidden();
+  await page.evaluate(() => (window as any).fixture.setTime(2000));
+  await expect(markers.nth(0)).toBeVisible();
+  await expect(markers.nth(1)).toBeHidden();
+  expect(await layout()).toEqual(initialLayout);
+});
+
 test('actual LRCLib uses optional lyricsfile, keeps ordinary LRC fallback and represents verified instrumental metadata', async ({
   page,
 }) => {

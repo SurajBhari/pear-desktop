@@ -148,9 +148,12 @@
 .instrumental-indicator {
   opacity: 0.4;
   display: inline-block;
+  /* Keep measured row height while only the current pause is visible. */
+  visibility: hidden;
 }
 .current .instrumental-indicator {
   opacity: 0.75;
+  visibility: visible;
 }
 .instrumental-indicator > span {
   display: inline-flex;
