@@ -1,3 +1,4 @@
+import { rendererMusicActionsOwnerSource } from './helpers/playlist-provider-source';
 import { test, expect } from '@playwright/test';
 import { musicHttpFixture } from './helpers/api-music-http';
 import { musicModuleSource } from './helpers/api-music-source';
@@ -98,11 +99,7 @@ test.beforeAll(async () => {
   try {
     const entry = path.join(owned, 'entry.ts');
     const core = await readFile(path.join(root, 'src/renderer.ts'), 'utf8');
-    coreInit = core.slice(
-      core.indexOf('async function onApiLoaded() {') +
-        'async function onApiLoaded() {'.length,
-      core.indexOf('  // Workaround for macOS traffic lights'),
-    );
+    coreInit = rendererMusicActionsOwnerSource(core);
     const navigationStart = core.indexOf(
       "  window.ipcRenderer.on('peard:previous-video'",
     );
