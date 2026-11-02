@@ -156,7 +156,6 @@ export default createPlugin({
             };
             additions.add(job);
             refreshOptimisticArtists();
-            filter?.refresh();
             const result = writes
               .then(async () => {
                 if (!ownsQueuedAddition(job)) return false;
@@ -172,8 +171,13 @@ export default createPlugin({
                   active && generation === epoch && writeEpoch === job.write;
                 // A later authoritative watch owns the base, even if an older
                 // admitted write's promise completes afterward.
-                if (current && configRevision === revision)
+                if (current && configRevision === revision) {
                   persistedArtists = artists;
+                  refreshOptimisticArtists();
+                  // A user save must reach storage before refreshing the playback
+                  // filter can synchronously skip and retire its source track.
+                  filter?.refresh();
+                }
                 return current;
               })
               .catch((error) => {

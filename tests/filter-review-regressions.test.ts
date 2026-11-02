@@ -926,6 +926,64 @@ test('a failed admitted addition does not leak into a later valid queued write',
   ]);
 });
 
+test('a synchronous config watch during a block save preserves the admitted write', async ({
+  page,
+}) => {
+  await f7Popup(page);
+  const result = await page.evaluate(async () => {
+    const w = window as any,
+      p = w.FilterFixture.blocklist;
+    w.open(['Current']);
+    const ctx = w.context({ enabled: true, blockedArtists: [] });
+    ctx.setConfig = async (patch: any) => {
+      const config = { enabled: true, blockedArtists: [], ...patch };
+      w.writes.push(patch);
+      p.renderer.onConfigChange(config);
+    };
+    await p.renderer.start(ctx);
+    p.renderer.onPlayerApiReady(w.api);
+    (
+      document.querySelector('.blocklist-injected') as HTMLButtonElement
+    ).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const result = { writes: w.writes.slice(), skips: w.state.skips.length };
+    p.renderer.stop();
+    return result;
+  });
+  expect(result).toEqual({
+    writes: [{ blockedArtists: [{ name: 'Current', channelId: 'UCCurrent' }] }],
+    skips: 0,
+  });
+});
+
+test('own playback-filter skip happens only after a current-track block is saved', async ({
+  page,
+}) => {
+  await f7Popup(page);
+  const result = await page.evaluate(async () => {
+    const w = window as any,
+      p = w.FilterFixture.blocklist;
+    w.open(['Twin']);
+    w.api.nextVideo = () => {
+      w.state.skips.push([w.state.id, w.state.index]);
+      w.state.id = w.state.responseId = 'B';
+    };
+    await p.renderer.start(w.context({ enabled: true, blockedArtists: [] }));
+    p.renderer.onPlayerApiReady(w.api);
+    (
+      document.querySelector('.blocklist-injected') as HTMLButtonElement
+    ).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const result = { writes: w.writes.slice(), skips: w.state.skips.length };
+    p.renderer.stop();
+    return result;
+  });
+  expect(result).toEqual({
+    writes: [{ blockedArtists: [{ name: 'Twin', channelId: 'UCTwin' }] }],
+    skips: 1,
+  });
+});
+
 // F7: supported retirement delivered reentrantly by an owned native getter.
 async function f7Popup(page: any) {
   await fixture(page);
