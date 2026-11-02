@@ -1,5 +1,434 @@
 import { test, expect } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
+import { stripTypeScriptTypes } from 'node:module';
+import { ts } from 'ts-morph';
 import { equalizerBundle, fixturePage } from './helpers/equalizer-bundle';
+
+// Run the actual renderer startup function with only its app/IPC boundaries
+// isolated. Web Audio, shared routing, EQ and DOM event registration are real.
+async function readinessFixture(
+  page: import('@playwright/test').Page,
+  ready: number,
+  deferred = false,
+  retireOnReady = false,
+  retireOnData = false,
+) {
+  const renderer = await readFile(
+    new URL('../src/renderer.ts', import.meta.url),
+    'utf8',
+  );
+  const source = ts.createSourceFile(
+    'renderer.ts',
+    renderer,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const declarations = source.statements.filter(
+    (statement) =>
+      ts.isVariableStatement(statement) &&
+      statement.declarationList.declarations.some(
+        (declaration) =>
+          ts.isIdentifier(declaration.name) &&
+          [
+            'languageDocumentActive',
+            'isLanguageDocumentCurrent',
+            'api',
+            'firstDataLoaded',
+            'repeatPreference',
+            'playlistQueue',
+            'disposeMusicActionsOwner',
+            'disposeAudioAnnouncements',
+            'audioAnnouncementGeneration',
+          ].includes(declaration.name.text),
+      ),
+  );
+  const pagehide = source.statements.find(
+    (statement) =>
+      ts.isExpressionStatement(statement) &&
+      ts.isCallExpression(statement.expression) &&
+      statement.expression.expression.getText(source) ===
+        'window.addEventListener' &&
+      statement.expression.arguments[0]?.getText(source) === "'pagehide'",
+  );
+  const startup = source.statements.find(
+    (statement) =>
+      ts.isFunctionDeclaration(statement) &&
+      statement.name?.text === 'onApiLoaded',
+  );
+  if (!pagehide || !startup)
+    throw new Error('Actual renderer startup not found');
+  const bootstrap =
+    stripTypeScriptTypes(
+      [...declarations, pagehide, startup]
+        .map((node) => node.getText(source))
+        .join('\n'),
+    ) +
+    (retireOnData ? '\nfirstDataLoaded = true;' : '') +
+    '\nreturn onApiLoaded;';
+  await fixturePage(
+    page,
+    await equalizerBundle("export * from '@/providers/renderer-audio';"),
+  );
+  await page.evaluate(
+    async ({ bootstrap, ready, deferred, retireOnReady, retireOnData }) => {
+      const f = (window as any).EqualizerFixture;
+      const contexts: AudioContext[] = [];
+      const media: {
+        element: HTMLVideoElement;
+        state: number;
+        listeners: Map<string, Set<unknown>>;
+      }[] = [];
+      const notifications: CustomEvent[] = [];
+      const messages: string[] = [];
+      const releases: (() => void)[] = [];
+      let inserts = 0;
+      const prepare = (element: HTMLVideoElement, state: number) => {
+        const row = {
+          element,
+          state,
+          listeners: new Map<string, Set<unknown>>(),
+        };
+        Object.defineProperty(element, 'readyState', { get: () => row.state });
+        const add = element.addEventListener.bind(element);
+        const remove = element.removeEventListener.bind(element);
+        element.addEventListener = ((
+          type: string,
+          listener: any,
+          options: any,
+        ) => {
+          if (type === 'loadstart' || type === 'canplaythrough') {
+            const set = row.listeners.get(type) ?? new Set();
+            set.add(listener);
+            row.listeners.set(type, set);
+          }
+          add(type, listener, options);
+        }) as any;
+        element.removeEventListener = ((
+          type: string,
+          listener: any,
+          options: any,
+        ) => {
+          row.listeners.get(type)?.delete(listener);
+          remove(type, listener, options);
+        }) as any;
+        media.push(row);
+        return row;
+      };
+      prepare(document.querySelector('video')!, ready);
+      document.addEventListener('peard:audio-can-play', (event) => {
+        notifications.push(event as CustomEvent);
+        if (retireOnReady) window.dispatchEvent(new Event('pagehide'));
+      });
+      if (retireOnData)
+        document.addEventListener('videodatachange', () =>
+          window.dispatchEvent(new Event('pagehide')),
+        );
+      await f.plugin.renderer.start({
+        getConfig: async () => ({
+          ...f.plugin.config,
+          enabled: true,
+          schemaVersion: 3,
+          profile: {
+            mode: 'custom',
+            preamp: 0,
+            bands: [
+              { id: 'saved', type: 'peaking', frequency: 1000, gain: 12, Q: 1 },
+            ],
+          },
+        }),
+        setConfig: async () => {},
+        ipc: { on() {}, removeAllListeners() {} },
+      });
+      Object.assign(window, {
+        electronIs: {
+          osx: () => false,
+          windows: () => false,
+          linux: () => false,
+        },
+        ipcRenderer: {
+          on() {},
+          send(channel: string) {
+            messages.push(channel);
+          },
+        },
+        mainConfig: { get: () => false },
+      });
+      const AsyncFunction = Object.getPrototypeOf(
+        async function () {},
+      ).constructor;
+      const load = new AsyncFunction(
+        'initializeAudioGraph',
+        'observeAudioGraphReadiness',
+        'createPlaylistQueueController',
+        'createRepeatPreference',
+        'publishMusicActionsOwner',
+        'getAllLoadedRendererPlugins',
+        'callOnPlayerApiReady',
+        'retireLanguageRequests',
+        bootstrap,
+      )(
+        (context: AudioContext, audio: MediaElementAudioSourceNode) => {
+          contexts.push(context);
+          const graph = f.initializeAudioGraph(context, audio);
+          const insert = graph.insertMaster;
+          graph.insertMaster = (...args: any[]) => {
+            inserts++;
+            return insert(...args);
+          };
+          return graph;
+        },
+        f.observeAudioGraphReadiness,
+        () => ({ dispose() {} }),
+        () => ({ dispose() {} }),
+        () => () => {},
+        () => (deferred ? { owned: { renderer: {} } } : {}),
+        () => new Promise<void>((resolve) => releases.push(resolve)),
+        () => {},
+      );
+      const owner = await load;
+      const fixture = {
+        media,
+        contexts,
+        notifications,
+        releases,
+        load: owner,
+        pending: Promise.resolve(),
+        start() {
+          this.pending = owner();
+        },
+        emit(type: string, index = media.length - 1) {
+          const row = media[index];
+          if (type === 'canplaythrough') row.state = 4;
+          row.element.dispatchEvent(new Event(type));
+        },
+        replace(state = 3) {
+          const video = document.createElement('video');
+          media[media.length - 1].element.replaceWith(video);
+          prepare(video, state);
+        },
+        summary() {
+          return {
+            inserts,
+            notifications: notifications.length,
+            currentIsLast:
+              f.getCurrentAudioGraph()?.audioContext === contexts.at(-1),
+            firstLoadListeners: media[0].listeners.get('loadstart')?.size ?? 0,
+            firstPendingListeners:
+              media[0].listeners.get('canplaythrough')?.size ?? 0,
+            loadListeners: media.map(
+              (row) => row.listeners.get('loadstart')?.size ?? 0,
+            ),
+            dialogs: document.querySelectorAll('dialog').length,
+            apiLoadedMessages: messages.filter(
+              (channel) => channel === 'peard:player-api-loaded',
+            ).length,
+          };
+        },
+        async close() {
+          f.plugin.renderer.stop();
+          for (const context of contexts)
+            if (context.state !== 'closed') await context.close();
+        },
+      };
+      (window as any).readyFixture = fixture;
+      // The current media load already started before renderer registration.
+      fixture.emit('loadstart');
+      fixture.start();
+      if (!deferred) await fixture.pending;
+    },
+    { bootstrap, ready, deferred, retireOnReady, retireOnData },
+  );
+}
+
+for (const ready of [2, 3]) {
+  test(`shared audio readiness catches current load at readyState${ready} and applies saved EQ before panel`, async ({
+    page,
+  }) => {
+    await readinessFixture(page, ready);
+    const before = await page.evaluate(() =>
+      (window as any).readyFixture.summary(),
+    );
+    expect(before).toMatchObject({ inserts: 0, notifications: 0, dialogs: 0 });
+    await page.evaluate(() => {
+      const f = (window as any).readyFixture;
+      f.emit('canplaythrough');
+      f.emit('playing');
+    });
+    expect(
+      await page.evaluate(() => (window as any).readyFixture.summary()),
+    ).toMatchObject({ inserts: 1, notifications: 1, dialogs: 0 });
+    await page.evaluate(() => (window as any).readyFixture.close());
+  });
+}
+
+test('shared audio readiness keeps initial-ready4 and later loads single without premature play announcements', async ({
+  page,
+}) => {
+  await readinessFixture(page, 4);
+  expect(
+    await page.evaluate(() => (window as any).readyFixture.summary()),
+  ).toMatchObject({ inserts: 1, notifications: 1 });
+  await page.evaluate(() => {
+    const f = (window as any).readyFixture;
+    f.emit('canplaythrough');
+    f.emit('play');
+    f.emit('pause');
+  });
+  expect(
+    await page.evaluate(() => (window as any).readyFixture.summary()),
+  ).toMatchObject({ inserts: 1, notifications: 1 });
+  await page.evaluate(() => {
+    const f = (window as any).readyFixture;
+    f.emit('loadstart');
+    f.emit('loadstart');
+    f.emit('canplaythrough');
+  });
+  expect(
+    await page.evaluate(() => (window as any).readyFixture.summary()),
+  ).toMatchObject({ inserts: 1, notifications: 2 });
+  await page.evaluate(() => (window as any).readyFixture.close());
+});
+
+test('shared audio readiness replaces the renderer owner and removes old pending listeners', async ({
+  page,
+}) => {
+  await readinessFixture(page, 3);
+  await page.evaluate(async () => {
+    const f = (window as any).readyFixture;
+    f.emit('loadstart');
+    f.replace();
+    await f.load();
+  });
+  expect(
+    await page.evaluate(() => (window as any).readyFixture.summary()),
+  ).toMatchObject({ firstLoadListeners: 0, firstPendingListeners: 0 });
+  await page.evaluate(() => {
+    const f = (window as any).readyFixture;
+    f.emit('canplaythrough', 0);
+    f.emit('canplaythrough');
+  });
+  expect(
+    await page.evaluate(() => (window as any).readyFixture.summary()),
+  ).toMatchObject({ inserts: 1, notifications: 1, currentIsLast: true });
+  await page.evaluate(() => (window as any).readyFixture.close());
+});
+
+for (const retirement of ['closed', 'detached', 'new-owner', 'pagehide']) {
+  test(`shared audio readiness rejects pending ${retirement} announcements`, async ({
+    page,
+  }) => {
+    await readinessFixture(page, 3);
+    await page.evaluate(async (retirement) => {
+      const f = (window as any).readyFixture;
+      f.emit('loadstart');
+      if (retirement === 'closed') {
+        const context = f.contexts[0];
+        const state = new Promise<void>((resolve) =>
+          context.addEventListener('statechange', () => {
+            if (context.state === 'closed') resolve();
+          }),
+        );
+        await context.close();
+        await state;
+      } else if (retirement === 'pagehide')
+        window.dispatchEvent(new Event('pagehide'));
+      else {
+        f.replace();
+        if (retirement === 'new-owner') {
+          const fixture = (window as any).EqualizerFixture,
+            context = new AudioContext();
+          f.contexts.push(context);
+          fixture.initializeAudioGraph(
+            context,
+            context.createMediaElementSource(f.media[1].element),
+          );
+        }
+      }
+      f.emit('canplaythrough', 0);
+    }, retirement);
+    expect(
+      await page.evaluate(() => (window as any).readyFixture.summary()),
+    ).toMatchObject({ inserts: 0, notifications: 0 });
+    await page.evaluate(() => (window as any).readyFixture.close());
+  });
+}
+
+test('shared audio readiness does not bind after pagehide during awaited player callbacks', async ({
+  page,
+}) => {
+  await readinessFixture(page, 3, true);
+  await page.evaluate(async () => {
+    const f = (window as any).readyFixture;
+    window.dispatchEvent(new Event('pagehide'));
+    f.releases.shift()();
+    await f.pending;
+    f.emit('loadstart');
+    f.emit('canplaythrough');
+  });
+  expect(
+    await page.evaluate(() => (window as any).readyFixture.summary()),
+  ).toMatchObject({
+    inserts: 0,
+    notifications: 0,
+    firstLoadListeners: 0,
+    firstPendingListeners: 0,
+  });
+  await page.evaluate(() => (window as any).readyFixture.close());
+});
+
+test('shared audio readiness keeps the newest disposer when older player callbacks finish last', async ({
+  page,
+}) => {
+  await readinessFixture(page, 3, true);
+  const listeners = await page.evaluate(async () => {
+    const f = (window as any).readyFixture;
+    f.replace();
+    const second = f.load();
+    f.releases[1]();
+    await second;
+    f.releases[0]();
+    await f.pending;
+    f.replace();
+    const third = f.load();
+    const listeners = f.summary().loadListeners;
+    f.releases[2]();
+    await third;
+    await f.close();
+    return listeners;
+  });
+  expect(listeners).toEqual([0, 0, 0]);
+});
+
+test('shared audio readiness retirement during immediate announcement stops later startup publication', async ({
+  page,
+}) => {
+  await readinessFixture(page, 4, false, true);
+  expect(
+    await page.evaluate(() => (window as any).readyFixture.summary()),
+  ).toMatchObject({
+    notifications: 1,
+    firstLoadListeners: 0,
+    firstPendingListeners: 0,
+    apiLoadedMessages: 0,
+  });
+  await page.evaluate(() => (window as any).readyFixture.close());
+});
+
+test('shared audio readiness cannot announce after a reentrant data-loaded retirement', async ({
+  page,
+}) => {
+  await readinessFixture(page, 4, false, false, true);
+  expect(
+    await page.evaluate(() => (window as any).readyFixture.summary()),
+  ).toMatchObject({
+    inserts: 0,
+    notifications: 0,
+    apiLoadedMessages: 0,
+    firstLoadListeners: 0,
+    firstPendingListeners: 0,
+  });
+  await page.evaluate(() => (window as any).readyFixture.close());
+});
 
 test('a repeated start releases the previous insert so a subsequent stop restores dry unity', async ({
   page,

@@ -11,7 +11,10 @@ import {
 import 'mdui/mdui.css';
 import 'mdui';
 
-import { initializeAudioGraph } from '@/providers/renderer-audio';
+import {
+  initializeAudioGraph,
+  observeAudioGraphReadiness,
+} from '@/providers/renderer-audio';
 import { LoggerPrefix } from '@/utils';
 import {
   defaultTrustedTypePolicy,
@@ -46,11 +49,16 @@ import type { SearchBoxElement } from '@/types/search-box-element';
 setTheme('dark');
 
 let languageDocumentActive = true;
+let audioAnnouncementGeneration = 0;
+let disposeAudioAnnouncements: (() => void) | undefined;
 const isLanguageDocumentCurrent = () => languageDocumentActive;
 window.addEventListener(
   'pagehide',
   () => {
     languageDocumentActive = false;
+    audioAnnouncementGeneration++;
+    disposeAudioAnnouncements?.();
+    disposeAudioAnnouncements = undefined;
     retireLanguageRequests();
   },
   { once: true },
@@ -106,6 +114,11 @@ async function callOnPlayerApiReady(
 }
 
 async function onApiLoaded() {
+  const audioOwner = ++audioAnnouncementGeneration;
+  const isAudioOwnerCurrent = () =>
+    audioOwner === audioAnnouncementGeneration && isLanguageDocumentCurrent();
+  disposeAudioAnnouncements?.();
+  disposeAudioAnnouncements = undefined;
   disposeMusicActionsOwner?.();
   disposeMusicActionsOwner = undefined;
   playlistQueue?.dispose();
@@ -450,36 +463,25 @@ async function onApiLoaded() {
     }
   }
 
+  if (!isAudioOwnerCurrent()) return;
+
   if (firstDataLoaded) {
     document.dispatchEvent(
       new CustomEvent('videodatachange', { detail: { name: 'dataloaded' } }),
     );
   }
 
-  const audioCanPlayEventDispatcher = () => {
-    document.dispatchEvent(
-      new CustomEvent('peard:audio-can-play', {
-        detail: {
-          audioContext,
-          audioSource,
-          audioGraph,
-        },
-      }),
-    );
-  };
-
-  const loadstartListener = () => {
-    // Emit "audioCanPlay" for each video
-    video.addEventListener('canplaythrough', audioCanPlayEventDispatcher, {
-      once: true,
-    });
-  };
-
-  if (video.readyState === 4 /* HAVE_ENOUGH_DATA (loaded) */) {
-    audioCanPlayEventDispatcher();
+  const dispose = observeAudioGraphReadiness(
+    audioGraph,
+    video,
+    isAudioOwnerCurrent,
+  );
+  // A synchronous readiness subscriber may retire/rebind this renderer owner.
+  if (!isAudioOwnerCurrent()) {
+    dispose();
+    return;
   }
-
-  video.addEventListener('loadstart', loadstartListener, { passive: true });
+  disposeAudioAnnouncements = dispose;
 
   window.ipcRenderer.send('peard:player-api-loaded');
 

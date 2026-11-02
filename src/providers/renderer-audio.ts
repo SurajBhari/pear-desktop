@@ -37,6 +37,68 @@ export function getCurrentAudioGraph(): RendererAudioGraph | null {
   return current;
 }
 
+/** Announce actual media readiness, including a load already in progress. */
+export function observeAudioGraphReadiness(
+  graph: RendererAudioGraph,
+  video: HTMLVideoElement,
+  isOwnerCurrent: () => boolean,
+): () => void {
+  let disposed = false;
+  const isCurrent = () =>
+    !disposed &&
+    isOwnerCurrent() &&
+    current === graph &&
+    graph.audioSource.mediaElement === video &&
+    graph.audioContext.state !== 'closed' &&
+    video.isConnected &&
+    document.querySelector('video') === video;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    video.removeEventListener('canplaythrough', announce);
+    video.removeEventListener('loadstart', arm);
+    graph.audioContext.removeEventListener('statechange', contextChanged);
+    window.removeEventListener('pagehide', dispose);
+  };
+  const announce = () => {
+    video.removeEventListener('canplaythrough', announce);
+    if (!isCurrent()) {
+      dispose();
+      return;
+    }
+    document.dispatchEvent(
+      new CustomEvent('peard:audio-can-play', {
+        detail: {
+          audioContext: graph.audioContext,
+          audioSource: graph.audioSource,
+          audioGraph: graph,
+        },
+      }),
+    );
+  };
+  const arm = () => {
+    if (!isCurrent()) {
+      dispose();
+      return;
+    }
+    // The same callback deduplicates the current load and future loadstart.
+    video.addEventListener('canplaythrough', announce, { once: true });
+  };
+  const contextChanged = () => {
+    if (graph.audioContext.state === 'closed') dispose();
+  };
+  if (!isCurrent()) {
+    dispose();
+    return dispose;
+  }
+  video.addEventListener('loadstart', arm, { passive: true });
+  graph.audioContext.addEventListener('statechange', contextChanged);
+  window.addEventListener('pagehide', dispose, { once: true });
+  if (video.readyState === 4 /* HAVE_ENOUGH_DATA */) announce();
+  else arm();
+  return dispose;
+}
+
 export function initializeAudioGraph(
   audioContext: AudioContext,
   audioSource: MediaElementAudioSourceNode,
