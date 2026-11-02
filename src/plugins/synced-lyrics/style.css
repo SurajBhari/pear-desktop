@@ -212,6 +212,7 @@
   height: auto;
   display: flex;
   flex-direction: row;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -223,7 +224,8 @@
 
 .lyrics-picker-content {
   display: flex;
-  width: 50%;
+  flex: 1;
+  min-width: 0;
 
   flex-direction: column;
   justify-content: space-around;
@@ -251,6 +253,10 @@
   align-items: center;
 
   transition: transform 180ms var(--lyrics-ease-out);
+}
+
+.lyrics-picker-item .description {
+  white-space: nowrap;
 }
 
 .lyrics-picker-dot {
@@ -302,6 +308,12 @@ div:has(> .lyrics-picker) {
 
 .lyrics-export {
   min-height: 36px;
+  flex-basis: 100%;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
   color: inherit;
   background: var(--ytmusic-general-background-b, #232325);
   border: 1px solid rgb(255 255 255 / 8%);
@@ -324,6 +336,9 @@ div:has(> .lyrics-picker) {
   outline-offset: 2px;
 }
 .lyrics-export-status {
+  flex-basis: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-size: 12px;
   color: var(--ytmusic-text-secondary);
 }
