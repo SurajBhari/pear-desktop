@@ -195,8 +195,7 @@
     animation: none;
   }
   .lyrics-original,
-  .lyrics-word,
-  .lyrics-picker-item {
+  .lyrics-word {
     transition: none;
   }
 }
@@ -255,6 +254,12 @@
   transition: transform 180ms var(--lyrics-ease-out);
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .lyrics-picker-item {
+    transition: none;
+  }
+}
+
 .lyrics-picker-item .description {
   white-space: nowrap;
 }
@@ -290,7 +295,7 @@ div:has(> .lyrics-picker) {
     position: relative;
 
     top: var(--lyrics-picker-top, 0) !important;
-    background: var(--ytmusic-general-background-a, #141415);
+    background: #000;
   }
 }
 
