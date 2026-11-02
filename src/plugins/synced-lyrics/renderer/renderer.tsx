@@ -41,12 +41,14 @@ export const startLyricsEffects = () =>
       // Saved effect names remain readable; emphasis never changes glyph metrics.
       const fancy = config()?.lineEffect === 'fancy';
       const styles = {
-        '--lyrics-font-size': fancy ? '3rem' : 'clamp(1.4rem, 1.1vmax, 3rem)',
+        '--lyrics-font-size': fancy
+          ? 'clamp(2.4rem, 3vw, 3rem)'
+          : 'clamp(1.4rem, 1.1vmax, 3rem)',
         '--lyrics-line-height': fancy
           ? '1.333'
           : 'var(--ytmusic-body-line-height)',
         '--lyrics-width': config()?.lineEffect === 'scale' ? '83%' : '100%',
-        '--lyrics-padding': fancy ? '2rem' : '0',
+        '--lyrics-padding': fancy ? '16px' : '0',
         '--lyrics-romanization-ratio': String(
           romanizationRatio(config()?.romanizationSizePercent),
         ),
