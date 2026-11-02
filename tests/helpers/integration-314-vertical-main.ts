@@ -2,10 +2,10 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { build } from 'vite';
+import { build, normalizePath } from 'vite';
 import { musicRemoteHttpFixture } from './api-music-remote-http';
 
-const root = path.resolve(import.meta.dirname, '../..');
+const root = normalizePath(path.resolve(import.meta.dirname, '../..'));
 let serial = 0;
 /** Keep real REST/service/broker; replace its canned responder before any request. */
 export async function verticalMainFixture() {
@@ -34,7 +34,8 @@ export async function verticalMainFixture() {
   });
   globals[key] = { ipcMain: transport.ipcMain, state, directory };
   const entry = path.join(directory, 'entry.ts');
-  const actual = (file: string) => JSON.stringify(path.join(root, file));
+  const actual = (file: string) =>
+    JSON.stringify(normalizePath(path.join(root, file)));
   await writeFile(
     entry,
     [
@@ -78,7 +79,7 @@ export const createFFmpeg=()=>{let loaded=false;const files=new Map();return{isL
             find,
             replacement: '\0vertical-main:' + find,
           })),
-          { find: '@', replacement: path.join(root, 'src') },
+          { find: '@', replacement: normalizePath(path.join(root, 'src')) },
         ],
       },
       plugins: [
@@ -119,7 +120,10 @@ export const createFFmpeg=()=>{let loaded=false;const files=new Map();return{isL
             return undefined;
           },
           transform(code, id) {
-            if (id === path.join(root, 'src/providers/song-info.ts'))
+            if (
+              normalizePath(id) ===
+              normalizePath(path.join(root, 'src/providers/song-info.ts'))
+            )
               return {
                 code: code + '\nexport {callbacks as verticalCallbacks};',
                 map: null,
@@ -128,9 +132,9 @@ export const createFFmpeg=()=>{let loaded=false;const files=new Map();return{isL
           },
           generateBundle() {
             modules.push(
-              ...Array.from(this.getModuleIds()).filter((id) =>
-                id.startsWith(root + '/src/'),
-              ),
+              ...Array.from(this.getModuleIds())
+                .map((id) => normalizePath(id))
+                .filter((id) => id.startsWith(root + '/src/')),
             );
             if (
               modules.filter((id) => id.endsWith('/providers/song-info.ts'))

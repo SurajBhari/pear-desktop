@@ -1,10 +1,10 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { build } from 'vite';
+import { build, normalizePath } from 'vite';
 import type { Page } from '@playwright/test';
 
-const root = path.resolve(import.meta.dirname, '../..');
+const root = normalizePath(path.resolve(import.meta.dirname, '../..'));
 /** Only external data, config and presentation boundaries are substituted. */
 export async function verticalBrowserBundle() {
   const directory = await mkdtemp(
@@ -12,7 +12,8 @@ export async function verticalBrowserBundle() {
   );
   const entry = path.join(directory, 'entry.ts');
   const modules: string[] = [];
-  const actual = (file: string) => JSON.stringify(path.join(root, file));
+  const actual = (file: string) =>
+    JSON.stringify(normalizePath(path.join(root, file)));
   await writeFile(
     entry,
     [
@@ -35,7 +36,7 @@ export async function verticalBrowserBundle() {
           ...['@/utils', '@/i18n', '@/providers/prompt-options'].map(
             (find) => ({ find, replacement: '\0vertical:' + find }),
           ),
-          { find: '@', replacement: path.join(root, 'src') },
+          { find: '@', replacement: normalizePath(path.join(root, 'src')) },
         ],
       },
       plugins: [
@@ -54,7 +55,10 @@ export async function verticalBrowserBundle() {
               ].includes(id)
             )
               return '\0vertical:' + id;
-            if (importer?.includes('/synced-lyrics/')) {
+            if (
+              importer &&
+              normalizePath(importer).includes('/synced-lyrics/')
+            ) {
               if (id === './renderer' || id === '../renderer/renderer')
                 return '\0vertical:lyrics-presentation';
               if (id === './utils') return '\0vertical:lyrics-view';
@@ -87,7 +91,8 @@ export async function verticalBrowserBundle() {
           transform(code, id) {
             if (
               process.env.VERTICAL_314_PROBE_BYPASS_PREVIOUS_ARM === '1' &&
-              id === path.join(root, 'src/providers/music-actions.ts')
+              normalizePath(id) ===
+                normalizePath(path.join(root, 'src/providers/music-actions.ts'))
             ) {
               const marker = 'armNavigation?.();';
               if (code.split(marker).length !== 2)
@@ -106,9 +111,9 @@ export async function verticalBrowserBundle() {
           },
           generateBundle() {
             modules.push(
-              ...Array.from(this.getModuleIds()).filter((id) =>
-                id.startsWith(root + '/src/'),
-              ),
+              ...Array.from(this.getModuleIds())
+                .map((id) => normalizePath(id))
+                .filter((id) => id.startsWith(root + '/src/')),
             );
             if (modules.some((id) => /electron-store|\/src\/config\//.test(id)))
               throw Error('Profile storage imported');
