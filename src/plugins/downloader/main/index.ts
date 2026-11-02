@@ -59,6 +59,7 @@ import {
 } from '../audio';
 import {
   checkDuplicate,
+  primaryOutputFilename,
   publishCompleted,
   hasVerifiedTrack,
   scanLibrary,
@@ -871,7 +872,12 @@ async function downloadSongUnsafe(
   if (!/^[\w]{1,12}$/.test(targetFileExtension))
     throw new Error('Invalid output extension');
   const policy = config.duplicatePolicy ?? 'legacy';
-  if (policy === 'legacy' && config.skipExisting && existsSync(filePath)) {
+  if (
+    policy === 'legacy' &&
+    config.skipExisting &&
+    (existsSync(filePath) ||
+      existsSync(join(dir, primaryOutputFilename(filename))))
+  ) {
     sendFeedback(null, -1);
     return;
   }
