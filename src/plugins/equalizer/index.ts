@@ -147,7 +147,7 @@ export default createPlugin({
         label: t('plugins.equalizer.editor.bypass'),
         type: 'checkbox',
         checked: config.bypass,
-        click: () => setConfig({ bypass: !config.bypass }),
+        click: (item) => setConfig({ bypass: item.checked }),
       },
     ];
   },
