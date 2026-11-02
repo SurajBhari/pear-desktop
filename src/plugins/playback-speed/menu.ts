@@ -12,27 +12,35 @@ export const onMenu = async ({
   getConfig,
   setConfig,
 }: MenuContext<PlaybackSpeedPluginConfig>): Promise<MenuTemplate> => {
-  const generation = backend.generation,
-    documentRevision = backend.documentRevision;
-  const contents = window?.webContents,
-    frame = contents?.mainFrame;
-  const current = () => {
+  const generation = backend.generation;
+  const contents = window?.webContents;
+  const captureCurrent = () => {
+    const documentRevision = backend.documentRevision;
+    let frame: unknown;
     try {
-      const unavailable =
-        window &&
-        (window.isDestroyed() ||
-          window.webContents !== contents ||
-          contents?.isDestroyed?.() ||
-          contents?.mainFrame !== frame);
-      return (
-        !unavailable &&
-        generation === backend.generation &&
-        documentRevision === backend.documentRevision
-      );
+      frame = contents?.mainFrame;
     } catch {
-      return false;
+      return () => false;
     }
+    return () => {
+      try {
+        const unavailable =
+          window &&
+          (window.isDestroyed() ||
+            window.webContents !== contents ||
+            contents?.isDestroyed?.() ||
+            contents?.mainFrame !== frame);
+        return (
+          !unavailable &&
+          generation === backend.generation &&
+          documentRevision === backend.documentRevision
+        );
+      } catch {
+        return false;
+      }
+    };
   };
+  const current = captureCurrent();
   const config = await getConfig();
   if (!current()) return [];
   return [
@@ -40,12 +48,18 @@ export const onMenu = async ({
       label: t('plugins.playback-speed.menu.preserve-pitch'),
       type: 'checkbox',
       checked: config.preservesPitch !== false,
-      click: (item) =>
-        current() ? setConfig({ preservesPitch: item.checked }) : undefined,
+      click: (item) => {
+        const current = captureCurrent();
+        return current()
+          ? setConfig({ preservesPitch: item.checked })
+          : undefined;
+      },
     },
     {
       label: t('plugins.playback-speed.menu.global-shortcuts'),
       async click() {
+        const current = captureCurrent();
+        if (!current()) return;
         const initial = await getConfig();
         if (!current()) return;
         const original = { ...initial.globalShortcuts };
@@ -98,6 +112,8 @@ export const onMenu = async ({
     {
       label: t('plugins.playback-speed.menu.step'),
       async click() {
+        const current = captureCurrent();
+        if (!current()) return;
         const initial = await getConfig();
         if (!current()) return;
         const original = initial.step;

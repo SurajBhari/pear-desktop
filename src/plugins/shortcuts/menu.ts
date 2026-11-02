@@ -52,29 +52,39 @@ export const onMenu = async ({
   getConfig,
   setConfig,
 }: MenuContext<ShortcutsPluginConfig>): Promise<MenuTemplate> => {
-  const generation = backend.generation,
-    documentRevision = backend.documentRevision;
-  const contents = window.webContents,
-    frame = contents.mainFrame;
-  const currentOwner = () => {
+  const generation = backend.generation;
+  const contents = window.webContents;
+  const captureOwner = () => {
+    const documentRevision = backend.documentRevision;
+    let frame: unknown;
     try {
-      const unavailable =
-        window.isDestroyed() ||
-        window.webContents !== contents ||
-        contents.isDestroyed?.() ||
-        contents.mainFrame !== frame;
-      return (
-        !unavailable &&
-        generation === backend.generation &&
-        documentRevision === backend.documentRevision
-      );
+      frame = contents.mainFrame;
     } catch {
-      return false;
+      return () => false;
     }
+    return () => {
+      try {
+        const unavailable =
+          window.isDestroyed() ||
+          window.webContents !== contents ||
+          contents.isDestroyed?.() ||
+          contents.mainFrame !== frame;
+        return (
+          !unavailable &&
+          generation === backend.generation &&
+          documentRevision === backend.documentRevision
+        );
+      } catch {
+        return false;
+      }
+    };
   };
+  const currentOwner = captureOwner();
   const config = await getConfig();
   if (!currentOwner()) return [];
   const promptKeybind = async (scope: 'global' | 'local') => {
+    const currentOwner = captureOwner();
+    if (!currentOwner()) return;
     const current = await getConfig();
     if (!currentOwner()) return;
     const originalMapping = { ...current[scope] };
@@ -138,6 +148,8 @@ export const onMenu = async ({
       submenu: seekSettings.map(({ key, label, fallback }) => ({
         label: t(`plugins.shortcuts.menu.seek.${label}`),
         async click() {
+          const currentOwner = captureOwner();
+          if (!currentOwner()) return;
           const current = await getConfig();
           if (!currentOwner()) return;
           const originalValue = current[key];
@@ -177,20 +189,24 @@ export const onMenu = async ({
       label: t('plugins.shortcuts.menu.override-media-keys'),
       type: 'checkbox',
       checked: config.overrideMediaKeys,
-      click: (item) =>
-        currentOwner()
+      click: (item) => {
+        const currentOwner = captureOwner();
+        return currentOwner()
           ? setConfig({ overrideMediaKeys: item.checked })
-          : undefined,
+          : undefined;
+      },
     },
     {
       label: t('plugins.shortcuts.menu.focus-window-on-double-play-pause'),
       sublabel: t('plugins.shortcuts.menu.double-command-repeat-info'),
       type: 'checkbox',
       checked: config.focusWindowOnDoublePlayPause === true,
-      click: (item) =>
-        currentOwner()
+      click: (item) => {
+        const currentOwner = captureOwner();
+        return currentOwner()
           ? setConfig({ focusWindowOnDoublePlayPause: item.checked })
-          : undefined,
+          : undefined;
+      },
     },
   ];
 };
