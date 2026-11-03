@@ -147,12 +147,9 @@
 .instrumental-indicator {
   opacity: 0.4;
   display: inline-block;
-  /* Keep measured row height while only the current pause is visible. */
-  visibility: hidden;
 }
 .current .instrumental-indicator {
   opacity: 0.75;
-  visibility: visible;
 }
 .instrumental-indicator > span {
   display: inline-flex;
@@ -185,10 +182,6 @@
   height: 0.24em;
   border-radius: 50%;
   background: currentColor;
-}
-.lyrics-placeholder {
-  white-space: pre-wrap;
-  opacity: 0.6;
 }
 @media (prefers-reduced-motion: reduce) {
   .current .instrumental-indicator > span {

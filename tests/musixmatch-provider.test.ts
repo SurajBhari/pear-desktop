@@ -6,6 +6,11 @@ import { pathToFileURL } from 'node:url';
 
 import { expect, test } from '@playwright/test';
 
+import { LRC } from '../src/plugins/synced-lyrics/parsers/lrc';
+import { renderedWords } from '../src/plugins/synced-lyrics/renderer/word-timing';
+
+import type { MusixMatch as MusixMatchProvider } from '../src/plugins/synced-lyrics/providers/MusixMatch';
+
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
 const requireVite = createRequire(requireRoot.resolve('vite'));
@@ -25,7 +30,7 @@ test.beforeAll(async () => {
   const entry = path.join(directory, 'entry.ts');
   await writeFile(
     entry,
-    `export {MusixMatch} from ${JSON.stringify(path.join(root, 'src/plugins/synced-lyrics/providers/MusixMatch.ts'))};`,
+    `export {MusixMatch} from ${JSON.stringify(path.join(root, 'src/plugins/synced-lyrics/providers/MusixMatch.ts'))};export {LRC} from ${JSON.stringify(path.join(root, 'src/plugins/synced-lyrics/parsers/lrc.ts'))};`,
   );
   const { rolldown } = await import(
     pathToFileURL(requireVite.resolve('rolldown')).href
@@ -203,10 +208,14 @@ async function fixture(
   };
   const modulePath = path.join(directory, `fixture-${fixtureIndex++}.cjs`);
   await writeFile(modulePath, code);
-  const { MusixMatch } = requireRoot(modulePath);
+  const { MusixMatch, LRC: providerParser } = requireRoot(modulePath) as {
+    MusixMatch: new () => MusixMatchProvider;
+    LRC: typeof LRC;
+  };
   const provider = new MusixMatch();
   return {
     provider,
+    providerParser,
     calls,
     diagnostics,
     count: (endpoint: string) =>
@@ -225,7 +234,7 @@ async function fixture(
 test('actual provider uses the public mobile client contract and returns correct plain lyrics', async () => {
   const f = await fixture();
   try {
-    const result = await f.provider.search(song);
+    const result = (await f.provider.search(song))!;
     expect(result).toMatchObject({
       title: 'Yellow',
       artists: ['Coldplay'],
@@ -316,16 +325,14 @@ test('modern optional lyric/subtitle metadata preserves actual LRC output compat
       : undefined,
   );
   try {
-    const result = await f.provider.search(song);
+    const result = (await f.provider.search(song))!;
     expect(result.lyrics).toBe('yellow verse');
-    expect(result.lines.map((line: any) => [line.timeInMs, line.text])).toEqual(
-      [
-        [0, ''],
-        [1000, 'first'],
-        [2000, 'second'],
-      ],
-    );
-    expect(result.lines.every((line: any) => line.status === 'upcoming')).toBe(
+    expect(result.lines!.map((line) => [line.timeInMs, line.text])).toEqual([
+      [0, ''],
+      [1000, 'first'],
+      [2000, 'second'],
+    ]);
+    expect(result.lines!.every((line) => line.status === 'upcoming')).toBe(
       true,
     );
   } finally {
@@ -680,6 +687,179 @@ test('malformed payload errors never log echoed tokens or raw responses', async 
   try {
     await expect(f.provider.search(song)).rejects.toThrow(/response|schema/i);
     expect(f.diagnostics).toEqual([]);
+  } finally {
+    f.close();
+  }
+});
+
+test('Musixmatch strips only line-leading ASCII padding and preserves clocks and other spacing', async () => {
+  const input =
+    '[offset:125]\n[00:00.00] \tFirst  middle\tend  \n[00:03.00]\tSecond \t \n[00:06.00] \t\n[00:09.00]\u00a0\u3000Third  \n[00:12.00] \t\u00a0Fourth\t ';
+  const before = LRC.parse(input).lines;
+  const f = await fixture((call) =>
+    call.endpoint === 'macro.subtitles.get'
+      ? { value: macro({}, { lrc: input }) }
+      : undefined,
+  );
+  try {
+    const result = (await f.provider.search(song))!;
+    expect(result.lines!.map((line) => line.text)).toEqual([
+      'First  middle\tend  ',
+      'Second \t ',
+      '',
+      '\u00a0\u3000Third  ',
+      '\u00a0Fourth\t ',
+    ]);
+    expect(
+      result.lines!.map(
+        ({ text: _text, words: _words, status: _status, ...clock }) => clock,
+      ),
+    ).toEqual(before.map(({ text: _text, words: _words, ...clock }) => clock));
+    expect(result.lyrics).toBe('yellow verse');
+    expect(before[0].text).toBe(' \tFirst  middle\tend  ');
+  } finally {
+    f.close();
+  }
+});
+
+for (const [name, body, expectedWords] of [
+  [
+    'first word',
+    ' \t<00:00.00>First  <00:00.30>word \t',
+    ['First  ', 'word \t'],
+  ],
+  [
+    'split prefix',
+    '<00:00.00> <00:00.10>\t<00:00.20>First  <00:00.30>word \t',
+    ['', '', 'First  ', 'word \t'],
+  ],
+  [
+    'empty first token',
+    '<00:00.00><00:00.10> \t<00:00.20>First  <00:00.30>word \t',
+    ['', '', 'First  ', 'word \t'],
+  ],
+] as const)
+  test(
+    'Musixmatch keeps real word alignment and timings while stripping ' +
+      name +
+      ' padding',
+    async () => {
+      const input = '[00:00.00]' + body + '\n[00:08.00]Later';
+      const before = LRC.parse(input).lines[0];
+      const f = await fixture((call) =>
+        call.endpoint === 'macro.subtitles.get'
+          ? { value: macro({}, { lrc: input }) }
+          : undefined,
+      );
+      try {
+        const line = (await f.provider.search(song))!.lines![0];
+        expect(line.text).toBe('First  word \t');
+        expect(line.words.map((word) => word.word)).toEqual(expectedWords);
+        expect(line.words.map(({ word: _word, ...timing }) => timing)).toEqual(
+          before.words.map(({ word: _word, ...timing }) => timing),
+        );
+        expect([line.time, line.timeInMs, line.duration]).toEqual([
+          before.time,
+          before.timeInMs,
+          before.duration,
+        ]);
+        expect(renderedWords(line)).toEqual(line.words);
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+test('Musixmatch preserves existing end and duration metadata when prefix tokens become empty', async () => {
+  const before = {
+    time: '00:00:00',
+    timeInMs: 0,
+    duration: 1000,
+    endTimeInMs: 1000,
+    text: ' \tHello  ',
+    words: [
+      { timeInMs: 0, endTimeInMs: 50, duration: 50, word: ' ' },
+      { timeInMs: 100, endTimeInMs: 150, duration: 50, word: '\t' },
+      { timeInMs: 200, endTimeInMs: 800, duration: 600, word: 'Hello  ' },
+    ],
+  };
+  const frozen = Object.freeze({
+    ...before,
+    words: Object.freeze(
+      before.words.map((word) => Object.freeze({ ...word })),
+    ),
+  });
+  const f = await fixture((call) =>
+    call.endpoint === 'macro.subtitles.get'
+      ? { value: macro({}, { lrc: '[00:00.00]fixture' }) }
+      : undefined,
+  );
+  // Ordinary LRC has no explicit end fields. Inject only that existing line
+  // shape at the parser boundary to guard richer metadata preservation.
+  f.providerParser.parse = () => ({
+    tags: [],
+    lines: [frozen as unknown as ReturnType<typeof LRC.parse>['lines'][number]],
+  });
+  try {
+    const line = (await f.provider.search(song))!.lines![0];
+    expect(line.text).toBe('Hello  ');
+    expect(line.words.map((word) => word.word)).toEqual(['', '', 'Hello  ']);
+    expect(line.words.map(({ word: _word, ...timing }) => timing)).toEqual(
+      before.words.map(({ word: _word, ...timing }) => timing),
+    );
+    expect([line.time, line.timeInMs, line.endTimeInMs, line.duration]).toEqual(
+      [before.time, before.timeInMs, before.endTimeInMs, before.duration],
+    );
+    expect(renderedWords(line)).toEqual(line.words);
+    expect(frozen.text).toBe(' \tHello  ');
+    expect(frozen.words).toEqual(before.words);
+  } finally {
+    f.close();
+  }
+});
+
+test('Musixmatch trims malformed word-line padding without accepting guessed alignment', async () => {
+  const before = {
+    time: '00:00:00',
+    timeInMs: 0,
+    duration: 1000,
+    text: '  Hello',
+    words: [{ timeInMs: 0, endTimeInMs: 800, word: 'Hello' }],
+  };
+  const f = await fixture((call) =>
+    call.endpoint === 'macro.subtitles.get'
+      ? { value: macro({}, { lrc: '[00:00.00]fixture' }) }
+      : undefined,
+  );
+  // A deliberately malformed existing join must remain a fallback. The real
+  // LRC parser already retains a purely whitespace prefix in its first token.
+  f.providerParser.parse = () => ({ tags: [], lines: [before] });
+  try {
+    const line = (await f.provider.search(song))!.lines![0];
+    expect(line.text).toBe('Hello');
+    expect(line.words).toEqual([]);
+    expect(renderedWords(line)).toBeNull();
+  } finally {
+    f.close();
+  }
+});
+
+test('Musixmatch padding cleanup does not repair invalid real word timings', async () => {
+  const input = '[00:00.00] \t<00:00.20>First <00:00.10>word\n[00:08.00]Later';
+  const before = LRC.parse(input).lines[0];
+  const f = await fixture((call) =>
+    call.endpoint === 'macro.subtitles.get'
+      ? { value: macro({}, { lrc: input }) }
+      : undefined,
+  );
+  try {
+    const line = (await f.provider.search(song))!.lines![0];
+    expect(line.text).toBe('First word');
+    expect(line.words.map(({ word: _word, ...timing }) => timing)).toEqual(
+      before.words.map(({ word: _word, ...timing }) => timing),
+    );
+    expect(renderedWords(before)).toBeNull();
+    expect(renderedWords(line)).toBeNull();
   } finally {
     f.close();
   }

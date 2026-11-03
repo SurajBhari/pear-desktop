@@ -134,6 +134,24 @@ async function captureUnhandled<T>(operation: () => Promise<T>) {
   }
 }
 
+test('obsolete default between-lyrics character submenu is absent without rewriting legacy configuration', async () => {
+  const f = await fixture();
+  try {
+    f.state.config.defaultTextString = '♪';
+    await f.refresh();
+    expect(
+      f.menu.find(
+        (item: any) =>
+          item.label === 'plugins.synced-lyrics.menu.default-text-string.label',
+      ),
+    ).toBeUndefined();
+    expect(f.state.config.defaultTextString).toBe('♪');
+    expect(f.state.writes).toEqual([]);
+  } finally {
+    f.close();
+  }
+});
+
 test('export option defaults on in the synced lyrics plugin config', async () => {
   const raw = stripTypeScriptTypes(
     await readFile(

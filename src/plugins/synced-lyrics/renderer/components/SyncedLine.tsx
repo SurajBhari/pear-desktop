@@ -46,40 +46,23 @@ const convertText = (text: string) => {
 };
 
 const EmptyLine = (props: SyncedLineProps) => {
-  const states = createMemo(() => {
-    const text = config()?.defaultTextString ?? '';
-    return Array.isArray(text) ? text : [text];
-  });
-  const text = createMemo(() => {
-    const progress = Math.max(
-      0,
-      Math.min(1, (displayTime() - props.line.timeInMs) / props.line.duration),
-    );
-    const index = Number.isFinite(progress)
-      ? Math.floor((states().length - 1) * progress)
-      : 0;
-    return states()[props.status === 'current' ? index : 0] ?? '';
-  });
   const knownGap = () =>
     Number.isFinite(props.line.duration) && props.line.duration >= 2000;
   return (
-    <div
-      aria-label={t('plugins.synced-lyrics.instrumental-break')}
-      class={`synced-line ${props.status}`}
-      onClick={() => seek(props.line)}
-      onKeyDown={(event) => keySeek(event, props.line)}
-      role="button"
-      tabIndex={0}
-    >
-      <div class="description ytmusic-description-shelf-renderer" dir="auto">
-        <div class="text-lyrics">
-          <Show when={config()?.showTimeCodes}>
-            <span class="lyrics-time">[{props.line.time}] </span>
-          </Show>
-          <Show
-            fallback={<span class="lyrics-placeholder">{text()}</span>}
-            when={knownGap()}
-          >
+    <Show when={knownGap()}>
+      <div
+        aria-label={t('plugins.synced-lyrics.instrumental-break')}
+        class={`synced-line ${props.status}`}
+        onClick={() => seek(props.line)}
+        onKeyDown={(event) => keySeek(event, props.line)}
+        role="button"
+        tabIndex={0}
+      >
+        <div class="description ytmusic-description-shelf-renderer" dir="auto">
+          <div class="text-lyrics">
+            <Show when={config()?.showTimeCodes}>
+              <span class="lyrics-time">[{props.line.time}] </span>
+            </Show>
             <span
               aria-label={t('plugins.synced-lyrics.instrumental-break')}
               class="instrumental-indicator"
@@ -92,10 +75,10 @@ const EmptyLine = (props: SyncedLineProps) => {
                 <i />
               </span>
             </span>
-          </Show>
+          </div>
         </div>
       </div>
-    </div>
+    </Show>
   );
 };
 
