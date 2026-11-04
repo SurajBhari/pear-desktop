@@ -11,7 +11,7 @@ import {
   AuthStrategy,
   defaultAPIServerConfig,
 } from './config';
-import { createMusicGrantMenu } from './music-menu';
+import { createMusicGrantMenu, createRemoteMusicGrantMenu } from './music-menu';
 
 import type { MenuTemplate } from '@/menu';
 import type { MenuContext } from '@/types/contexts';
@@ -39,6 +39,18 @@ export const onMenu = async ({
     show: (options: import('electron').MessageBoxOptions) =>
       dialog.showMessageBox(window, options),
     copy: (token: string) => clipboard.writeText(token),
+    promptResource: async (value: string) =>
+      (await prompt(
+        {
+          title: 'Remote REST resource',
+          label: 'Exact remote REST resource URL',
+          value,
+          type: 'input',
+          width: 380,
+          ...promptOptions(),
+        },
+        window,
+      )) ?? null,
   };
   const context = { getConfig, setConfig, window, refresh };
   const musicMenu = await createMusicGrantMenu(
@@ -52,8 +64,24 @@ export const onMenu = async ({
     native,
     'mcp',
   );
+  const remoteMenu = await createRemoteMusicGrantMenu(
+    context,
+    (resource) => getMusicService(window, resource),
+    native,
+  );
   return [
-    { label: 'Expanded music API', type: 'submenu', submenu: musicMenu },
+    {
+      label: 'Expanded music API',
+      type: 'submenu',
+      submenu: [
+        ...musicMenu.map((entry) =>
+          entry.label === 'Create client grant…'
+            ? { ...entry, label: 'Create local REST grant…' }
+            : entry,
+        ),
+        { label: 'Remote REST access', type: 'submenu', submenu: remoteMenu },
+      ],
+    },
     { label: 'MCP music access', type: 'submenu', submenu: mcpMenu },
     {
       label: t('plugins.api-server.menu.hostname.label'),

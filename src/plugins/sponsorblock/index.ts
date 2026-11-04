@@ -113,12 +113,27 @@ export default createPlugin<
       const epoch = backendEpoch;
       const config = await getConfig();
       if (epoch !== backendEpoch) return;
+      const webContents = window.webContents;
+      const isCurrentFrame = (event: Electron.IpcMainEvent) => {
+        try {
+          return (
+            !window.isDestroyed?.() &&
+            window.webContents === webContents &&
+            !webContents.isDestroyed() &&
+            event.sender === webContents &&
+            event.senderFrame != null &&
+            event.senderFrame === webContents.mainFrame
+          );
+        } catch {
+          return false;
+        }
+      };
       const listener = async (
         event: Electron.IpcMainEvent,
         data: GetPlayerResponse,
       ) => {
-        if (epoch !== backendEpoch || event.sender !== window.webContents)
-          return;
+        if (epoch !== backendEpoch || !isCurrentFrame(event)) return;
+        const eventFrame = event.senderFrame;
         requestController?.abort();
         const request = ++requestEpoch;
         const controller = new AbortController();
@@ -159,7 +174,8 @@ export default createPlugin<
           controller.signal.aborted ||
           epoch !== backendEpoch ||
           request !== requestEpoch ||
-          window.isDestroyed?.()
+          !isCurrentFrame(event) ||
+          event.senderFrame !== eventFrame
         )
           return;
         ipc.send('sponsorblock-skip', {
@@ -169,9 +185,32 @@ export default createPlugin<
           requestId: request,
         });
       };
+      const seedListener = (
+        event: Electron.IpcMainEvent,
+        data: GetPlayerResponse,
+        nativeVideoId: unknown,
+      ) => {
+        try {
+          const responseVideoId = data?.videoDetails?.videoId;
+          if (
+            !isCurrentFrame(event) ||
+            typeof nativeVideoId !== 'string' ||
+            !nativeVideoId ||
+            nativeVideoId.length > 128 ||
+            responseVideoId !== nativeVideoId
+          )
+            return;
+          listener(event, data);
+        } catch {
+          // A retired window or frame cannot seed SponsorBlock state.
+        }
+      };
       ipcMain.on('peard:video-src-changed', listener);
-      removeBackendListener = () =>
+      ipcMain.on('sponsorblock-seed', seedListener);
+      removeBackendListener = () => {
         ipcMain.removeListener('peard:video-src-changed', listener);
+        ipcMain.removeListener('sponsorblock-seed', seedListener);
+      };
     },
     stop: stopBackend,
   },
@@ -293,7 +332,17 @@ export default createPlugin<
       this.video?.addEventListener('emptied', this.emptyListener);
       this.video?.addEventListener('loadedmetadata', this.metadataListener);
       // Seed the current track when enabled after playback has already started (#4637).
-      ipc.send('peard:video-src-changed', playerApi.getPlayerResponse());
+      try {
+        const response = playerApi.getPlayerResponse();
+        const nativeVideoId = playerApi.getVideoData?.()?.video_id;
+        if (
+          typeof nativeVideoId === 'string' &&
+          response?.videoDetails?.videoId === nativeVideoId
+        )
+          ipc.send('sponsorblock-seed', response, nativeVideoId);
+      } catch {
+        // A transient player API read must not prevent plugin startup.
+      }
     },
     stop() {
       rendererActive = false;

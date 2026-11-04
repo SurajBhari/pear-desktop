@@ -11,7 +11,10 @@ import {
 import 'mdui/mdui.css';
 import 'mdui';
 
-import { initializeAudioGraph } from '@/providers/renderer-audio';
+import {
+  initializeAudioGraph,
+  observeAudioGraphReadiness,
+} from '@/providers/renderer-audio';
 import { LoggerPrefix } from '@/utils';
 import {
   defaultTrustedTypePolicy,
@@ -27,7 +30,10 @@ import {
   loadAllRendererPlugins,
 } from './loader/renderer';
 import { startingPages } from './providers/extracted-data';
-import { publishMusicActionsOwner } from './providers/music-actions';
+import {
+  getMusicActionsOwner,
+  publishMusicActionsOwner,
+} from './providers/music-actions';
 import { createPlaylistQueueController } from './providers/queue-playlist-renderer';
 import { createRepeatPreference } from './providers/repeat-preference';
 import { setupShareLinks } from './providers/share-links';
@@ -43,11 +49,16 @@ import type { SearchBoxElement } from '@/types/search-box-element';
 setTheme('dark');
 
 let languageDocumentActive = true;
+let audioAnnouncementGeneration = 0;
+let disposeAudioAnnouncements: (() => void) | undefined;
 const isLanguageDocumentCurrent = () => languageDocumentActive;
 window.addEventListener(
   'pagehide',
   () => {
     languageDocumentActive = false;
+    audioAnnouncementGeneration++;
+    disposeAudioAnnouncements?.();
+    disposeAudioAnnouncements = undefined;
     retireLanguageRequests();
   },
   { once: true },
@@ -103,6 +114,11 @@ async function callOnPlayerApiReady(
 }
 
 async function onApiLoaded() {
+  const audioOwner = ++audioAnnouncementGeneration;
+  const isAudioOwnerCurrent = () =>
+    audioOwner === audioAnnouncementGeneration && isLanguageDocumentCurrent();
+  disposeAudioAnnouncements?.();
+  disposeAudioAnnouncements = undefined;
   disposeMusicActionsOwner?.();
   disposeMusicActionsOwner = undefined;
   playlistQueue?.dispose();
@@ -136,6 +152,7 @@ async function onApiLoaded() {
     );
 
   window.ipcRenderer.on('peard:previous-video', () => {
+    const navigation = api && getMusicActionsOwner(api)?.navigation;
     (
       window as unknown as {
         blockerSceneGuard?: { cancelFromUser: () => void };
@@ -144,10 +161,32 @@ async function onApiLoaded() {
     const button = document.querySelector<HTMLElement>(
       '.previous-button.ytmusic-player-bar',
     );
-    if (button) button.click();
-    else api?.previousVideo?.();
+    const target = button
+      ? button.click.bind(button)
+      : api?.previousVideo?.bind(api);
+    if (!target) {
+      navigation?.cancel();
+      return;
+    }
+    const ticket =
+      !button || !button.matches(':disabled,[aria-disabled="true"]')
+        ? navigation?.preparePrevious()
+        : undefined;
+    if (
+      button &&
+      document.querySelector('.previous-button.ytmusic-player-bar') !== button
+    )
+      ticket?.cancel();
+    try {
+      ticket?.arm();
+      target();
+    } catch (error) {
+      ticket?.cancel();
+      throw error;
+    }
   });
   window.ipcRenderer.on('peard:next-video', () => {
+    if (api) getMusicActionsOwner(api)?.navigation?.cancel();
     (
       window as unknown as {
         blockerSceneGuard?: { cancelFromUser: () => void };
@@ -160,6 +199,7 @@ async function onApiLoaded() {
     else api?.nextVideo?.();
   });
   window.ipcRenderer.on('peard:play', (_) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.interrupt();
     (
       window as unknown as {
         blockerSceneGuard?: { cancelFromUser: () => void };
@@ -168,6 +208,7 @@ async function onApiLoaded() {
     api?.playVideo();
   });
   window.ipcRenderer.on('peard:pause', (_) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.interrupt();
     (
       window as unknown as {
         blockerSceneGuard?: { cancelFromUser: () => void };
@@ -176,6 +217,7 @@ async function onApiLoaded() {
     api?.pauseVideo();
   });
   window.ipcRenderer.on('peard:toggle-play', (_) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.interrupt();
     (
       window as unknown as {
         blockerSceneGuard?: { cancelFromUser: () => void };
@@ -185,6 +227,7 @@ async function onApiLoaded() {
     else api?.pauseVideo();
   });
   window.ipcRenderer.on('peard:seek-to', (_, t: number) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.cancel();
     (
       window as unknown as {
         blockerSceneGuard?: { cancelFromUser: () => void };
@@ -193,6 +236,7 @@ async function onApiLoaded() {
     api!.seekTo(t);
   });
   window.ipcRenderer.on('peard:seek-by', (_, t: number) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.cancel();
     (
       window as unknown as {
         blockerSceneGuard?: { cancelFromUser: () => void };
@@ -201,6 +245,7 @@ async function onApiLoaded() {
     api!.seekBy(t);
   });
   window.ipcRenderer.on('peard:shuffle', () => {
+    if (api) getMusicActionsOwner(api)?.navigation?.cancel();
     (
       window as unknown as {
         blockerSceneGuard?: { cancelFromUser: () => void };
@@ -418,36 +463,25 @@ async function onApiLoaded() {
     }
   }
 
+  if (!isAudioOwnerCurrent()) return;
+
   if (firstDataLoaded) {
     document.dispatchEvent(
       new CustomEvent('videodatachange', { detail: { name: 'dataloaded' } }),
     );
   }
 
-  const audioCanPlayEventDispatcher = () => {
-    document.dispatchEvent(
-      new CustomEvent('peard:audio-can-play', {
-        detail: {
-          audioContext,
-          audioSource,
-          audioGraph,
-        },
-      }),
-    );
-  };
-
-  const loadstartListener = () => {
-    // Emit "audioCanPlay" for each video
-    video.addEventListener('canplaythrough', audioCanPlayEventDispatcher, {
-      once: true,
-    });
-  };
-
-  if (video.readyState === 4 /* HAVE_ENOUGH_DATA (loaded) */) {
-    audioCanPlayEventDispatcher();
+  const dispose = observeAudioGraphReadiness(
+    audioGraph,
+    video,
+    isAudioOwnerCurrent,
+  );
+  // A synchronous readiness subscriber may retire/rebind this renderer owner.
+  if (!isAudioOwnerCurrent()) {
+    dispose();
+    return;
   }
-
-  video.addEventListener('loadstart', loadstartListener, { passive: true });
+  disposeAudioAnnouncements = dispose;
 
   window.ipcRenderer.send('peard:player-api-loaded');
 

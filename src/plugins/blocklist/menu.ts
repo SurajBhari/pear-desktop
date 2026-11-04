@@ -90,6 +90,16 @@ export async function onMenu(
     });
   };
   const template: MenuTemplate = [
+    {
+      label: t('plugins.blocklist.menu.allow-intentional-previous'),
+      type: 'checkbox',
+      checked: config.allowIntentionalPrevious !== false,
+      click: async (item) => {
+        if (window.isDestroyed()) return;
+        await setConfig({ allowIntentionalPrevious: item.checked });
+        if (!window.isDestroyed()) await refresh();
+      },
+    },
     { label: t('plugins.blocklist.menu.add.label'), click: () => ask() },
     { type: 'separator' },
   ];

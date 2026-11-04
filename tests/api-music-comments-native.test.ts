@@ -1,3 +1,4 @@
+import { rendererMusicActionsOwnerSource } from './helpers/playlist-provider-source';
 import { test, expect } from '@playwright/test';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import {
@@ -976,11 +977,7 @@ export async function commentsNative<T>(
         ].join('\n'),
       );
       const core = await readFile(path.join(root, 'src/renderer.ts'), 'utf8');
-      const init = core.slice(
-        core.indexOf('async function onApiLoaded() {') +
-          'async function onApiLoaded() {'.length,
-        core.indexOf('  // Workaround for macOS traffic lights'),
-      );
+      const init = rendererMusicActionsOwnerSource(core);
       await writeFile(
         rendererEntry,
         [

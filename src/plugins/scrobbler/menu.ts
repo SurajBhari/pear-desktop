@@ -20,6 +20,7 @@ export const onMenu = async ({
   window,
   getConfig,
   setConfig,
+  refresh,
 }: MenuContext<ScrobblerPluginConfig>): Promise<MenuTemplate> => {
   const epoch = backend.lifecycleRevision ?? 0;
   const contents = window.webContents;
@@ -83,16 +84,20 @@ export const onMenu = async ({
     });
     return current();
   };
-  const editFilter = async (index: number) => {
+  const renderedFilters = JSON.stringify(config.customRegexFilters ?? []);
+  const editFilter = async (target: number | 'append') => {
     const original = await getConfig();
     if (!current()) return;
     const snapshot = JSON.stringify(original.customRegexFilters ?? []);
     const patterns = original.customRegexFilters ?? [];
+    const index = target === 'append' ? patterns.length : target;
     if (
       !Array.isArray(patterns) ||
       patterns.length > 32 ||
       patterns.some((value) => typeof value !== 'string') ||
-      index > patterns.length
+      index > patterns.length ||
+      (target === 'append' && patterns.length >= 32) ||
+      (target !== 'append' && snapshot !== renderedFilters)
     )
       return;
     const output: unknown = await prompt(
@@ -135,8 +140,10 @@ export const onMenu = async ({
     if (
       current() &&
       JSON.stringify(latest.customRegexFilters ?? []) === snapshot
-    )
+    ) {
       await write({ customRegexFilters: result.patterns });
+      if (current()) await refresh?.();
+    }
   };
   const tuple = (value: ScrobblerPluginConfig, name: WsServiceName) => {
     const account = value.scrobblers?.[name];
@@ -292,7 +299,7 @@ export const onMenu = async ({
         {
           label: t('plugins.scrobbler.menu.add-regex-filter'),
           enabled: (config.customRegexFilters?.length ?? 0) < 32,
-          click: () => editFilter(config.customRegexFilters?.length ?? 0),
+          click: () => editFilter('append'),
         },
       ],
     },

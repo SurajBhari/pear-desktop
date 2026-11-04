@@ -463,6 +463,7 @@
             "fade-out-duration": "Fade out duration (ms)",
             "fade-scaling": {
               "label": "Fade scaling",
+              "equalPower": "Equal power",
               "linear": "Linear",
               "logarithmic": "Logarithmic"
             },
@@ -1365,6 +1366,7 @@
         "button": "Block {{name}}"
       },
       "menu": {
+        "allow-intentional-previous": "Allow an intentionally revisited song to play once",
         "add": {
           "label": "Add blocked artist…",
           "prompt-title": "Block artist",

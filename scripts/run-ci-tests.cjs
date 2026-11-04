@@ -217,13 +217,25 @@ function createOwnedChildRunner({
     get cancelled() {
       return cancelled;
     },
-    async run(command, args, options) {
+    async run(command, args, options = {}) {
       if (cancelled || active)
         throw Error('Cancelled or already running an owned child');
+      const { stdoutFd, ...spawnOptions } = options;
+      if (
+        stdoutFd !== undefined &&
+        (!Number.isSafeInteger(stdoutFd) || stdoutFd < 3)
+      )
+        throw Error('Invalid owned stdout file descriptor');
       return await new Promise((resolve, reject) => {
         let child;
         try {
-          child = spawn(command, args, { ...options, stdio: 'inherit' });
+          child = spawn(command, args, {
+            ...spawnOptions,
+            stdio:
+              stdoutFd === undefined
+                ? 'inherit'
+                : ['inherit', stdoutFd, 'inherit'],
+          });
         } catch {
           reject(Error('Cannot start test CLI'));
           return;
@@ -335,6 +347,70 @@ async function readCompact(file, requireResults) {
   });
 }
 
+async function captureDiscoveryStdout(
+  directory,
+  invoke,
+  { stdout = process.stdout, isCancelled = () => false } = {},
+) {
+  const file = path.join(directory, 'discovery.stdout');
+  const handle = await fs.open(file, 'wx+', 0o600);
+  try {
+    // The owned child must close before its regular-file output is read or removed.
+    const child = await invoke(handle.fd);
+    if (!child.closed) throw Error('Discovery child did not close');
+    if (isCancelled()) throw Error('Discovery output cancelled');
+    const stat = await handle.stat();
+    // Current 3,514-row evidence is 673,624 bytes; fail rather than truncate.
+    if (
+      !stat.isFile() ||
+      !Number.isSafeInteger(stat.size) ||
+      stat.size > 8 * 1024 * 1024
+    )
+      throw Error('Discovery output exceeds regular-file bound');
+    let outputError;
+    const onError = (error) => {
+      outputError ??= error;
+    };
+    stdout.on('error', onError);
+    try {
+      const buffer = Buffer.allocUnsafe(
+        Math.min(64 * 1024, Math.max(1, stat.size)),
+      );
+      let position = 0;
+      while (position < stat.size) {
+        if (isCancelled()) throw Error('Discovery output cancelled');
+        // The inherited fd shares its write offset; always replay from explicit offset0.
+        const { bytesRead } = await handle.read(
+          buffer,
+          0,
+          Math.min(buffer.length, stat.size - position),
+          position,
+        );
+        if (!bytesRead) throw Error('Discovery output read changed');
+        await new Promise((resolve, reject) => {
+          stdout.write(buffer.subarray(0, bytesRead), (error) =>
+            error ? reject(error) : resolve(),
+          );
+        });
+        if (outputError) throw outputError;
+        position += bytesRead;
+      }
+      if ((await handle.stat()).size !== stat.size)
+        throw Error('Discovery output changed during replay');
+      if (isCancelled()) throw Error('Discovery output cancelled');
+    } finally {
+      stdout.removeListener('error', onError);
+    }
+    return child;
+  } finally {
+    try {
+      await handle.close();
+    } finally {
+      await fs.rm(file, { force: true });
+    }
+  }
+}
+
 async function main(args = process.argv.slice(2)) {
   if (args.length && (args.length !== 1 || args[0] !== '--list'))
     throw Error('Usage: node scripts/run-ci-tests.cjs [--list]');
@@ -343,7 +419,7 @@ async function main(args = process.argv.slice(2)) {
   const cli = require.resolve('@playwright/test/cli');
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'pear-ci-tests-'));
   const runner = createOwnedChildRunner();
-  async function invoke(files, index, discoveryOnly) {
+  async function invoke(files, index, discoveryOnly, stdoutFd) {
     const reportFile = path.join(directory, `${index}.json`);
     const cliArgs = [
       cli,
@@ -355,6 +431,7 @@ async function main(args = process.argv.slice(2)) {
     const child = await runner.run(process.execPath, cliArgs, {
       cwd: root,
       env: { ...process.env, PLAYWRIGHT_JSON_OUTPUT_FILE: reportFile },
+      stdoutFd,
     });
     try {
       return {
@@ -369,7 +446,11 @@ async function main(args = process.argv.slice(2)) {
   }
   try {
     // JSON goes to an owned file: discovery may also run Node-only release tests.
-    const discovery = await invoke([], 'discovery', true);
+    const discovery = await captureDiscoveryStdout(
+      directory,
+      (stdoutFd) => invoke([], 'discovery', true, stdoutFd),
+      { isCancelled: () => !!runner.cancelled },
+    );
     if (
       runner.cancelled ||
       discovery.code !== 0 ||
@@ -427,6 +508,7 @@ module.exports = {
   assertIdentities,
   runGroups,
   createOwnedChildRunner,
+  captureDiscoveryStdout,
   main,
 };
 if (require.main === module)

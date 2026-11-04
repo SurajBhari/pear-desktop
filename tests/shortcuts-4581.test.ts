@@ -566,6 +566,74 @@ test('foreign local binding survives collision and stop', async () => {
   }
 });
 
+for (const transition of ['navigation', 'replacement-frame']) {
+  for (const action of [0, 1, 2, 3, 4]) {
+    test(`shortcuts existing menu action ${action} remains usable after ${transition}`, async () => {
+      const f = await shortcutRatingSource();
+      try {
+        await f.source.backend.start(f.context);
+        const menu = await f.source.onMenu(f.context);
+        f.contents.emit('did-start-navigation', {}, '', false, true);
+        if (transition === 'replacement-frame') f.contents.mainFrame = {};
+        f.contents.emit('did-navigate');
+        f.state.prompt = async () =>
+          action < 2 ? [{ value: 'like', accelerator: 'F8' }] : '27';
+        if (action === 2) await menu[2].submenu[0].click();
+        else await menu[action].click({ checked: true });
+        expect(f.writes).toHaveLength(1);
+        if (action < 2) {
+          const scope = action === 0 ? 'global' : 'local';
+          expect(Object.keys(f.writes[0])).toEqual([scope]);
+          expect(f.writes[0][scope].like).toBe('F8');
+        } else
+          expect(f.writes[0]).toEqual(
+            action === 2
+              ? { seekForwardSeconds: 27 }
+              : action === 3
+                ? { overrideMediaKeys: true }
+                : { focusWindowOnDoublePlayPause: true },
+          );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+}
+
+test('shortcuts old menu cannot edit a restarted backend lifetime', async () => {
+  const f = await shortcutRatingSource();
+  try {
+    await f.source.backend.start(f.context);
+    const menu = await f.source.onMenu(f.context);
+    f.source.backend.stop();
+    await f.source.backend.start(f.context);
+    await menu[3].click({ checked: true });
+    expect(f.writes).toEqual([]);
+  } finally {
+    await f.close();
+  }
+});
+
+test('shortcuts held seek result cannot cross navigation after a fresh click', async () => {
+  const f = await shortcutRatingSource();
+  try {
+    await f.source.backend.start(f.context);
+    const menu = await f.source.onMenu(f.context);
+    let resolve!: (value: any) => void;
+    f.state.prompt = () => new Promise((done) => (resolve = done));
+    const pending = menu[2].submenu[0].click();
+    for (let i = 0; i < 100 && !resolve; i++)
+      await new Promise((done) => setTimeout(done, 1));
+    expect(typeof resolve).toBe('function');
+    f.contents.emit('did-start-navigation', {}, '', false, true);
+    resolve('27');
+    await pending;
+    expect(f.writes).toEqual([]);
+  } finally {
+    await f.close();
+  }
+});
+
 for (const retire of ['stop', 'navigation', 'frame']) {
   test(`held mapping prompt ignores ${retire} retirement`, async () => {
     const f = await shortcutRatingSource();

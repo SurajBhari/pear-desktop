@@ -47,6 +47,11 @@ const truncateBytes = (value: string, max: number) => {
   }
   return result;
 };
+export const primaryOutputFilename = (filename: string) => {
+  const extension = path.extname(filename);
+  const stem = filename.slice(0, filename.length - extension.length);
+  return `${truncateBytes(stem, 200)}${extension}`;
+};
 export interface OutputRecipe {
   extension: string;
   args: string[];
@@ -706,14 +711,73 @@ export async function publishCompleted(
             const stem = filename.slice(0, filename.length - ext.length);
             const name =
               attempt === 0
-                ? `${truncateBytes(stem, 200)}${ext}`
+                ? primaryOutputFilename(filename)
                 : `${truncateBytes(stem, 100)} [${truncateBytes(input.videoId, 100)}-${variantKey(input).slice(0, 8)}${attempt > 1 ? `-${attempt}` : ''}]${ext}`;
             const candidate = path.join(targetDirectory, name);
             assertCurrent();
             await assertDirectories();
             assertCurrent();
             try {
-              await link(temp, candidate);
+              try {
+                await link(temp, candidate);
+              } catch (error) {
+                // FAT and some writable shares cannot create hard links. EPERM
+                // also covers filesystems which prohibit links but allow files.
+                if (
+                  !['ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EPERM'].includes(
+                    (error as NodeJS.ErrnoException).code ?? '',
+                  )
+                )
+                  throw error;
+                await assertDirectories();
+                assertCurrent();
+                const output = await open(candidate, 'wx', 0o600);
+                let closed = false;
+                try {
+                  const identity = await output.stat({ bigint: true });
+                  await assertDirectories();
+                  assertCurrent();
+                  // Use the completed bytes, not a re-opened temporary path.
+                  // Unlike a hard link, this can be visible before completion;
+                  // the manifest is published only after the write and sync.
+                  await output.writeFile(bytes);
+                  await output.sync();
+                  assertCurrent();
+                  await assertDirectories();
+                  const current = await lstat(candidate, { bigint: true });
+                  if (
+                    !current.isFile() ||
+                    current.ino !== identity.ino ||
+                    current.dev !== identity.dev ||
+                    current.size !== BigInt(bytes.byteLength)
+                  )
+                    throw new Error('Library output file changed', {
+                      cause: error,
+                    });
+                  assertCurrent();
+                  await output.close();
+                  closed = true;
+                } catch (writeError) {
+                  // Node has no atomic compare-inode-and-unlink operation.
+                  // Keep an unreceipted candidate rather than risk deleting a
+                  // replacement owned by another writer after a pathname check.
+                  const reason =
+                    writeError instanceof Error
+                      ? writeError.message
+                      : String(writeError);
+                  const failure = new Error(
+                    `Cannot finish audio file ${candidate}: ${reason}. An incomplete file may remain; remove it before retrying with Skip existing files enabled.`,
+                    { cause: writeError },
+                  );
+                  const code = (writeError as NodeJS.ErrnoException)?.code;
+                  throw Object.assign(failure, {
+                    path: candidate,
+                    ...(typeof code === 'string' ? { code } : {}),
+                  });
+                } finally {
+                  if (!closed) await output.close().catch(() => {});
+                }
+              }
               finalPath = candidate;
               break;
             } catch (e) {

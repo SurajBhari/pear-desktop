@@ -1,6 +1,11 @@
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const test = require('node:test');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { Writable } = require('node:stream');
+const { writeSync, ftruncateSync } = require('node:fs');
 
 const {
   parseReport,
@@ -9,6 +14,7 @@ const {
   assertIdentities,
   runGroups,
   createOwnedChildRunner,
+  captureDiscoveryStdout,
 } = require('./run-ci-tests.cjs');
 
 const record = (id, file = 'tests/a.test.ts') => ({
@@ -284,4 +290,248 @@ test('unknown JSON entries and invalid worker metadata fail closed', () => {
     { suites: [{ specs: [null] }], errors: [] },
   ])
     assert.throws(() => parseReport(bad));
+});
+
+test('an owned stdout file receives the child bytes before immediate exit', async () => {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'pear-ci-stdout-test-'),
+  );
+  const file = path.join(directory, 'output');
+  const handle = await fs.open(file, 'wx+', 0o600);
+  const runner = createOwnedChildRunner();
+  try {
+    const child = await runner.run(
+      process.execPath,
+      ['-e', "process.stdout.write('owned stdout\\n'); process.exit(0)"],
+      { stdoutFd: handle.fd },
+    );
+    assert.equal(child.closed, true);
+    assert.equal(child.code, 0);
+    assert.equal(await fs.readFile(file, 'utf8'), 'owned stdout\n');
+  } finally {
+    runner.dispose();
+    await handle.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('group output stays inherited and invalid stdout descriptors never spawn', async () => {
+  let calls = 0;
+  const runner = createOwnedChildRunner({
+    spawn: (_command, _args, options) => {
+      calls++;
+      assert.equal(options.stdio, 'inherit');
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    },
+  });
+  try {
+    await runner.run('node', []);
+    for (const stdoutFd of [null, -1, 1, 3.5])
+      await assert.rejects(runner.run('node', [], { stdoutFd }));
+    assert.equal(calls, 1);
+  } finally {
+    runner.dispose();
+  }
+});
+
+test('discovery replays every actual child byte and Total before its awaited continuation', async () => {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'pear-ci-replay-test-'),
+  );
+  const runner = createOwnedChildRunner();
+  const row = 'synthetic \u03bb ' + 'x'.repeat(180) + '\n';
+  const expected = Buffer.from(row.repeat(3514) + 'Total: 3514 tests\n');
+  const chunks = [];
+  let releaseFirst,
+    firstStarted,
+    childClosed = false,
+    continued = false;
+  const first = new Promise((resolve) => {
+    firstStarted = resolve;
+  });
+  const stdout = new Writable({
+    highWaterMark: 1,
+    write(chunk, _encoding, callback) {
+      assert.equal(childClosed, true);
+      chunks.push(Buffer.from(chunk));
+      if (!releaseFirst) {
+        releaseFirst = callback;
+        firstStarted();
+      } else setImmediate(callback);
+    },
+  });
+  try {
+    const pending = captureDiscoveryStdout(
+      directory,
+      async (stdoutFd) => {
+        const child = await runner.run(
+          process.execPath,
+          [
+            '-e',
+            "if (!require('node:fs').fstatSync(1).isFile()) process.exit(9);" +
+              `for(let i=0;i<3514;i++)process.stdout.write(${JSON.stringify(row)});` +
+              "process.stdout.write('Total: 3514 tests\\n');process.exit(0);",
+          ],
+          { stdoutFd },
+        );
+        childClosed = child.closed;
+        assert.equal(child.code, 0);
+        return child;
+      },
+      { stdout },
+    ).then(() => {
+      continued = true;
+    });
+    await first;
+    assert.equal(continued, false);
+    releaseFirst();
+    await pending;
+    assert.equal(continued, true);
+    assert.deepEqual(Buffer.concat(chunks), expected);
+    assert.deepEqual(await fs.readdir(directory), []);
+  } finally {
+    runner.dispose();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('cancelled discovery keeps capture owned until child close and prevents replay', async () => {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'pear-ci-cancel-test-'),
+  );
+  let release,
+    started,
+    cancelled = false,
+    settled = false,
+    writes = 0;
+  const entered = new Promise((resolve) => {
+    started = resolve;
+  });
+  const stdout = new Writable({
+    write(_chunk, _encoding, callback) {
+      writes++;
+      callback();
+    },
+  });
+  try {
+    const pending = captureDiscoveryStdout(
+      directory,
+      () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({ closed: true, code: null, signal: 'SIGTERM' });
+          started();
+        }),
+      { stdout, isCancelled: () => cancelled },
+    ).finally(() => {
+      settled = true;
+    });
+    await entered;
+    cancelled = true;
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.equal((await fs.readdir(directory)).length, 1);
+    release();
+    await assert.rejects(pending);
+    assert.equal(writes, 0);
+    assert.deepEqual(await fs.readdir(directory), []);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a replay write error gates continuation and removes its owned capture', async () => {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'pear-ci-write-test-'),
+  );
+  let continued = false;
+  const stdout = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback(Error('sink failed'));
+    },
+  });
+  try {
+    await assert.rejects(
+      captureDiscoveryStdout(
+        directory,
+        async (fd) => {
+          writeSync(fd, 'actual child bytes\n');
+          return { closed: true, code: 0 };
+        },
+        { stdout },
+      ).then(() => {
+        continued = true;
+      }),
+      /sink failed/,
+    );
+    assert.equal(continued, false);
+    assert.deepEqual(await fs.readdir(directory), []);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('oversized discovery output fails before replay without truncating it into a success', async () => {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'pear-ci-bound-test-'),
+  );
+  let writes = 0;
+  const stdout = new Writable({
+    write(_chunk, _encoding, callback) {
+      writes++;
+      callback();
+    },
+  });
+  try {
+    await assert.rejects(
+      captureDiscoveryStdout(
+        directory,
+        async (fd) => {
+          ftruncateSync(fd, 8 * 1024 * 1024 + 1);
+          return { closed: true, code: 0 };
+        },
+        { stdout },
+      ),
+      /bound/i,
+    );
+    assert.equal(writes, 0);
+    assert.deepEqual(await fs.readdir(directory), []);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a shortened capture read fails orchestration and cleans up instead of emitting a partial success', async () => {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'pear-ci-read-test-'),
+  );
+  let continued = false;
+  const stdout = new Writable({
+    write(_chunk, _encoding, callback) {
+      fs.readdir(directory)
+        .then(([file]) => fs.truncate(path.join(directory, file), 0))
+        .then(() => callback(), callback);
+    },
+  });
+  try {
+    await assert.rejects(
+      captureDiscoveryStdout(
+        directory,
+        async (fd) => {
+          writeSync(fd, Buffer.alloc(128 * 1024, 65));
+          return { closed: true, code: 0 };
+        },
+        { stdout },
+      ).then(() => {
+        continued = true;
+      }),
+      /read|changed/i,
+    );
+    assert.equal(continued, false);
+    assert.deepEqual(await fs.readdir(directory), []);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });

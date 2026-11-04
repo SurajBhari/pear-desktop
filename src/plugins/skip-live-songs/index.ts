@@ -57,6 +57,7 @@ export default createPlugin({
             categories !== null &&
             (isNonStudioTitle(track.title, categories) ||
               isNonStudioTitle(track.alternativeTitle, categories)),
+          { kind: 'live' },
         );
         const config = await context.getConfig();
         if (!active || generation !== epoch) return;

@@ -264,29 +264,6 @@ export const menu = async (
       ],
     },
     {
-      label: t('plugins.synced-lyrics.menu.default-text-string.label'),
-      toolTip: t('plugins.synced-lyrics.menu.default-text-string.tooltip'),
-      type: 'submenu',
-      submenu: [
-        { label: '♪', value: '♪' },
-        { label: '" "', value: ' ' },
-        { label: '...', value: ['.', '..', '...'] },
-        { label: '•••', value: ['•', '••', '•••'] },
-        { label: '———', value: '———' },
-      ].map(({ label, value }) => ({
-        label,
-        type: 'radio',
-        checked:
-          typeof value === 'string'
-            ? config.defaultTextString === value
-            : JSON.stringify(config.defaultTextString) ===
-              JSON.stringify(value),
-        click() {
-          ctx.setConfig({ defaultTextString: value });
-        },
-      })),
-    },
-    {
       label: t('plugins.synced-lyrics.menu.romanization.label'),
       toolTip: t('plugins.synced-lyrics.menu.romanization.tooltip'),
       type: 'checkbox',

@@ -173,6 +173,138 @@ test('pure preflight selects exact audiences from owned socket facts and rejects
   }
 });
 
+test('Phase5 focused resource parser validates canonical audiences without activation', async () => {
+  const p = await policySource();
+  expect(typeof p.parseRemoteMusicResource).toBe('function');
+  expect(p.parseRemoteMusicResource(remote)).toBe(remote);
+  expect(
+    p.parseRemoteMusicResource(
+      'https://music-http.fixture.invalid/api/v1/music',
+    ),
+  ).toBe('https://music-http.fixture.invalid/api/v1/music');
+  for (const value of [
+    undefined,
+    '',
+    ' ' + remote,
+    remote + '/',
+    remote + '?x',
+    remote + '#x',
+    'http://127.0.0.1/api/v1/music',
+    'http://localhost/api/v1/music',
+    'http://0.0.0.0/api/v1/music',
+  ])
+    expect(p.parseRemoteMusicResource(value)).toBeUndefined();
+});
+
+test('Phase5 selected native grant rejects config listener and same-frame ABA then recovers', async () => {
+  const menuSource = await musicModuleSource(
+    'src/plugins/api-server/music-menu.ts',
+  );
+  expect(typeof menuSource.createRemoteMusicGrantMenu).toBe('function');
+  const { musicRequestFixture } = await import('./helpers/api-music-request');
+  for (const kind of ['config', 'listener', 'frame']) {
+    const f = await musicServiceFixture(),
+      n = await musicRequestFixture();
+    const cfg = {
+      ...config,
+      hostname: '192.0.2.1',
+      musicApiRemoteEnabled: true,
+      musicApiRemoteResource: remote,
+    };
+    let lifetime = new AbortController();
+    const owner = () => {
+      const captured = lifetime;
+      return {
+        identity: {},
+        address: '127.0.0.1',
+        port: 26538,
+        tls: false,
+        resources: { remote },
+        signal: captured.signal,
+        current: () => !captured.signal.aborted,
+        ownsSocket: () => true,
+      };
+    };
+    let listener = owner();
+    const service = f.m.createMusicService({
+      window: n.window,
+      config: cfg,
+      grants: f.store,
+      broker: n.broker,
+      restListenerOwner: () => listener,
+    });
+    let issues = 0,
+      copies = 0;
+    const issue = f.store.issue.bind(f.store);
+    f.store.issue = async (...args: any[]) => {
+      issues++;
+      return issue(...args);
+    };
+    const frame = n.contents.mainFrame;
+    let retire = () => {
+      if (kind === 'config') {
+        service.configure({ ...cfg, musicApiRemoteEnabled: false });
+        service.configure(cfg);
+      }
+      if (kind === 'listener') {
+        lifetime.abort();
+        lifetime = new AbortController();
+        listener = owner();
+      }
+      if (kind === 'frame') {
+        n.contents.emit(
+          'did-start-navigation',
+          {},
+          'fixture://owned',
+          false,
+          true,
+        );
+        n.contents.emit('did-navigate');
+      }
+    };
+    const choices = [0, 2, 0];
+    const menu = await menuSource.createRemoteMusicGrantMenu(
+      {
+        window: n.window,
+        getConfig: () => cfg,
+        setConfig: () => {},
+        refresh: () => {},
+      },
+      (resource: string) => f.m.getMusicService(n.window, resource),
+      {
+        prompt: async () => {
+          retire();
+          return 'Phase5 ABA';
+        },
+        promptResource: async () => remote,
+        show: async () => ({ response: choices.shift() }),
+        copy: () => {
+          copies++;
+        },
+      },
+    );
+    try {
+      expect(f.m.getMusicService(n.window)).toBeUndefined();
+      await menu
+        .find((entry: any) => entry.label === 'Create client grant…')
+        .click();
+      expect(issues).toBe(0);
+      expect(copies).toBe(0);
+      expect(n.contents.mainFrame === frame).toBe(true);
+      retire = () => {};
+      await menu
+        .find((entry: any) => entry.label === 'Create client grant…')
+        .click();
+      expect(issues).toBe(1);
+      expect(copies).toBe(1);
+    } finally {
+      service.stop();
+      n.broker.dispose();
+      await f.close();
+    }
+  }
+});
+
 test('namespace classification consumes absolute and encoded aliases without claiming unrelated paths', async () => {
   const p = await policySource();
   expect(typeof p.isMusicHttpNamespace).toBe('function');

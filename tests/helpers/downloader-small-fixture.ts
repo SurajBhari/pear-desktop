@@ -74,6 +74,8 @@ interface FixtureState {
   live?: boolean;
   loginRequired?: boolean;
   basicInfoCalls?: { id: string; client: string }[];
+  trackTitle?: string;
+  trackArtist?: string;
 }
 interface FixtureSource {
   downloader: {
@@ -180,7 +182,7 @@ class MusicResponsiveListItem {constructor(id){this.id=id;this.title='Track '+id
 export const YTNodes={MusicResponsiveListItem};
 export const Utils={InnertubeError:actualUtils.InnertubeError,streamToIterable:async function*(stream){const reader=stream.getReader();try{while(true){const chunk=await reader.read();if(chunk.done)return;yield chunk.value;}}finally{reader.releaseLock();}}};
 const playlist=(page)=>({header:state.album?undefined:{title:{text:'Fixture playlist'}},page:{contents_memo:{get:()=>[null,null,{as:()=>({title:{text:'Fixture album'}})}]}},items:(state.pages[page]??[]).map(id=>new MusicResponsiveListItem(id)),has_continuation:page+1<state.pages.length,getContinuation:async()=>{state.continuations++;return playlist(page+1);}});
-const makeInfo=(id,options,muxed=false)=>{const format={itag:muxed?18:140,mime_type:muxed?'video/mp4; codecs="avc1.42001E, mp4a.40.2"':'audio/mp4; codecs="mp4a.40.2"',has_audio:true,has_video:muxed,is_original:true,bitrate:muxed?3000000:128000,content_length:state.sourceLength===null?undefined:(state.sourceLength??3),decipher:async()=> 'https://fixture.test/media?x=1'};return {basic_info:{id,title:'Track '+id,author:'Fixture artist',duration:30,thumbnail:[{url:'https://fixture.test/cover.png'}]},playability_status:{status:'OK'},streaming_data:{formats:[],adaptive_formats:[format]},actions:{session:{http:{fetch_function:options.fetch}}},cpn:'fixture',page:[{video_details:{is_live:!!state.live}}]};};
+const makeInfo=(id,options,muxed=false)=>{const format={itag:muxed?18:140,mime_type:muxed?'video/mp4; codecs="avc1.42001E, mp4a.40.2"':'audio/mp4; codecs="mp4a.40.2"',has_audio:true,has_video:muxed,is_original:true,bitrate:muxed?3000000:128000,content_length:state.sourceLength===null?undefined:(state.sourceLength??3),decipher:async()=> 'https://fixture.test/media?x=1'};return {basic_info:{id,title:state.trackTitle??'Track '+id,author:state.trackArtist??'Fixture artist',duration:30,thumbnail:[{url:'https://fixture.test/cover.png'}]},playability_status:{status:'OK'},streaming_data:{formats:[],adaptive_formats:[format]},actions:{session:{http:{fetch_function:options.fetch}}},cpn:'fixture',page:[{video_details:{is_live:!!state.live}}]};};
 const client=(options,index)=>({options,session:{context:{client:{visitorData:state.visitor?'fixture-visitor':undefined}}},getBasicInfo:async(id,args)=>{state.basicInfoCalls??=[];state.basicInfoCalls.push({id,client:args.client});return makeInfo(id,options,true);},music:{getPlaylist:async()=>playlist(0),getInfo:async(id)=>{state.infoCalls.push({id,cookie:options.cookie,index});if(state.infoMode==='reject')throw Error(state.mediaError);if(state.infoMode==='defer')return new Promise((_resolve,reject)=>state.pendingInfo.push({reject}));const info=makeInfo(id,options);if(state.loginRequired)info.playability_status.status='LOGIN_REQUIRED';return info;}}});
 export const Innertube={create:(options)=>{const index=state.creates.length;state.creates.push(options);const value=client(options,index);state.clients.push(value);if(state.initMode==='reject')return Promise.reject(Error('Owned fixture initialization failure'));if(state.initMode==='defer')return new Promise((resolve,reject)=>state.pending.push({resolve:()=>resolve(value),reject}));return Promise.resolve(value);}};
 `;

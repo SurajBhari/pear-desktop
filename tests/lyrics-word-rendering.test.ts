@@ -405,7 +405,8 @@ test('finite gaps replace the configured bullet cycle instead of stacking two in
     f.setTime(2500);
   });
   await expect(page.locator('.instrumental-indicator')).toHaveCount(0);
-  await expect(page.locator('.lyrics-placeholder')).toHaveText('•');
+  await expect(page.locator('.lyrics-placeholder')).toHaveCount(0);
+  await expect(page.locator('.synced-line')).toHaveCount(0);
 });
 
 test('only the playing current gap breathes, freezes on pause and respects reduced motion', async ({
@@ -504,6 +505,113 @@ test('only the playing current gap breathes, freezes on pause and respects reduc
   await page.evaluate(() => (window as any).fixture.setLines([]));
   await expect(page.locator('.instrumental-indicator')).toHaveCount(0);
   await page.evaluate(() => (window as any).fixture.disposeClock());
+});
+
+test('known instrumental intervals stay visible at every status without changing row layout', async ({
+  page,
+}) => {
+  await mount(page, [
+    { ...timed, timeInMs: 0, duration: 10000, text: '', words: [] },
+    { ...timed, timeInMs: 10000 },
+    { ...timed, timeInMs: 20000 },
+  ]);
+  const markers = page.locator('.instrumental-indicator');
+  await expect(markers).toHaveCount(2);
+  const layout = () =>
+    markers.evaluateAll((nodes) =>
+      nodes.map((node) => {
+        const marker = node as HTMLElement;
+        const row = marker.closest('.synced-line') as HTMLElement;
+        return [marker.offsetWidth, marker.offsetHeight, row.offsetHeight];
+      }),
+    );
+  const initialLayout = await layout();
+  for (const dimensions of initialLayout)
+    for (const dimension of dimensions) expect(dimension).toBeGreaterThan(0);
+
+  for (const time of [0, 11000, 15000, 21000, 2000]) {
+    await page.evaluate((time) => (window as any).fixture.setTime(time), time);
+    await expect(markers.nth(0)).toBeVisible();
+    await expect(markers.nth(1)).toBeVisible();
+    await expect(markers.nth(0).locator('i')).toHaveCount(3);
+    await expect(markers.nth(1).locator('i')).toHaveCount(3);
+  }
+  expect(await layout()).toEqual(initialLayout);
+});
+
+test('blank interval boundary keeps two-second seekable dots and hides short or unknown tails', async ({
+  page,
+}) => {
+  await mount(page, [{ ...timed }]);
+  await page.evaluate(async () => {
+    await (window as any).nativeClock();
+    (window as any).fixture.setLines([
+      { time: '00:00', timeInMs: 0, duration: 1999, text: '', words: [] },
+      { time: '00:02', timeInMs: 2000, duration: 2000, text: '', words: [] },
+      {
+        time: '00:04',
+        timeInMs: 4000,
+        duration: Infinity,
+        text: '',
+        words: [],
+      },
+      { time: '00:06', timeInMs: 6000, duration: NaN, text: '', words: [] },
+    ]);
+  });
+  const gap = page.getByRole('button', { name: 'Instrumental', exact: true });
+  await expect(gap).toHaveCount(1);
+  await expect(gap.locator('.instrumental-indicator i')).toHaveCount(3);
+  await expect(page.locator('.lyrics-placeholder')).toHaveCount(0);
+  await gap.click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fixture.video.currentTime))
+    .toBeCloseTo(2.01, 3);
+  await page.evaluate(() => ((window as any).fixture.video.currentTime = 0));
+  await gap.focus();
+  await page.keyboard.press('Enter');
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fixture.video.currentTime))
+    .toBeCloseTo(2.01, 3);
+  await page.evaluate(() => ((window as any).fixture.video.currentTime = 0));
+  await page.keyboard.press('Space');
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fixture.video.currentTime))
+    .toBeCloseTo(2.01, 3);
+  await page.evaluate(() => (window as any).fixture.disposeClock());
+});
+
+test('future pause dots remain visible in narrow and wide lyric layouts', async ({
+  page,
+}) => {
+  await mount(page, [
+    { ...timed, timeInMs: 0, duration: 10000, text: '', words: [] },
+    { ...timed, timeInMs: 10000 },
+    { ...timed, timeInMs: 20000 },
+  ]);
+  await page.evaluate(() => (window as any).fixture.setTime(11000));
+  for (const width of [360, 960]) {
+    await page.setViewportSize({ width, height: 600 });
+    await page.locator('#lyrics-tab').evaluate((node) => {
+      (node as HTMLElement).style.width = '100%';
+    });
+    const future = page.locator(
+      '.synced-line.upcoming .instrumental-indicator',
+    );
+    await expect(future).toBeVisible();
+    expect(await future.locator('i').count()).toBe(3);
+    expect(
+      await future
+        .locator('span')
+        .evaluate((node) => node.getAnimations().length),
+    ).toBe(0);
+    if (process.env.PEAR_LYRICS_EVIDENCE_DIR)
+      await page.locator('#lyrics-tab').screenshot({
+        path: path.join(
+          process.env.PEAR_LYRICS_EVIDENCE_DIR,
+          `lyrics-future-gap-${width}.png`,
+        ),
+      });
+  }
 });
 
 test('actual LRCLib uses optional lyricsfile, keeps ordinary LRC fallback and represents verified instrumental metadata', async ({

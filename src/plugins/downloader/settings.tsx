@@ -281,7 +281,7 @@ export const DownloaderSettings = (props: {
           </div>
           <div class="downloader-actions">
             <button
-              class="downloader-primary"
+              class="downloader-secondary"
               onClick={() =>
                 run(async () => {
                   await props.api.invoke('downloader-save-settings', {

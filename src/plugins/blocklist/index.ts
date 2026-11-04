@@ -17,6 +17,7 @@ import type { MusicPlayer } from '@/types/music-player';
 
 export type BlocklistPluginConfig = {
   enabled: boolean;
+  allowIntentionalPrevious?: boolean;
   blockedArtists: BlockedArtist[];
 };
 let generation = 0;
@@ -73,6 +74,18 @@ const refreshOptimisticArtists = () => {
         artists = withArtist(artists, job.artist);
     }
   }
+  if (
+    artists !== config.blockedArtists &&
+    (!validArtistList(artists) ||
+      !validArtistList(config.blockedArtists) ||
+      artists.length !== config.blockedArtists.length ||
+      artists.some(
+        (artist, index) =>
+          artist.name !== config.blockedArtists[index].name ||
+          artist.channelId !== config.blockedArtists[index].channelId,
+      ))
+  )
+    filter?.retirePermission();
   config = { ...config, blockedArtists: artists };
 };
 const stop = () => {
@@ -94,7 +107,11 @@ export default createPlugin({
   name: () => t('plugins.blocklist.name'),
   description: () => t('plugins.blocklist.description'),
   restartNeeded: false,
-  config: { enabled: false, blockedArtists: [] } as BlocklistPluginConfig,
+  config: {
+    enabled: false,
+    blockedArtists: [],
+    allowIntentionalPrevious: true,
+  } as BlocklistPluginConfig,
   menu: onMenu,
   stylesheets: [style],
   renderer: {
@@ -110,6 +127,11 @@ export default createPlugin({
             config.enabled &&
             validArtistList(config.blockedArtists) &&
             matchesArtist(config.blockedArtists, track),
+          {
+            kind: 'artist',
+            allowIntentionalPrevious: () =>
+              config.allowIntentionalPrevious !== false,
+          },
         );
         const raw = await context.getConfig();
         if (!active || generation !== epoch) return;
@@ -134,7 +156,6 @@ export default createPlugin({
             };
             additions.add(job);
             refreshOptimisticArtists();
-            filter?.refresh();
             const result = writes
               .then(async () => {
                 if (!ownsQueuedAddition(job)) return false;
@@ -150,8 +171,13 @@ export default createPlugin({
                   active && generation === epoch && writeEpoch === job.write;
                 // A later authoritative watch owns the base, even if an older
                 // admitted write's promise completes afterward.
-                if (current && configRevision === revision)
+                if (current && configRevision === revision) {
                   persistedArtists = artists;
+                  refreshOptimisticArtists();
+                  // A user save must reach storage before refreshing the playback
+                  // filter can synchronously skip and retire its source track.
+                  filter?.refresh();
+                }
                 return current;
               })
               .catch((error) => {
@@ -178,6 +204,7 @@ export default createPlugin({
       ui?.refresh();
     },
     onConfigChange(raw: BlocklistPluginConfig) {
+      filter?.retirePermission();
       configRevision++;
       persistedArtists = raw.blockedArtists;
       if (!raw.enabled || !validArtistList(raw.blockedArtists)) {

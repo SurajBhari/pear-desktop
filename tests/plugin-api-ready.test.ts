@@ -50,12 +50,16 @@ async function fixture(plugins: Record<string, any>) {
       },
     },
   };
-  const graphSource = await rendererAudioFixtureSource(true);
+  (globalThis as any)[key] = state;
+  const graphSource =
+    `const fixture=globalThis[${JSON.stringify(key)}];
+const window=fixture.window,document=fixture.dom.document,CustomEvent=fixture.dom.CustomEvent;
+` + (await rendererAudioFixtureSource(true));
   const graph = await import(
     `data:text/javascript;base64,${Buffer.from(graphSource).toString('base64')}`
   );
   (state as any).initializeAudioGraph = graph.initializeAudioGraph;
-  (globalThis as any)[key] = state;
+  (state as any).observeAudioGraphReadiness = graph.observeAudioGraphReadiness;
   const raw = await readFile(
     new URL('../src/renderer.ts', import.meta.url),
     'utf8',
@@ -103,6 +107,7 @@ const fixture=globalThis[${JSON.stringify(key)}];
 const {window}=fixture; const document=fixture.dom.document;
 const {Element,CustomEvent}=fixture.dom;
 const initializeAudioGraph=fixture.initializeAudioGraph;
+const observeAudioGraphReadiness=fixture.observeAudioGraphReadiness;
 const setTheme=()=>{}; const registerWindowDefaultTrustedTypePolicy=()=>{};
 const retireLanguageRequests=()=>{};const i18t=(key,options)=>({key,options}); const LoggerPrefix='[YTMusic]';
 const console={error:(...args)=>fixture.errors.push(args),trace:err=>fixture.traces.push(err)};
@@ -112,7 +117,7 @@ const getAllLoadedRendererPlugins=()=>fixture.plugins;
 const getLoadedRendererPlugin=id=>fixture.plugins[id];
 const loadAllRendererPlugins=async()=>{}; const forceLoadRendererPlugin=async()=>{};
 const forceUnloadRendererPlugin=async()=>{};
-class AudioContext {destination={};addEventListener(){}removeEventListener(){}createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(){return {connect(){},disconnect(){}}}}
+class AudioContext extends fixture.dom.EventTarget {state='running';destination={};createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return {mediaElement:element,connect(){},disconnect(){}}}}
 `;
   const source = await import(
     `data:text/javascript;base64,${Buffer.from(boundaries + actionsProvider + shareSource + repeatProvider + (await playlistProviderSource()) + actual).toString('base64')}`
@@ -224,6 +229,38 @@ test('actual renderer share option changes Copy input and retires IPC updates on
     update({}, true);
     expect(input.value).toBe(music);
     expect(f.handlers.has('plugin:enable')).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test('renderer-entry fixture wires actual readiness once and retires pending audio on pagehide', async () => {
+  const f = await fixture({});
+  try {
+    const video = f.dom.document.querySelector('video')!;
+    Object.defineProperty(video, 'readyState', {
+      configurable: true,
+      value: 3,
+    });
+    const announcements: any[] = [];
+    f.dom.document.addEventListener('peard:audio-can-play', (event: any) =>
+      announcements.push(event.detail),
+    );
+    await f.source.main();
+    expect(announcements).toHaveLength(0);
+    video.dispatchEvent(new f.dom.Event('canplaythrough'));
+    expect(announcements).toHaveLength(1);
+    expect(announcements[0].audioSource.mediaElement).toBe(video);
+    expect(announcements[0].audioGraph.audioSource).toBe(
+      announcements[0].audioSource,
+    );
+    expect(announcements[0].audioGraph.audioContext).toBe(
+      announcements[0].audioContext,
+    );
+    video.dispatchEvent(new f.dom.Event('loadstart'));
+    f.dom.dispatchEvent(new f.dom.Event('pagehide'));
+    video.dispatchEvent(new f.dom.Event('canplaythrough'));
+    expect(announcements).toHaveLength(1);
   } finally {
     await f.close();
   }

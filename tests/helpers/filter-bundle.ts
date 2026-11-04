@@ -2,10 +2,11 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { build } from 'vite';
+import { build, normalizePath } from 'vite';
 
 const root = path.resolve(import.meta.dirname, '../..');
-export async function filterBundle() {
+export async function filterBundle(rootDirectory = root) {
+  const root = rootDirectory;
   const directory = await mkdtemp(path.join(tmpdir(), 'pear-filter-'));
   const entry = path.join(directory, 'entry.ts');
   const exports = ['blocklist', 'skip-live-songs'].map((name, index) => {
@@ -15,6 +16,11 @@ export async function filterBundle() {
       ? `export {default as ${index ? 'live' : 'blocklist'}} from ${JSON.stringify(target)};`
       : `export const ${index ? 'live' : 'blocklist'}={renderer:{async start(){},onPlayerApiReady(){},onConfigChange(){},stop(){}}};`;
   });
+  exports.push(
+    `export {claimCrossfadeNext,createPlaybackFilter} from ${JSON.stringify(path.join(root, 'src/plugins/utils/renderer/playback-filter.ts'))};`,
+    `export {publishMusicActionsOwner,getMusicActionsOwner,dispatchMusicControl} from ${JSON.stringify(path.join(root, 'src/providers/music-actions.ts'))};`,
+    `export {adoptPlaybackOwner} from ${JSON.stringify(path.join(root, 'src/providers/playback-owner.ts'))};`,
+  );
   await writeFile(entry, exports.join('\n'));
   try {
     await build({
@@ -40,9 +46,13 @@ export async function filterBundle() {
               return `\0style:${path.resolve(path.dirname(importer), id.slice(0, -7))}.js`;
             if (id.startsWith('@/')) {
               const p = path.join(root, 'src', id.slice(2));
-              return [p, `${p}.ts`, `${p}.tsx`, path.join(p, 'index.ts')].find(
-                (file) => existsSync(file) && statSync(file).isFile(),
-              );
+              const file = [
+                p,
+                `${p}.ts`,
+                `${p}.tsx`,
+                path.join(p, 'index.ts'),
+              ].find((file) => existsSync(file) && statSync(file).isFile());
+              return file && normalizePath(file);
             }
           },
           load(id) {
