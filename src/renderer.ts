@@ -13,7 +13,7 @@ import 'mdui';
 
 import {
   initializeAudioGraph,
-  observeAudioGraphReadiness,
+  observeAudioGraphLifetime,
 } from '@/providers/renderer-audio';
 import { LoggerPrefix } from '@/utils';
 import {
@@ -471,11 +471,7 @@ async function onApiLoaded() {
     );
   }
 
-  const dispose = observeAudioGraphReadiness(
-    audioGraph,
-    video,
-    isAudioOwnerCurrent,
-  );
+  const dispose = observeAudioGraphLifetime(audioGraph, isAudioOwnerCurrent);
   // A synchronous readiness subscriber may retire/rebind this renderer owner.
   if (!isAudioOwnerCurrent()) {
     dispose();
