@@ -70,7 +70,7 @@ const window=fixture.window,document=fixture.dom.document,CustomEvent=fixture.do
     .replace(/^import[\s\S]*?;\n/gm, '')
     .replace(
       /initObserver\(\)\s*\.then\(preload\)[\s\S]*?;\s*$/,
-      'export { main };',
+      'export { main, initObserver };',
     );
   const repeatProvider = stripTypeScriptTypes(
     await readFile(
@@ -107,7 +107,8 @@ const window=fixture.window,document=fixture.dom.document,CustomEvent=fixture.do
   const boundaries = `
 const fixture=globalThis[${JSON.stringify(key)}];
 const {window}=fixture; const document=fixture.dom.document;
-const {Element,CustomEvent}=fixture.dom;
+const {Element,CustomEvent,MutationObserver}=fixture.dom;
+const setupSongInfo=()=>{};
 const initializeAudioGraph=fixture.initializeAudioGraph;
 const observeAudioGraphReadiness=fixture.observeAudioGraphReadiness;
 const observeAudioGraphLifetime=fixture.observeAudioGraphLifetime;
@@ -272,6 +273,48 @@ test('renderer-entry fixture wires actual readiness once and retires pending aud
     f.dom.dispatchEvent(new f.dom.Event('pagehide'));
     video.dispatchEvent(new f.dom.Event('canplaythrough'));
     expect(announcements).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test('startup discovery cannot restart an already initialized renderer on its first media replacement', async () => {
+  let apiReadyCalls = 0;
+  const f = await fixture({
+    healthy: { renderer: { onPlayerApiReady: () => apiReadyCalls++ } },
+  });
+  try {
+    // The player already exists before either startup path. No child mutation
+    // occurs until playback replaces its video after main() has completed.
+    Object.defineProperty(f.dom.document, 'readyState', {
+      configurable: true,
+      value: 'complete',
+    });
+    const original = f.dom.document.querySelector('video')!;
+    const replacement = f.dom.document.createElement('video');
+    for (const video of [original, replacement])
+      Object.defineProperty(video, 'readyState', {
+        configurable: true,
+        value: 4,
+      });
+    const announcements: any[] = [];
+    f.dom.document.addEventListener('peard:audio-can-play', (event: any) =>
+      announcements.push(event.detail),
+    );
+    await f.source.initObserver();
+    await f.source.main();
+    expect(announcements).toHaveLength(1);
+    expect(apiReadyCalls).toBe(1);
+
+    original.replaceWith(replacement);
+    await expect.poll(() => announcements.length).toBe(2);
+    expect(announcements[1].audioSource.mediaElement).toBe(replacement);
+    expect({
+      sameContext:
+        announcements[1].audioContext === announcements[0].audioContext,
+      apiReadyCalls,
+    }).toEqual({ sameContext: true, apiReadyCalls: 1 });
+    expect(f.sourceCreations).toEqual([original, replacement]);
   } finally {
     await f.close();
   }

@@ -78,6 +78,8 @@ async function listenForApiLoad() {
   if (!isApiLoaded) {
     api = document.querySelector('#movie_player');
     if (api) {
+      // Claim startup before async hooks can wake the discovery observer.
+      isApiLoaded = true;
       await onApiLoaded();
 
       return;
