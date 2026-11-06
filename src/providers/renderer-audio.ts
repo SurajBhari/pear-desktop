@@ -32,9 +32,104 @@ export interface RendererAudioGraph {
 
 let current: RendererAudioGraph | null = null;
 const graphs = new WeakMap<AudioNode, RendererAudioGraph>();
+const retirements = new WeakMap<RendererAudioGraph, () => void>();
 
 export function getCurrentAudioGraph(): RendererAudioGraph | null {
   return current;
+}
+
+/** Retire only this renderer graph's edges, not other plugins' raw source taps. */
+export function retireAudioGraph(graph: RendererAudioGraph): void {
+  retirements.get(graph)?.();
+}
+
+/** Follow media replacements, retaining one native source per reused element. */
+export function observeAudioGraphLifetime(
+  initialGraph: RendererAudioGraph,
+  isOwnerCurrent: () => boolean,
+): () => void {
+  const context = initialGraph.audioContext;
+  const sources = new WeakMap<HTMLMediaElement, MediaElementAudioSourceNode>();
+  sources.set(initialGraph.audioSource.mediaElement, initialGraph.audioSource);
+  let graph: RendererAudioGraph | null = initialGraph;
+  let observedVideo: HTMLVideoElement | null | undefined;
+  let disposeReadiness: (() => void) | undefined;
+  let disposed = false;
+  let epoch = 0;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    epoch++;
+    observer.disconnect();
+    disposeReadiness?.();
+    disposeReadiness = undefined;
+    const previous = graph;
+    graph = null;
+    if (previous) retireAudioGraph(previous);
+    window.removeEventListener('pagehide', dispose);
+    context.removeEventListener('statechange', contextChanged);
+  };
+  const update = () => {
+    if (disposed) return;
+    if (!isOwnerCurrent() || context.state === 'closed') {
+      dispose();
+      return;
+    }
+    const video = document.querySelector<HTMLVideoElement>('video');
+    if (video === observedVideo) return;
+    observedVideo = video;
+    const generation = ++epoch;
+    disposeReadiness?.();
+    disposeReadiness = undefined;
+    const previous = graph;
+    graph = null;
+    if (previous && previous.audioSource.mediaElement !== video)
+      retireAudioGraph(previous);
+    if (!video || disposed || !isOwnerCurrent()) return;
+    try {
+      let next = previous?.audioSource.mediaElement === video ? previous : null;
+      if (!next) {
+        let source = sources.get(video);
+        if (!source) {
+          source = context.createMediaElementSource(video);
+          sources.set(video, source);
+        }
+        if (disposed || generation !== epoch || !isOwnerCurrent()) return;
+        next = initializeAudioGraph(context, source);
+      }
+      if (disposed || generation !== epoch || !isOwnerCurrent()) {
+        retireAudioGraph(next);
+        return;
+      }
+      graph = next;
+      const stop = observeAudioGraphReadiness(
+        next,
+        video,
+        () => !disposed && generation === epoch && isOwnerCurrent(),
+      );
+      // An immediate readiness subscriber can pagehide/rebind this owner.
+      if (disposed || generation !== epoch || !isOwnerCurrent()) {
+        stop();
+        dispose();
+      } else disposeReadiness = stop;
+    } catch (error) {
+      if (graph) retireAudioGraph(graph);
+      graph = null;
+      console.error('[audio-graph] Media replacement binding failed', error);
+    }
+  };
+  const contextChanged = () => {
+    if (context.state === 'closed') dispose();
+  };
+  const observer = new MutationObserver(update);
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+  window.addEventListener('pagehide', dispose, { once: true });
+  context.addEventListener('statechange', contextChanged);
+  update();
+  return dispose;
 }
 
 /** Announce actual media readiness, including a load already in progress. */
@@ -109,6 +204,9 @@ export function initializeAudioGraph(
   const masterInput = audioContext.createGain();
   const musicGate = audioContext.createGain();
   const outputInput = audioContext.createGain();
+  let retired = false;
+  const insertRetirements = new Set<() => void>();
+  const auxiliaryDisposers = new Set<() => void>();
   let auxiliaryMediaCount = 0;
   // Only the renderer's original dry edge is ours to replace. Never detach raw taps.
   try {
@@ -133,7 +231,7 @@ export function initializeAudioGraph(
   };
   let preparingVolume = false;
   const prepareVolumeChange = () => {
-    if (preparingVolume) return false;
+    if (retired || preparingVolume) return false;
     preparingVolume = true;
     try {
       // Audio can advance between JS event listeners. Complete conservative
@@ -159,10 +257,7 @@ export function initializeAudioGraph(
   main?.addEventListener('volumechange', syncMute);
   const contextChanged = () => {
     if (audioContext.state !== 'closed') return;
-    output.close();
-    main?.removeEventListener('volumechange', syncMute);
-    audioContext.removeEventListener('statechange', contextChanged);
-    if (current?.audioContext === audioContext) current = null;
+    retireAudioGraph(graph);
   };
   audioContext.addEventListener('statechange', contextChanged);
   const mediaNodes = new WeakMap<
@@ -185,14 +280,42 @@ export function initializeAudioGraph(
   function insert(upstream: AudioNode, downstream: AudioNode) {
     let active: { input: AudioNode; output: AudioNode; token: object } | null =
       null;
+    const detach = (owned: { input: AudioNode; output: AudioNode }) => {
+      try {
+        upstream.disconnect(owned.input);
+      } catch {
+        /* Detached. */
+      }
+      try {
+        owned.output.disconnect(downstream);
+      } catch {
+        /* Detached. */
+      }
+    };
+    insertRetirements.add(() => {
+      const owned = active;
+      active = null;
+      if (owned) detach(owned);
+    });
     return (input: AudioNode, output: AudioNode) => {
+      if (retired) throw new Error('The audio graph is retired');
       if (active) throw new Error('The music insert is already owned');
       const token = {};
+      const owned = { input, output, token };
+      active = owned;
+      const check = () => {
+        if (retired || active !== owned)
+          throw new Error('The audio graph is retired');
+      };
       try {
         upstream.connect(input);
+        check();
         output.connect(downstream);
+        check();
         upstream.disconnect(downstream);
+        check();
       } catch (error) {
+        if (active === owned) active = null;
         try {
           upstream.disconnect(input);
         } catch {
@@ -205,13 +328,21 @@ export function initializeAudioGraph(
         }
         throw error;
       }
-      active = { input, output, token };
       return () => {
-        if (active?.token !== token) return;
-        upstream.connect(downstream);
-        upstream.disconnect(input);
-        output.disconnect(downstream);
+        if (retired || active?.token !== token) return;
         active = null;
+        try {
+          upstream.connect(downstream);
+        } finally {
+          if (retired) {
+            try {
+              upstream.disconnect(downstream);
+            } catch {
+              /* Detached. */
+            }
+          }
+          detach(owned);
+        }
       };
     };
   }
@@ -232,6 +363,7 @@ export function initializeAudioGraph(
       return auxiliaryMediaCount;
     },
     observeAuxiliaryMedia(listener) {
+      if (retired) return () => {};
       // Each subscription owns its callback even if callers reuse a function.
       const owned = (count: number) => listener(count);
       auxiliaryObservers.add(owned);
@@ -239,6 +371,7 @@ export function initializeAudioGraph(
       return () => auxiliaryObservers.delete(owned);
     },
     registerVolumePreparation(phase, listener) {
+      if (retired) return () => {};
       const owned = () => listener();
       const callbacks = volumePreparations[phase];
       callbacks.add(owned);
@@ -246,6 +379,7 @@ export function initializeAudioGraph(
     },
     prepareVolumeChange,
     registerMedia(element, suppliedGain, suppliedOutput, admission) {
+      if (retired) throw new Error('The audio graph is retired');
       if (element === audioSource.mediaElement)
         throw new Error('Main media is already registered');
       if (activeMedia.has(element))
@@ -278,6 +412,7 @@ export function initializeAudioGraph(
       const dispose = () => {
         if (disposed) return;
         disposed = true;
+        auxiliaryDisposers.delete(dispose);
         const fault = disconnect();
         activeMedia.delete(element);
         if (counted) {
@@ -288,9 +423,9 @@ export function initializeAudioGraph(
         if (fault) throw new Error('Auxiliary route retirement failed');
       };
       const live = () => {
-        if (disposed) return false;
+        if (retired || disposed) return false;
         const current = !admission || admission.isCurrent();
-        return !disposed && current;
+        return !retired && !disposed && current;
       };
       const check = () => {
         if (live()) return true;
@@ -299,6 +434,7 @@ export function initializeAudioGraph(
         dispose();
         return false;
       };
+      auxiliaryDisposers.add(dispose);
       try {
         admission?.publishDispose(dispose);
         if (!check()) return dispose;
@@ -334,6 +470,48 @@ export function initializeAudioGraph(
       }
     },
   };
+  retirements.set(graph, () => {
+    if (retired) return;
+    retired = true;
+    retirements.delete(graph);
+    if (graphs.get(audioSource) === graph) graphs.delete(audioSource);
+    if (current === graph) current = null;
+    main?.removeEventListener('volumechange', syncMute);
+    audioContext.removeEventListener('statechange', contextChanged);
+    // Shutdown can synchronously reopen the gate and invoke wet owners.
+    // Remove our destination edge before either of those callouts.
+    try {
+      musicGate.disconnect(audioContext.destination);
+    } catch {
+      /* Detached. */
+    }
+    output.close();
+    for (const retire of insertRetirements) retire();
+    insertRetirements.clear();
+    for (const dispose of [...auxiliaryDisposers]) {
+      try {
+        dispose();
+      } catch (error) {
+        console.error('[audio-graph] Auxiliary retirement failed', error);
+      }
+    }
+    auxiliaryDisposers.clear();
+    auxiliaryObservers.clear();
+    volumePreparations.attenuate.clear();
+    volumePreparations.scale.clear();
+    try {
+      audioSource.disconnect(dryInput);
+    } catch {
+      /* Detached. */
+    }
+    for (const node of [dryInput, masterInput, outputInput, musicGate]) {
+      try {
+        node.disconnect();
+      } catch {
+        /* Detached. */
+      }
+    }
+  });
   graphs.set(audioSource, graph);
   return (current = graph);
 }

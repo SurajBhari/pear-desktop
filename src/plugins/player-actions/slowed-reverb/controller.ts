@@ -102,6 +102,7 @@ export interface SlowedReverbController {
   config: SlowedReverbConfig | null;
   audioContext: AudioContext | null;
   audioSource: MediaElementAudioSourceNode | null;
+  audioGraph: RendererAudioGraph | null;
   wetGain: GainNode | null;
   wetInput: GainNode | null;
   wetVolumeMedia: HTMLMediaElement | null;
@@ -166,6 +167,7 @@ export function createSlowedReverbController(): SlowedReverbController {
     config: null,
     audioContext: null,
     audioSource: null,
+    audioGraph: null,
     wetGain: null,
     wetInput: null,
     wetVolumeMedia: null,
@@ -270,6 +272,7 @@ export function createSlowedReverbController(): SlowedReverbController {
       this.restoreVideo();
       this.audioContext = null;
       this.audioSource = null;
+      this.audioGraph = null;
       this.workletReadyFor = null;
       this.ctx = null;
     },
@@ -447,6 +450,9 @@ export function createSlowedReverbController(): SlowedReverbController {
 
     wireAudio(audioContext, audioSource) {
       if (!this.ctx) return;
+      const graph = graphFromAnnouncement({ audioContext, audioSource });
+      if (this.audioGraph !== graph) this.workletFailed = false;
+      this.audioGraph = graph;
       this.audioContext = audioContext;
       this.audioSource = audioSource;
       if (this.workletFailed) return;
@@ -470,7 +476,7 @@ export function createSlowedReverbController(): SlowedReverbController {
         // Wet reverb joins the renderer master mix so EQ/output sink cover it.
         // Raw analyser taps and the compressor's dry insert remain untouched.
         this.wetGain.gain.value = 0;
-        this.volumeGraph = graphFromAnnouncement({ audioContext, audioSource });
+        this.volumeGraph = graph;
         const epoch = this.workletEpoch;
         // Publish ownership before registration: allocation can fail inline.
         this.wiredSource = audioSource;
@@ -557,9 +563,16 @@ export function createSlowedReverbController(): SlowedReverbController {
       if (!this.ctx) return;
       const detail = (event as CustomEvent<AudioCanPlayDetail>).detail;
       if (!detail?.audioContext || !detail?.audioSource) return;
+      const graph = graphFromAnnouncement(detail);
       // Record the announced graph even while the reverb is silent: the lazy
       // tap wires it as soon as the intensity rises above 0.
-      if (this.audioContext !== detail.audioContext) this.workletFailed = false;
+      if (
+        this.audioGraph !== graph ||
+        this.audioContext !== detail.audioContext ||
+        this.audioSource !== detail.audioSource
+      )
+        this.workletFailed = false;
+      this.audioGraph = graph;
       this.audioContext = detail.audioContext;
       this.audioSource = detail.audioSource;
       this.syncWetTap();
