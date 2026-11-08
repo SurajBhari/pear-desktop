@@ -31,6 +31,7 @@ export default createPlugin<
     timingOffsetMs: 0,
     romanizationSizePercent: 70,
     enhancedLrc: false,
+    enableDownload: true,
   },
 
   menu,

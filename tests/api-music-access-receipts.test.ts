@@ -41,6 +41,7 @@ async function fixture(
   rest = false,
   guard?: (kind: 'owner' | 'session' | 'resolver') => void,
   progress?: (phase: string) => void,
+  clock?: () => number,
 ) {
   progress?.('broker-bundle:begin');
   const f = await musicRequestFixture();
@@ -60,6 +61,7 @@ async function fixture(
   progress?.('grant-directory:end');
   let now = Date.now(),
     ownerLive = true;
+  const readNow = clock ?? (() => now);
   const owner = {
     identity: {},
     current: () => {
@@ -74,7 +76,7 @@ async function fixture(
     port: 26538,
     useHttps: false,
   };
-  const store = new g.MusicGrantStore(path.join(folder, 'owned'), () => now);
+  const store = new g.MusicGrantStore(path.join(folder, 'owned'), readNow);
   progress?.('grant-issue:begin');
   const grant = await store.issue(
     'Owned MCP',
@@ -97,7 +99,7 @@ async function fixture(
     config,
     grants: store,
     broker: f.broker,
-    now: () => now,
+    now: readNow,
     resolveAccessOwner: (transport: string, audience: string) => {
       guard?.('resolver');
       return transport === 'mcp' && audience === resource
@@ -1052,7 +1054,7 @@ test('one stable MCP grant across sessions stays at two slots while distinct loc
 });
 
 test('foreign queue receipt and nonexistent ID have identical scope denial before receipt inspection', async () => {
-  const f = await fixture();
+  const f = await fixture(false, undefined, undefined, Date.now);
   try {
     const grant = await f.store.issue(
       'Queue only',
@@ -1205,7 +1207,8 @@ test('absent retired wrong-resource and replaced receipt owners cannot inspect o
 });
 
 test('legacy mutation wrappers preserve synchronous prepare validation and promised unavailable local discovery', async () => {
-  const f = await fixture();
+  // This validation case crosses the broker, which uses the live clock.
+  const f = await fixture(false, undefined, undefined, Date.now);
   try {
     expect(() =>
       f.service.prepare(f.grant.token, { action: 'invalid' }),

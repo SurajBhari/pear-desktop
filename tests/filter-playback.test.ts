@@ -675,3 +675,219 @@ test('stopping one of two filters retains the remaining owner claim', async ({
   });
   expect(result).toEqual({ before: 1, after: ['A', 'A'] });
 });
+
+for (const category of ['acoustic', 'demo', 'session', 'venue']) {
+  test(`non-studio ${category} is opt-in and responds to current config`, async ({
+    page,
+  }) => {
+    await fixture(page);
+    const result = await page.evaluate(async (category) => {
+      const w = window as any,
+        p = w.FilterFixture.live;
+      const titles: any = {
+        acoustic: 'Song (Acoustic Version)',
+        demo: 'Song [Rehearsal]',
+        session: 'Song (BBC Radio Session)',
+        venue: 'Song (Recorded at Paris, 1992)',
+      };
+      w.state.title = titles[category];
+      w.metadata = { videoId: 'A', title: w.state.title, artist: 'Allowed' };
+      await p.renderer.start(w.context({ enabled: true }));
+      p.renderer.onPlayerApiReady(w.api);
+      const before = w.state.skips.slice();
+      p.renderer.onConfigChange({
+        enabled: true,
+        categories: { [category]: true },
+      });
+      const after = w.state.skips.slice();
+      p.renderer.stop();
+      return { before, after };
+    }, category);
+    expect(result).toEqual({ before: [], after: ['A'] });
+  });
+}
+
+test('non-studio all-off, malformed and disabled configurations cannot skip live recordings', async ({
+  page,
+}) => {
+  await fixture(page);
+  const result = await page.evaluate(async () => {
+    const w = window as any,
+      p = w.FilterFixture.live;
+    for (const config of [
+      { enabled: true, categories: { live: false } },
+      { enabled: true, categories: null },
+      { enabled: true, categories: { acoustic: 'true' } },
+      { enabled: false, categories: { live: true } },
+    ]) {
+      await p.renderer.start(w.context(config));
+      p.renderer.onPlayerApiReady(w.api);
+      p.renderer.stop();
+    }
+    return w.state.skips;
+  });
+  expect(result).toEqual([]);
+});
+
+test('newer category state wins over pending startup and stop fences retained callbacks', async ({
+  page,
+}) => {
+  await fixture(page);
+  const result = await page.evaluate(async () => {
+    const w = window as any,
+      p = w.FilterFixture.live;
+    w.state.title = 'Song (Demo)';
+    w.metadata = { videoId: 'A', title: w.state.title, artist: 'Allowed' };
+    let release: any;
+    const pending = new Promise((resolve) => (release = resolve));
+    const start = p.renderer.start({
+      ...w.context({}),
+      getConfig: () => pending,
+    });
+    p.renderer.onConfigChange({
+      enabled: true,
+      categories: { live: false, demo: true },
+    });
+    release({ enabled: true, categories: { live: true, demo: false } });
+    await start;
+    p.renderer.onPlayerApiReady(w.api);
+    const retained = [...w.handlers, ...w.subscribers];
+    p.renderer.stop();
+    w.state.id = w.state.responseId = 'B';
+    for (const callback of retained)
+      callback('dataloaded', { videoId: 'B', title: w.state.title });
+    return w.state.skips;
+  });
+  expect(result).toEqual(['A']);
+});
+
+for (const primaryMatches of [true, false]) {
+  test(`non-studio title OR alternativeTitle remains eligible (${primaryMatches})`, async ({
+    page,
+  }) => {
+    await fixture(page);
+    const result = await page.evaluate(async (primaryMatches) => {
+      const w = window as any,
+        p = w.FilterFixture.live;
+      w.state.title = primaryMatches ? 'Song (Demo)' : 'Ordinary';
+      w.metadata = {
+        videoId: 'A',
+        title: w.state.title,
+        alternativeTitle: primaryMatches ? 'Ordinary' : 'Song (Demo)',
+        artist: 'Allowed',
+      };
+      await p.renderer.start(
+        w.context({ enabled: true, categories: { demo: true } }),
+      );
+      p.renderer.onPlayerApiReady(w.api);
+      p.renderer.stop();
+      return w.state.skips;
+    }, primaryMatches);
+    expect(result).toEqual(['A']);
+  });
+}
+
+test('selected non-studio category shares a single native claim with artist filtering', async ({
+  page,
+}) => {
+  await fixture(page);
+  const result = await page.evaluate(async () => {
+    const w = window as any;
+    w.state.title = 'Song (Demo)';
+    w.metadata = { videoId: 'A', title: w.state.title, artist: 'Blocked' };
+    for (const p of [w.FilterFixture.live, w.FilterFixture.blocklist]) {
+      await p.renderer.start(
+        w.context({
+          enabled: true,
+          categories: { demo: true },
+          blockedArtists: [{ name: 'Blocked' }],
+        }),
+      );
+      p.renderer.onPlayerApiReady(w.api);
+      if (p === w.FilterFixture.live && w.state.skips.length !== 1)
+        throw Error('Selected category did not claim playback');
+    }
+    w.announce();
+    w.publish();
+    for (const p of [w.FilterFixture.live, w.FilterFixture.blocklist])
+      p.renderer.stop();
+    return w.state.skips;
+  });
+  expect(result).toEqual(['A']);
+});
+
+for (const category of ['live', 'acoustic', 'demo', 'session', 'venue']) {
+  for (const primaryMatches of [true, false]) {
+    test(`qualified suffix ${category} uses title OR alternativeTitle (${primaryMatches})`, async ({
+      page,
+    }) => {
+      await fixture(page);
+      const result = await page.evaluate(
+        async ({ category, primaryMatches }) => {
+          const w = window as any,
+            p = w.FilterFixture.live;
+          const markers: any = {
+            live: 'Live',
+            acoustic: 'Acoustic Version',
+            demo: 'Demo',
+            session: 'BBC Radio Session',
+            venue: 'Recorded performance at Wembley Arena,1992',
+          };
+          const title = `Song (${markers[category]}) Official Video`;
+          w.state.title = primaryMatches ? title : 'Ordinary';
+          w.metadata = {
+            videoId: 'A',
+            title: w.state.title,
+            alternativeTitle: primaryMatches ? 'Ordinary' : title,
+            artist: 'Allowed',
+          };
+          const config =
+            category === 'live'
+              ? { enabled: true }
+              : {
+                  enabled: true,
+                  categories: { live: false, [category]: true },
+                };
+          await p.renderer.start(w.context(config));
+          p.renderer.onPlayerApiReady(w.api);
+          p.renderer.stop();
+          return w.state.skips;
+        },
+        { category, primaryMatches },
+      );
+      expect(result).toEqual(['A']);
+    });
+  }
+}
+
+test('default legacy live matching retains simple and suffixed English/Russian renderer positives', async ({
+  page,
+}) => {
+  await fixture(page);
+  const result = await page.evaluate(async () => {
+    const w = window as any,
+      p = w.FilterFixture.live;
+    const observed = [];
+    for (const title of [
+      'Song (Live)',
+      'Song (Live) Official Audio',
+      'Song [Live at Wembley] Official Video',
+      'Song (концертная запись) Official Audio',
+    ]) {
+      w.state.title = title;
+      w.state.skips = [];
+      w.metadata = { videoId: 'A', title, artist: 'Allowed' };
+      await p.renderer.start(w.context({ enabled: true }));
+      p.renderer.onPlayerApiReady(w.api);
+      p.renderer.stop();
+      observed.push({ title, skips: w.state.skips });
+    }
+    return observed;
+  });
+  expect(result).toEqual([
+    { title: 'Song (Live)', skips: ['A'] },
+    { title: 'Song (Live) Official Audio', skips: ['A'] },
+    { title: 'Song [Live at Wembley] Official Video', skips: ['A'] },
+    { title: 'Song (концертная запись) Official Audio', skips: ['A'] },
+  ]);
+});

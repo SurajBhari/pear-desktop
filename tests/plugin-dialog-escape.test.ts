@@ -257,8 +257,94 @@ for (const kind of ['equalizer', 'downloader']) {
     expect(await page.evaluate(() => (window as any).siteKeys)).toEqual([
       'Escape',
     ]);
+    await page.evaluate(() => {
+      const old = (window as any).oldDialog as HTMLDialogElement;
+      const input = document.createElement('input');
+      old.append(input);
+      input.focus();
+      input.remove();
+    });
+    await page.keyboard.press('Escape');
+    expect(await page.evaluate(() => (window as any).siteKeys)).toEqual([
+      'Escape',
+      'Escape',
+    ]);
   });
 }
+
+for (const mode of ['open', 'closed'] as const) {
+  test(`Escape reaches the focused control in a foreign ${mode} shadow dialog`, async ({
+    page,
+  }) => {
+    await page.evaluate((mode) => {
+      (window as any).DialogFixture.open('equalizer');
+      const host = document.createElement('div');
+      document.body.append(host);
+      const shadow = host.attachShadow({ mode });
+      const foreign = document.createElement('dialog');
+      const input = document.createElement('input');
+      foreign.append(input);
+      shadow.append(foreign);
+      (window as any).foreignDialog = foreign;
+      (window as any).controlKeys = [];
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          (window as any).controlKeys.push(event.key);
+          event.preventDefault();
+        }
+      });
+      foreign.showModal();
+      input.focus();
+    }, mode);
+    await page.keyboard.press('Escape');
+    await expect
+      .poll(() =>
+        page.evaluate(() => ({
+          controlKeys: (window as any).controlKeys,
+          foreignOpen: (window as any).foreignDialog.open,
+          pluginOpen:
+            document.querySelector<HTMLDialogElement>('.eq-panel')!.open,
+        })),
+      )
+      .toEqual({
+        controlKeys: ['Escape'],
+        foreignOpen: true,
+        pluginOpen: true,
+      });
+  });
+}
+
+test('equalizer Escape after a layout redraw closes the modal before site navigation', async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    history.replaceState({}, '', '/watch?v=owned');
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') history.replaceState({}, '', '/home');
+    });
+    (window as any).DialogFixture.open('equalizer');
+  });
+  const layout = page.locator('.eq-toolbar select').first();
+  await layout.focus();
+  await layout.selectOption('custom');
+  // The real panel replaces its controls on this change; Chromium moves focus
+  // to body, outside the still-open dialog's keydown propagation path.
+  expect(
+    await page.evaluate(() => document.activeElement === document.body),
+  ).toBe(true);
+  await expect(page.locator('dialog[open]')).toHaveCount(1);
+  await page.keyboard.press('Escape');
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        openDialogs: document.querySelectorAll('dialog[open]').length,
+        path: location.pathname + location.search,
+        siteKeys: (window as any).siteKeys,
+      })),
+    )
+    .toEqual({ openDialogs: 0, path: '/watch?v=owned', siteKeys: [] });
+  await expect(page.locator('#outside')).toBeFocused();
+});
 
 test('downloader stop disposes its owner before an immediate restart opens a new modal', async ({
   page,

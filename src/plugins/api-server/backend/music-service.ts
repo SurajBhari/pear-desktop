@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 
 import { sliceMusicSource } from '@/providers/music-catalog';
 import { loadComments } from '@/providers/music-comments';
@@ -6,6 +6,7 @@ import {
   createMusicRequestBroker,
   type MusicRequestBroker,
   type MusicAdmission,
+  type MusicResultOwner,
 } from '@/providers/music-request';
 
 import {
@@ -38,6 +39,13 @@ import {
   type MusicOperationRow,
   type MusicOperationBinding,
 } from './music-operations';
+import { captureMusicPublication } from './music-publication';
+import {
+  MUSIC_READ_RESULT_MAX_BYTES,
+  musicReadPayloadLimit,
+  musicReadErrorCode,
+  type MusicReadEncoder,
+} from './music-read-result';
 import {
   parseMusicInput,
   parseMusicCommentsInput,
@@ -80,6 +88,7 @@ import {
   type MetadataBinding,
   type MetadataTarget,
   type LyricsResult,
+  type PlaybackSnapshot,
   type MusicOperationReceipt,
 } from '../music-types';
 
@@ -87,7 +96,13 @@ import type { APIServerConfig } from '../config';
 import type { MusicGrantRecord } from './music-grants';
 import type { BrowserWindow } from 'electron';
 
-type SourceOwner = { epoch: string; current(): boolean };
+type SourceOwner = MusicResultOwner;
+// Capture native brand-checked reads; own/custom aborted accessors never run.
+const sourceSignalAborted: (signal: AbortSignal) => boolean =
+  Function.prototype.call.bind(
+    // oxlint-disable-next-line typescript/unbound-method -- The intrinsic getter is explicitly bound to call.
+    Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!,
+  );
 type PageContext =
   | {
       route: 'search';
@@ -164,6 +179,8 @@ interface TargetReference {
   bytes: number;
 }
 interface Lease {
+  /** Encoded invocation only; derived leases retain this exact private array. */
+  sourceRetirements?: AbortSignal[];
   access: MusicAccessBinding;
   principal: MusicGrantRecord;
   scope: MusicScope;
@@ -342,6 +359,30 @@ export class MusicService {
       },
     };
   }
+  /** Main-owned transport/native-grant lifetime, captured before dialogs or SDK awaits. */
+  captureTransportOwner(transport: 'rest' | 'mcp', resource: string) {
+    const selected = this.accessOwner(transport, resource);
+    const serviceSignal = this.scope.signal;
+    const admission = this.broker.capture();
+    const signal = AbortSignal.any([
+      serviceSignal,
+      ...(selected?.signal ? [selected.signal] : []),
+    ]);
+    return Object.freeze({
+      signal,
+      current: () => {
+        if (!selected || signal.aborted || !this.sharedAvailable())
+          return false;
+        const current = this.accessOwner(transport, resource);
+        return (
+          current?.identity === selected.identity &&
+          selected.current() &&
+          this.broker.isCurrent(admission) &&
+          !signal.aborted
+        );
+      },
+    });
+  }
   /** Exact main-owned session identity is terminal, regardless of later guard results. */
   retireSession(owner: MusicSessionOwner): void {
     this.retiredSessions.add(owner);
@@ -453,6 +494,32 @@ export class MusicService {
       ? this.runtime.resolveAccessOwner?.(transport, resource)
       : undefined;
   }
+  private admittedFor<T>(
+    invocation: MusicInvocation,
+    requiredScope: MusicScope | ((access: MusicAccessBinding) => MusicScope),
+    extra: MusicScope[],
+    currentRead: boolean,
+    action: (lease: Lease) => Promise<T>,
+    deadlineAt?: number,
+  ): Promise<T>;
+  private admittedFor<T>(
+    invocation: MusicInvocation,
+    requiredScope: MusicScope | ((access: MusicAccessBinding) => MusicScope),
+    extra: MusicScope[],
+    currentRead: boolean,
+    action: (lease: Lease) => Promise<T>,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<T>,
+  ): Promise<string>;
+  private admittedFor<T>(
+    invocation: MusicInvocation,
+    requiredScope: MusicScope | ((access: MusicAccessBinding) => MusicScope),
+    extra: MusicScope[],
+    currentRead: boolean,
+    action: (lease: Lease) => Promise<T>,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<T> | undefined,
+  ): Promise<T | string>;
   private async admittedFor<T>(
     invocation: MusicInvocation,
     requiredScope: MusicScope | ((access: MusicAccessBinding) => MusicScope),
@@ -460,7 +527,8 @@ export class MusicService {
     currentRead: boolean,
     action: (lease: Lease) => Promise<T>,
     deadlineAt?: number,
-  ): Promise<T> {
+    encode?: MusicReadEncoder<T>,
+  ): Promise<T | string> {
     const { token, transport, resource, signal, session } = invocation;
     const revision = this.revision,
       serviceSignal = this.scope.signal;
@@ -634,8 +702,12 @@ export class MusicService {
       );
       timer.unref?.();
       if (!current()) throw invalidReason(principal);
+      const sourceRetirements: AbortSignal[] | undefined = encode
+        ? []
+        : undefined;
       const result = await waitOwned(
         action({
+          ...(sourceRetirements ? { sourceRetirements } : {}),
           principal,
           access,
           scope,
@@ -650,7 +722,75 @@ export class MusicService {
         joined,
       );
       if (!current()) throw invalidReason(principal);
-      return result;
+      if (!encode) return result;
+      let encoded = '';
+      let encodingError: MusicServiceError | undefined;
+      try {
+        const value: unknown = encode(result);
+        if (typeof value !== 'string') throw new MusicServiceError('source');
+        if (utf8Bytes(value) > MUSIC_READ_RESULT_MAX_BYTES)
+          throw new MusicServiceError('budget');
+        encoded = value;
+      } catch (error) {
+        encodingError = new MusicServiceError(musicReadErrorCode(error));
+      }
+      if (invocation.delivery) {
+        try {
+          if (
+            !access.owner.signal ||
+            (session && !session.signal) ||
+            sourceRetirements!.length > 4
+          )
+            throw new MusicServiceError('source');
+          const witness = captureMusicPublication({
+            digest: createHash('sha256').update(encoded, 'utf8').digest('hex'),
+            access,
+            broker: this.broker,
+            admission,
+            signals: [
+              serviceSignal,
+              grantSignal,
+              signal,
+              access.owner.signal,
+              ...(session?.signal ? [session.signal] : []),
+              ...sourceRetirements!,
+            ],
+            createdAt: principal.createdAt,
+            expiresAt: principal.expiresAt,
+            deadline: Math.min(deadline, principal.expiresAt),
+            now: this.now,
+          });
+          if (invocation.delivery.capture(witness) !== true)
+            throw new MusicServiceError('source');
+        } catch {
+          encodingError = new MusicServiceError('source');
+        }
+      }
+      // All potentially reentrant encoding/error inspection precedes this last guard.
+      const guardError = new MusicServiceError('source');
+      const sourceRetiredError = new MusicServiceError('retired');
+      let live = false;
+      let guardThrew = false;
+      try {
+        live = current();
+      } catch {
+        guardThrew = true;
+      }
+      // No callouts/listeners/foreign inspection after current(): native flags only.
+      let sourceRetired = false;
+      for (let index = 0; index < sourceRetirements!.length; index++)
+        if (sourceSignalAborted(sourceRetirements![index]))
+          sourceRetired = true;
+      if (guardThrew)
+        throw joined.aborted
+          ? invalidReason(principal)
+          : sourceRetired
+            ? sourceRetiredError
+            : guardError;
+      if (!live) throw invalidReason(principal);
+      if (sourceRetired) throw sourceRetiredError;
+      if (encodingError) throw encodingError;
+      return encoded;
     } catch (error) {
       if (error instanceof MusicServiceError) throw error;
       if (
@@ -684,6 +824,22 @@ export class MusicService {
       }
     }
   }
+  private rememberSourceOwner(lease: Lease, owner: SourceOwner | undefined) {
+    const captured = lease.sourceRetirements;
+    if (!captured) return;
+    let signal: AbortSignal;
+    try {
+      const witness = owner?.retirementSignal;
+      if (!witness) return failMusic('source');
+      // The intrinsic validates native AbortSignal brand and ignores own accessors.
+      if (sourceSignalAborted(witness)) return failMusic('retired');
+      signal = witness;
+    } catch (error) {
+      if (error instanceof MusicServiceError) throw error;
+      return failMusic('source');
+    }
+    if (!captured.includes(signal)) captured.push(signal);
+  }
   private async native(lease: Lease, input: MusicReadInput) {
     if (!lease.current()) return failMusic('retired');
     const value = await this.broker.read(
@@ -697,6 +853,7 @@ export class MusicService {
       },
     );
     const owner = this.broker.resultOwner(value);
+    this.rememberSourceOwner(lease, owner);
     if (!lease.current() || !owner?.current() || !lease.current())
       return failMusic('retired');
     return { value, owner };
@@ -720,7 +877,23 @@ export class MusicService {
       return Promise.reject(error as Error);
     }
   }
-  prepareFor(invocation: MusicInvocation, input: unknown, deadlineAt?: number) {
+  prepareFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt?: number,
+  ): Promise<MusicOperationReceipt>;
+  prepareFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicOperationReceipt>,
+  ): Promise<string>;
+  prepareFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicOperationReceipt>,
+  ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
     const command = parseMusicOperationPrepareInput(input),
       scope = musicOperationScope(command);
@@ -741,6 +914,7 @@ export class MusicService {
         return Promise.resolve(this.operations.prepare(command, binding));
       },
       deadline,
+      encode,
     );
   }
   /** Separate factory: durable ownership never closes over a request lease or signal. */
@@ -809,14 +983,35 @@ export class MusicService {
       deadlineAt,
     );
   }
+  operationFor(
+    invocation: MusicInvocation,
+    operationId: unknown,
+    deadlineAt?: number,
+  ): Promise<MusicOperationReceipt>;
+  operationFor(
+    invocation: MusicInvocation,
+    operationId: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicOperationReceipt>,
+  ): Promise<string>;
   async operationFor(
     invocation: MusicInvocation,
     operationId: unknown,
     deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicOperationReceipt>,
   ) {
     const id = parseMusicOperationId(operationId);
     const { token, transport, resource, signal, session } = invocation;
-    const snapshot = { token, transport, resource, signal, session };
+    const snapshot: MusicInvocation = {
+      token,
+      transport,
+      resource,
+      signal,
+      session,
+      ...(encode && invocation.delivery
+        ? { delivery: invocation.delivery }
+        : {}),
+    };
     return this.admittedFor(
       snapshot,
       (access) =>
@@ -833,6 +1028,7 @@ export class MusicService {
         return Promise.resolve(this.operations.receipt(row));
       },
       deadlineAt,
+      encode,
     );
   }
   navigate(
@@ -856,6 +1052,18 @@ export class MusicService {
     invocation: MusicInvocation,
     input: unknown,
     deadlineAt?: number,
+  ): Promise<MusicOperationReceipt>;
+  navigateFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicOperationReceipt>,
+  ): Promise<string>;
+  navigateFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicOperationReceipt>,
   ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
     return this.admittedFor(
@@ -949,6 +1157,7 @@ export class MusicService {
         return row.promise;
       },
       deadline,
+      encode,
     );
   }
   control(
@@ -968,7 +1177,23 @@ export class MusicService {
       return Promise.reject(error as Error);
     }
   }
-  controlFor(invocation: MusicInvocation, input: unknown, deadlineAt?: number) {
+  controlFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt?: number,
+  ): Promise<MusicOperationReceipt>;
+  controlFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicOperationReceipt>,
+  ): Promise<string>;
+  controlFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicOperationReceipt>,
+  ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
     return this.admittedFor(
       invocation,
@@ -1072,6 +1297,7 @@ export class MusicService {
         return row.promise;
       },
       deadline,
+      encode,
     );
   }
   mutateQueue(
@@ -1095,6 +1321,18 @@ export class MusicService {
     invocation: MusicInvocation,
     input: unknown,
     deadlineAt?: number,
+  ): Promise<MusicOperationReceipt>;
+  mutateQueueFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicOperationReceipt>,
+  ): Promise<string>;
+  mutateQueueFor(
+    invocation: MusicInvocation,
+    input: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicOperationReceipt>,
   ) {
     const deadline = Math.min(this.now() + 10000, deadlineAt ?? Infinity);
     return this.admittedFor(
@@ -1217,6 +1455,7 @@ export class MusicService {
         return row.promise;
       },
       deadline,
+      encode,
     );
   }
   private metadataBinding(
@@ -1294,25 +1533,48 @@ export class MusicService {
     invocation: MusicInvocation,
     value: unknown,
     deadlineAt?: number,
-  ): Promise<LyricsResult> {
+  ): Promise<LyricsResult>;
+  lyricsFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<LyricsResult>,
+  ): Promise<string>;
+  lyricsFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<LyricsResult>,
+  ): Promise<LyricsResult | string> {
     const target = parseMusicLyricsInput(value);
-    return this.admittedFor(
-      invocation,
-      'catalog.read',
-      [],
-      false,
-      async (lease) => {
-        const captured = await this.native(lease, {
-          operation: 'lyrics',
-          target,
-          deadlineAt: lease.deadline,
-        });
-        const result = parseNativeLyricsMetadata(captured.value);
-        this.metadataBinding(result.binding, captured.owner, target);
-        return result.lyrics;
-      },
-      deadlineAt,
-    );
+    const action = async (lease: Lease) => {
+      const captured = await this.native(lease, {
+        operation: 'lyrics',
+        target,
+        deadlineAt: lease.deadline,
+      });
+      const result = parseNativeLyricsMetadata(captured.value);
+      this.metadataBinding(result.binding, captured.owner, target);
+      return result.lyrics;
+    };
+    return encode
+      ? this.admittedFor(
+          invocation,
+          'catalog.read',
+          [],
+          false,
+          action,
+          deadlineAt,
+          encode,
+        )
+      : this.admittedFor(
+          invocation,
+          'catalog.read',
+          [],
+          false,
+          action,
+          deadlineAt,
+        );
   }
   related(
     token: unknown,
@@ -1331,40 +1593,63 @@ export class MusicService {
     invocation: MusicInvocation,
     value: unknown,
     deadlineAt?: number,
-  ): Promise<MusicPage> {
+  ): Promise<MusicPage>;
+  relatedFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicPage>,
+  ): Promise<string>;
+  relatedFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicPage>,
+  ): Promise<MusicPage | string> {
     const input = parseMusicRelatedInput(value);
-    return this.admittedFor(
-      invocation,
-      'catalog.read',
-      [],
-      false,
-      async (lease) => {
-        if ('cursor' in input)
-          return this.next(lease, input.cursor, 'related', input.limit);
-        const target: MetadataTarget =
-          'videoId' in input ? { videoId: input.videoId } : { current: true };
-        const captured = await this.native(lease, {
-          operation: 'related',
-          target,
-          deadlineAt: lease.deadline,
-        });
-        const result = parseNativeRelatedMetadata(captured.value);
-        this.metadataBinding(result.binding, captured.owner, target);
-        return this.page(
-          lease,
-          {
-            route: 'related',
-            videoId: result.binding.videoId,
-            binding: result.binding,
-          },
-          result.source,
-          captured.owner,
-          0,
-          input.limit,
+    const action = async (lease: Lease) => {
+      if ('cursor' in input)
+        return this.next(lease, input.cursor, 'related', input.limit);
+      const target: MetadataTarget =
+        'videoId' in input ? { videoId: input.videoId } : { current: true };
+      const captured = await this.native(lease, {
+        operation: 'related',
+        target,
+        deadlineAt: lease.deadline,
+      });
+      const result = parseNativeRelatedMetadata(captured.value);
+      this.metadataBinding(result.binding, captured.owner, target);
+      return this.page(
+        lease,
+        {
+          route: 'related',
+          videoId: result.binding.videoId,
+          binding: result.binding,
+        },
+        result.source,
+        captured.owner,
+        0,
+        input.limit,
+      );
+    };
+    return encode
+      ? this.admittedFor(
+          invocation,
+          'catalog.read',
+          [],
+          false,
+          action,
+          deadlineAt,
+          encode,
+        )
+      : this.admittedFor(
+          invocation,
+          'catalog.read',
+          [],
+          false,
+          action,
+          deadlineAt,
         );
-      },
-      deadlineAt,
-    );
   }
   /** Public WEB work uses the same physical broker pool as all native reads. */
   private async publicComments(
@@ -1440,53 +1725,76 @@ export class MusicService {
     invocation: MusicInvocation,
     value: unknown,
     deadlineAt?: number,
-  ): Promise<CommentPage> {
+  ): Promise<CommentPage>;
+  commentsFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<CommentPage>,
+  ): Promise<string>;
+  commentsFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<CommentPage>,
+  ): Promise<CommentPage | string> {
     const input = parseMusicCommentsInput(value);
     const deadline = Math.min(this.now() + 15000, deadlineAt ?? Infinity);
-    return this.admittedFor(
-      invocation,
-      'comments.read',
-      [],
-      false,
-      async (lease) => {
-        if ('cursor' in input)
-          return this.nextComments(lease, input.cursor, input.limit);
-        const target: MetadataTarget =
-          'videoId' in input ? { videoId: input.videoId } : { current: true };
-        const captured = await this.native(lease, {
-          operation: 'comments',
-          target,
-          sort: input.sort,
-          deadlineAt: lease.deadline,
-        });
-        let result = parseNativeCommentsMetadata(captured.value),
-          channel: 'music' | 'public-web' = 'music';
-        this.metadataBinding(result.binding, captured.owner, target);
-        // Only an authenticated, supported native absence and explicit consent may switch source.
-        if (!result.comments.available && input.allowPublicWebFallback) {
-          result = await this.publicComments(
-            lease,
-            result.binding,
-            captured.owner,
-            input.sort,
-            undefined,
-            5 - result.requests,
-          );
-          channel = 'public-web';
-        }
-        return this.commentsPage(
+    const action = async (lease: Lease) => {
+      if ('cursor' in input)
+        return this.nextComments(lease, input.cursor, input.limit);
+      const target: MetadataTarget =
+        'videoId' in input ? { videoId: input.videoId } : { current: true };
+      const captured = await this.native(lease, {
+        operation: 'comments',
+        target,
+        sort: input.sort,
+        deadlineAt: lease.deadline,
+      });
+      let result = parseNativeCommentsMetadata(captured.value),
+        channel: 'music' | 'public-web' = 'music';
+      this.metadataBinding(result.binding, captured.owner, target);
+      // Only an authenticated, supported native absence and explicit consent may switch source.
+      if (!result.comments.available && input.allowPublicWebFallback) {
+        result = await this.publicComments(
           lease,
-          result.comments,
-          captured.owner,
           result.binding,
-          channel,
+          captured.owner,
           input.sort,
-          0,
-          input.limit,
+          undefined,
+          5 - result.requests,
         );
-      },
-      deadline,
-    );
+        channel = 'public-web';
+      }
+      return this.commentsPage(
+        lease,
+        result.comments,
+        captured.owner,
+        result.binding,
+        channel,
+        input.sort,
+        0,
+        input.limit,
+      );
+    };
+    return encode
+      ? this.admittedFor(
+          invocation,
+          'comments.read',
+          [],
+          false,
+          action,
+          deadline,
+          encode,
+        )
+      : this.admittedFor(
+          invocation,
+          'comments.read',
+          [],
+          false,
+          action,
+          deadline,
+        );
   }
   private commentsPage(
     lease: Lease,
@@ -1517,7 +1825,11 @@ export class MusicService {
             ? opaque('mcur')
             : null,
       };
-      if (utf8Bytes(JSON.stringify(page)) <= MUSIC_LIMITS.pageBytes) break;
+      if (
+        utf8Bytes(JSON.stringify(page)) <=
+        musicReadPayloadLimit(lease.access.transport)
+      )
+        break;
       if (!comments.length) return failMusic('budget');
       comments.pop();
     }
@@ -1581,6 +1893,7 @@ export class MusicService {
       cursor.expires <= this.now()
     )
       return failMusic('not_found');
+    this.rememberSourceOwner(lease, cursor.owner);
     if (
       cursor.revision !== this.revision ||
       !musicAccessCurrent(cursor.access) ||
@@ -1672,18 +1985,42 @@ export class MusicService {
   async current(token: unknown, signal?: AbortSignal) {
     return this.currentFor(this.localInvocation(token, signal));
   }
-  currentFor(invocation: MusicInvocation, deadlineAt?: number) {
-    return this.admittedFor(
-      invocation,
-      'playback.read',
-      [],
-      true,
-      async (lease) => {
-        const captured = await this.native(lease, { operation: 'current' });
-        return parseNativeSnapshot(captured.value);
-      },
-      deadlineAt,
-    );
+  currentFor(
+    invocation: MusicInvocation,
+    deadlineAt?: number,
+  ): Promise<PlaybackSnapshot>;
+  currentFor(
+    invocation: MusicInvocation,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<PlaybackSnapshot>,
+  ): Promise<string>;
+  currentFor(
+    invocation: MusicInvocation,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<PlaybackSnapshot>,
+  ): Promise<PlaybackSnapshot | string> {
+    const action = async (lease: Lease) => {
+      const captured = await this.native(lease, { operation: 'current' });
+      return parseNativeSnapshot(captured.value);
+    };
+    return encode
+      ? this.admittedFor(
+          invocation,
+          'playback.read',
+          [],
+          true,
+          action,
+          deadlineAt,
+          encode,
+        )
+      : this.admittedFor(
+          invocation,
+          'playback.read',
+          [],
+          true,
+          action,
+          deadlineAt,
+        );
   }
   async queue(
     token: unknown,
@@ -1697,85 +2034,109 @@ export class MusicService {
     invocation: MusicInvocation,
     value: unknown,
     deadlineAt?: number,
-  ): Promise<QueuePage> {
+  ): Promise<QueuePage>;
+  queueFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<QueuePage>,
+  ): Promise<string>;
+  queueFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<QueuePage>,
+  ): Promise<QueuePage | string> {
     const input = parseMusicQueueInput(value);
-    return this.admittedFor(
-      invocation,
-      'playback.read',
-      [],
-      true,
-      async (lease) => {
-        if (!input.cursor) {
-          const captured = await this.native(lease, { operation: 'queue' });
-          return this.queuePage(
-            lease,
-            parseNativeQueue(captured.value),
-            captured.owner,
-            0,
-            input.limit,
-          );
-        }
-        const cursor = this.cursors.get(input.cursor);
+    const action = async (lease: Lease) => {
+      if (!input.cursor) {
+        const captured = await this.native(lease, { operation: 'queue' });
+        return this.queuePage(
+          lease,
+          parseNativeQueue(captured.value),
+          captured.owner,
+          0,
+          input.limit,
+        );
+      }
+      const cursor = this.cursors.get(input.cursor);
+      if (
+        !cursor ||
+        cursor.kind !== 'queue' ||
+        !sameMusicAccess(cursor.access, lease.access) ||
+        cursor.resource !== lease.resource ||
+        cursor.scope !== lease.scope ||
+        cursor.principal.id !== lease.principal.id ||
+        cursor.principal.digest !== lease.principal.digest ||
+        cursor.expires <= this.now()
+      )
+        return failMusic('not_found');
+      this.rememberSourceOwner(lease, cursor.owner);
+      if (
+        cursor.revision !== this.revision ||
+        !musicAccessCurrent(cursor.access) ||
+        !lease.current() ||
+        !cursor.owner.current() ||
+        !lease.current() ||
+        !this.grants.isCurrent(cursor.principal, cursor.scope) ||
+        !lease.current() ||
+        (cursor.issuerScope !== undefined &&
+          !this.grants.isCurrent(cursor.principal, cursor.issuerScope)) ||
+        !lease.current()
+      )
+        return failMusic('retired');
+      if (input.limit !== cursor.limit) return failMusic('invalid');
+      if (cursor.busy) return failMusic('busy');
+      cursor.busy = true;
+      try {
+        const captured = await this.native(lease, { operation: 'queue' });
+        const fresh = parseNativeQueue(captured.value);
         if (
-          !cursor ||
-          cursor.kind !== 'queue' ||
-          !sameMusicAccess(cursor.access, lease.access) ||
-          cursor.resource !== lease.resource ||
-          cursor.scope !== lease.scope ||
-          cursor.principal.id !== lease.principal.id ||
-          cursor.principal.digest !== lease.principal.digest ||
-          cursor.expires <= this.now()
-        )
-          return failMusic('not_found');
-        if (
-          cursor.revision !== this.revision ||
-          !musicAccessCurrent(cursor.access) ||
-          !lease.current() ||
+          fresh.queueRevision !== cursor.source.queueRevision ||
+          captured.owner.epoch !== cursor.owner.epoch ||
           !cursor.owner.current() ||
           !lease.current() ||
-          !this.grants.isCurrent(cursor.principal, cursor.scope) ||
-          !lease.current() ||
-          (cursor.issuerScope !== undefined &&
-            !this.grants.isCurrent(cursor.principal, cursor.issuerScope)) ||
-          !lease.current()
+          JSON.stringify(fresh) !== JSON.stringify(cursor.source)
         )
           return failMusic('retired');
-        if (input.limit !== cursor.limit) return failMusic('invalid');
-        if (cursor.busy) return failMusic('busy');
-        cursor.busy = true;
-        try {
-          const captured = await this.native(lease, { operation: 'queue' });
-          const fresh = parseNativeQueue(captured.value);
-          if (
-            fresh.queueRevision !== cursor.source.queueRevision ||
-            captured.owner.epoch !== cursor.owner.epoch ||
-            !cursor.owner.current() ||
-            !lease.current() ||
-            JSON.stringify(fresh) !== JSON.stringify(cursor.source)
-          )
-            return failMusic('retired');
-          if (cursor.replay) return structuredClone(cursor.replay);
-          const page = this.queuePage(
-            lease,
-            cursor.source,
-            captured.owner,
-            cursor.offset,
-            cursor.limit,
-          );
-          const bytes = utf8Bytes(JSON.stringify(page)) + 32;
-          if (this.bytes() + bytes > MUSIC_LIMITS.cacheBytes) {
-            if (page.nextCursor) this.cursors.delete(page.nextCursor);
-            return failMusic('budget');
-          }
-          cursor.bytes += bytes;
-          cursor.replay = structuredClone(page);
-          return page;
-        } finally {
-          cursor.busy = false;
+        if (cursor.replay) return structuredClone(cursor.replay);
+        const page = this.queuePage(
+          lease,
+          cursor.source,
+          captured.owner,
+          cursor.offset,
+          cursor.limit,
+        );
+        const bytes = utf8Bytes(JSON.stringify(page)) + 32;
+        if (this.bytes() + bytes > MUSIC_LIMITS.cacheBytes) {
+          if (page.nextCursor) this.cursors.delete(page.nextCursor);
+          return failMusic('budget');
         }
-      },
-      deadlineAt,
-    );
+        cursor.bytes += bytes;
+        cursor.replay = structuredClone(page);
+        return page;
+      } finally {
+        cursor.busy = false;
+      }
+    };
+    return encode
+      ? this.admittedFor(
+          invocation,
+          'playback.read',
+          [],
+          true,
+          action,
+          deadlineAt,
+          encode,
+        )
+      : this.admittedFor(
+          invocation,
+          'playback.read',
+          [],
+          true,
+          action,
+          deadlineAt,
+        );
   }
   private queuePage(
     lease: Lease,
@@ -1804,7 +2165,11 @@ export class MusicService {
     for (;;) {
       result.nextCursor =
         offset + items.length < source.items.length ? opaque('mcur') : null;
-      if (utf8Bytes(JSON.stringify(result)) <= MUSIC_LIMITS.pageBytes) break;
+      if (
+        utf8Bytes(JSON.stringify(result)) <=
+        musicReadPayloadLimit(lease.access.transport)
+      )
+        break;
       if (!items.length) return failMusic('budget');
       items.pop();
     }
@@ -1840,22 +2205,68 @@ export class MusicService {
   search(token: unknown, value: unknown, signal?: AbortSignal) {
     return this.catalog(token, parseMusicInput(value, 'search'), signal);
   }
-  searchFor(invocation: MusicInvocation, value: unknown, deadlineAt?: number) {
-    return this.catalogFor(
-      invocation,
-      parseMusicInput(value, 'search'),
-      deadlineAt,
-    );
+  searchFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+  ): Promise<MusicPage>;
+  searchFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicPage>,
+  ): Promise<string>;
+  searchFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicPage>,
+  ): Promise<MusicPage | string> {
+    return encode
+      ? this.catalogFor(
+          invocation,
+          parseMusicInput(value, 'search'),
+          deadlineAt,
+          encode,
+        )
+      : this.catalogFor(
+          invocation,
+          parseMusicInput(value, 'search'),
+          deadlineAt,
+        );
   }
   browse(token: unknown, value: unknown, signal?: AbortSignal) {
     return this.catalog(token, parseMusicInput(value, 'browse'), signal);
   }
-  browseFor(invocation: MusicInvocation, value: unknown, deadlineAt?: number) {
-    return this.catalogFor(
-      invocation,
-      parseMusicInput(value, 'browse'),
-      deadlineAt,
-    );
+  browseFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+  ): Promise<MusicPage>;
+  browseFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicPage>,
+  ): Promise<string>;
+  browseFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicPage>,
+  ): Promise<MusicPage | string> {
+    return encode
+      ? this.catalogFor(
+          invocation,
+          parseMusicInput(value, 'browse'),
+          deadlineAt,
+          encode,
+        )
+      : this.catalogFor(
+          invocation,
+          parseMusicInput(value, 'browse'),
+          deadlineAt,
+        );
   }
   home(
     token: unknown,
@@ -1869,8 +2280,22 @@ export class MusicService {
     invocation: MusicInvocation,
     value: unknown,
     deadlineAt?: number,
-  ): Promise<MusicPage> {
-    return this.collectionFor(invocation, value, 'home', deadlineAt);
+  ): Promise<MusicPage>;
+  homeFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicPage>,
+  ): Promise<string>;
+  homeFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicPage>,
+  ): Promise<MusicPage | string> {
+    return encode
+      ? this.collectionFor(invocation, value, 'home', deadlineAt, encode)
+      : this.collectionFor(invocation, value, 'home', deadlineAt);
   }
   library(
     token: unknown,
@@ -1884,42 +2309,81 @@ export class MusicService {
     invocation: MusicInvocation,
     value: unknown,
     deadlineAt?: number,
-  ): Promise<MusicPage> {
-    return this.collectionFor(invocation, value, 'library', deadlineAt);
+  ): Promise<MusicPage>;
+  libraryFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicPage>,
+  ): Promise<string>;
+  libraryFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicPage>,
+  ): Promise<MusicPage | string> {
+    return encode
+      ? this.collectionFor(invocation, value, 'library', deadlineAt, encode)
+      : this.collectionFor(invocation, value, 'library', deadlineAt);
   }
   private collectionFor(
     invocation: MusicInvocation,
     value: unknown,
     route: 'home' | 'library',
     deadlineAt?: number,
-  ): Promise<MusicPage> {
+  ): Promise<MusicPage>;
+  private collectionFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    route: 'home' | 'library',
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicPage>,
+  ): Promise<string>;
+  private collectionFor(
+    invocation: MusicInvocation,
+    value: unknown,
+    route: 'home' | 'library',
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicPage>,
+  ): Promise<MusicPage | string> {
     const input = parseMusicCollectionInput(value);
-    return this.admittedFor(
-      invocation,
-      route === 'home' ? 'personalized.read' : 'library.read',
-      [],
-      false,
-      async (lease) => {
-        if (input.cursor)
-          return this.next(lease, input.cursor, route, input.limit);
-        const captured = await this.native(lease, { operation: route });
-        const parsed = parseNativeCatalog(captured.value, 'browse');
-        const { source, seenPlaylistIds } =
-          route === 'library'
-            ? this.librarySource(parsed, [])
-            : { source: parsed, seenPlaylistIds: undefined };
-        return this.page(
-          lease,
-          { route },
-          source,
-          captured.owner,
-          0,
-          input.limit,
-          seenPlaylistIds,
+    const action = async (lease: Lease) => {
+      if (input.cursor)
+        return this.next(lease, input.cursor, route, input.limit);
+      const captured = await this.native(lease, { operation: route });
+      const parsed = parseNativeCatalog(captured.value, 'browse');
+      const { source, seenPlaylistIds } =
+        route === 'library'
+          ? this.librarySource(parsed, [])
+          : { source: parsed, seenPlaylistIds: undefined };
+      return this.page(
+        lease,
+        { route },
+        source,
+        captured.owner,
+        0,
+        input.limit,
+        seenPlaylistIds,
+      );
+    };
+    return encode
+      ? this.admittedFor(
+          invocation,
+          route === 'home' ? 'personalized.read' : 'library.read',
+          [],
+          false,
+          action,
+          deadlineAt,
+          encode,
+        )
+      : this.admittedFor(
+          invocation,
+          route === 'home' ? 'personalized.read' : 'library.read',
+          [],
+          false,
+          action,
+          deadlineAt,
         );
-      },
-      deadlineAt,
-    );
   }
   /** Bounded playlist-only first-occurrence projection; preserve shelf intersections. */
   private librarySource(source: NormalizedMusicSource, prior: string[]) {
@@ -1960,138 +2424,155 @@ export class MusicService {
     invocation: MusicInvocation,
     input: MusicClientInput,
     deadlineAt?: number,
-  ): Promise<MusicPage> {
+  ): Promise<MusicPage>;
+  private catalogFor(
+    invocation: MusicInvocation,
+    input: MusicClientInput,
+    deadlineAt: number | undefined,
+    encode: MusicReadEncoder<MusicPage>,
+  ): Promise<string>;
+  private catalogFor(
+    invocation: MusicInvocation,
+    input: MusicClientInput,
+    deadlineAt?: number,
+    encode?: MusicReadEncoder<MusicPage>,
+  ): Promise<MusicPage | string> {
     const extra: MusicScope[] =
       input.operation === 'browse' &&
       input.target.kind === 'playlist' &&
       personalCollection(input.target.id)
         ? ['library.read']
         : [];
-    return this.admittedFor(
-      invocation,
-      'catalog.read',
-      extra,
-      false,
-      async (lease) => {
-        if (input.operation === 'page')
-          return this.next(lease, input.cursor, input.route, input.limit);
-        let nativeInput: MusicReadInput, context: PageContext;
-        if (input.operation === 'search') {
-          const filters = {
-            song: 'songs',
-            video: 'videos',
-            album: 'albums',
-            artist: 'artists',
-            playlist: 'playlists',
-          } as const;
-          nativeInput = {
-            operation: 'search',
-            query: input.query,
-            ...(input.kind ? { filter: filters[input.kind] } : {}),
-          };
-          context = {
-            route: 'search',
-            query: input.query,
-            ...(input.kind ? { kind: input.kind } : {}),
-          };
-        } else {
-          const target = input.target;
-          context = { route: 'browse', target };
-          if (target.kind === 'reference') {
-            const reference = this.references.get(target.id);
-            if (
-              !reference ||
-              !sameMusicAccess(reference.access, lease.access) ||
-              reference.principal.id !== lease.principal.id ||
-              reference.principal.digest !== lease.principal.digest ||
-              reference.resource !== lease.resource ||
-              reference.expires <= this.now()
-            )
-              return failMusic('not_found');
-            if (
-              reference.revision !== this.revision ||
-              !musicAccessCurrent(reference.access) ||
-              !lease.current() ||
-              !reference.owner.current() ||
-              !lease.current() ||
-              !this.grants.isCurrent(reference.principal, reference.scope) ||
-              !lease.current() ||
-              (reference.issuerScope !== undefined &&
-                !this.grants.isCurrent(
+    const action = async (lease: Lease) => {
+      if (input.operation === 'page')
+        return this.next(lease, input.cursor, input.route, input.limit);
+      let nativeInput: MusicReadInput, context: PageContext;
+      if (input.operation === 'search') {
+        const filters = {
+          song: 'songs',
+          video: 'videos',
+          album: 'albums',
+          artist: 'artists',
+          playlist: 'playlists',
+        } as const;
+        nativeInput = {
+          operation: 'search',
+          query: input.query,
+          ...(input.kind ? { filter: filters[input.kind] } : {}),
+        };
+        context = {
+          route: 'search',
+          query: input.query,
+          ...(input.kind ? { kind: input.kind } : {}),
+        };
+      } else {
+        const target = input.target;
+        context = { route: 'browse', target };
+        if (target.kind === 'reference') {
+          const reference = this.references.get(target.id);
+          if (
+            !reference ||
+            !sameMusicAccess(reference.access, lease.access) ||
+            reference.principal.id !== lease.principal.id ||
+            reference.principal.digest !== lease.principal.digest ||
+            reference.resource !== lease.resource ||
+            reference.expires <= this.now()
+          )
+            return failMusic('not_found');
+          this.rememberSourceOwner(lease, reference.owner);
+          if (
+            reference.revision !== this.revision ||
+            !musicAccessCurrent(reference.access) ||
+            !lease.current() ||
+            !reference.owner.current() ||
+            !lease.current() ||
+            !this.grants.isCurrent(reference.principal, reference.scope) ||
+            !lease.current() ||
+            (reference.issuerScope !== undefined &&
+              !this.grants.isCurrent(
+                reference.principal,
+                reference.issuerScope,
+              )) ||
+            !lease.current()
+          )
+            return failMusic('retired');
+          if (reference.busy) return failMusic('busy');
+          reference.busy = true;
+          try {
+            await this.probeMetadata(
+              lease,
+              reference.binding ?? { videoId: '', playbackEpoch: null },
+              reference.owner,
+            );
+          } finally {
+            reference.busy = false;
+          }
+          if (reference.binding)
+            context = { ...context, binding: reference.binding };
+          const originLease = lease;
+          lease = {
+            ...originLease,
+            issuerScope: reference.issuerScope ?? reference.scope,
+            current: () =>
+              originLease.current() &&
+              reference.owner.current() &&
+              originLease.current() &&
+              this.grants.isCurrent(reference.principal, reference.scope) &&
+              originLease.current() &&
+              (!reference.issuerScope ||
+                (this.grants.isCurrent(
                   reference.principal,
                   reference.issuerScope,
-                )) ||
-              !lease.current()
-            )
-              return failMusic('retired');
-            if (reference.busy) return failMusic('busy');
-            reference.busy = true;
-            try {
-              await this.probeMetadata(
-                lease,
-                reference.binding ?? { videoId: '', playbackEpoch: null },
-                reference.owner,
-              );
-            } finally {
-              reference.busy = false;
-            }
-            if (reference.binding)
-              context = { ...context, binding: reference.binding };
-            const originLease = lease;
-            lease = {
-              ...originLease,
-              issuerScope: reference.issuerScope ?? reference.scope,
-              current: () =>
-                originLease.current() &&
-                reference.owner.current() &&
-                originLease.current() &&
-                this.grants.isCurrent(reference.principal, reference.scope) &&
-                originLease.current() &&
-                (!reference.issuerScope ||
-                  (this.grants.isCurrent(
-                    reference.principal,
-                    reference.issuerScope,
-                  ) &&
-                    originLease.current())),
-            };
-            nativeInput = {
-              operation: 'browse',
-              browseId: reference.browseId,
-              ...(reference.binding?.playbackEpoch
-                ? {
-                    expectedCurrent: reference.binding,
-                    deadlineAt: lease.deadline,
-                  }
-                : {}),
-              ...(reference.params ? { params: reference.params } : {}),
-            };
-          } else
-            nativeInput = {
-              operation: 'browse',
-              browseId:
-                target.kind === 'category'
-                  ? categoryTargets[target.id]
-                  : target.kind === 'playlist'
-                    ? `VL${target.id}`
-                    : target.id,
-            };
-        }
-        const captured = await this.native(lease, nativeInput);
-        const source = parseNativeCatalog(
-          captured.value,
-          nativeInput.operation === 'search' ? 'search' : 'browse',
+                ) &&
+                  originLease.current())),
+          };
+          nativeInput = {
+            operation: 'browse',
+            browseId: reference.browseId,
+            ...(reference.binding?.playbackEpoch
+              ? {
+                  expectedCurrent: reference.binding,
+                  deadlineAt: lease.deadline,
+                }
+              : {}),
+            ...(reference.params ? { params: reference.params } : {}),
+          };
+        } else
+          nativeInput = {
+            operation: 'browse',
+            browseId:
+              target.kind === 'category'
+                ? categoryTargets[target.id]
+                : target.kind === 'playlist'
+                  ? `VL${target.id}`
+                  : target.id,
+          };
+      }
+      const captured = await this.native(lease, nativeInput);
+      const source = parseNativeCatalog(
+        captured.value,
+        nativeInput.operation === 'search' ? 'search' : 'browse',
+      );
+      return this.page(lease, context, source, captured.owner, 0, input.limit);
+    };
+    return encode
+      ? this.admittedFor(
+          invocation,
+          'catalog.read',
+          extra,
+          false,
+          action,
+          deadlineAt,
+          encode,
+        )
+      : this.admittedFor(
+          invocation,
+          'catalog.read',
+          extra,
+          false,
+          action,
+          deadlineAt,
         );
-        return this.page(
-          lease,
-          context,
-          source,
-          captured.owner,
-          0,
-          input.limit,
-        );
-      },
-      deadlineAt,
-    );
   }
   private bytes() {
     return (
@@ -2203,7 +2684,11 @@ export class MusicService {
             ? opaque('mcur')
             : null,
       };
-      if (utf8Bytes(JSON.stringify(result)) <= MUSIC_LIMITS.pageBytes) break;
+      if (
+        utf8Bytes(JSON.stringify(result)) <=
+        musicReadPayloadLimit(lease.access.transport)
+      )
+        break;
       if (!projected.length) return failMusic('budget');
       projected.pop();
     }
@@ -2300,6 +2785,7 @@ export class MusicService {
       cursor.expires <= this.now()
     )
       return failMusic('not_found');
+    this.rememberSourceOwner(lease, cursor.owner);
     if (
       cursor.revision !== this.revision ||
       !musicAccessCurrent(cursor.access) ||

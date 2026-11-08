@@ -75,7 +75,7 @@ export function romanize(input){let resolve,reject;const promise=new Promise((ye
             return `export * from ${JSON.stringify(realSolid)};import{createSignal as original}from ${JSON.stringify(realSolid)};export function createSignal(value,...options){const[read,set]=original(value,...options);if(value!=='')return[read,set];return[read,(next)=>{window.romanizationWrites.push(next);return set(next)}]}`;
           if (id === '\0fixture-state') return state;
           if (id === '\0fixture-renderer')
-            return "export{config}from'fixture-state';export const currentTime=()=>0,LyricsRenderer=()=>null,setIsVisible=()=>{};";
+            return "export{config}from'fixture-state';export const currentTime=()=>0,isPlaying=()=>false,LyricsRenderer=()=>null,setIsVisible=()=>{};";
           if (id === '\0fixture-utils')
             return `export {canonicalize,simplifyUnicode,convertChineseCharacter} from ${JSON.stringify(actualUtils)};export{romanize}from'fixture-state';`;
           if (id === '\0fixture-api') return 'export const _ytAPI=null;';

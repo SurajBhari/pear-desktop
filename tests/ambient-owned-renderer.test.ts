@@ -162,15 +162,18 @@ function fixture(
     foreign = new FakeNode('foreign', () => {});
   wrapper.prepend(foreign);
   const page = {},
-    state = { open: true, videoMode: true };
+    state = {
+      open: true,
+      videoMode: true,
+      videoReady: !options.delayVideo,
+    };
   const nodes: FakeNode[] = [],
     draws: Draw[] = [];
   const intervals = new Map<number, { fn: Callback; delay: number }>(),
     frames = new Map<number, Callback>();
   let serial = 0,
     frameRequests = 0;
-  const configGate = deferred<Config>(),
-    videoGate = deferred<Video>();
+  const configGate = deferred<Config>();
   const observers: Observer[] = [];
   class Observer {
     active = false;
@@ -192,12 +195,15 @@ function fixture(
     }
   }
   const environment = {
+    AbortController,
     t: (key: string) => key,
     createPlugin: (value: unknown) => value,
     menu: {},
     style: '',
     document: {
       querySelector: (selector: string) => {
+        if (selector === '.html5-video-container > video')
+          return state.videoReady ? video : null;
         if (selector === '#song-image')
           return {
             querySelector: () => image,
@@ -221,10 +227,6 @@ function fixture(
     getComputedStyle: (target: Target) => {
       assert.equal(target, songVideo);
       return { display: state.videoMode ? 'block' : 'none' };
-    },
-    waitForElement: (selector: string) => {
-      assert.equal(selector, '.html5-video-container > video');
-      return options.delayVideo ? videoGate.promise : Promise.resolve(video);
     },
     MutationObserver: Observer,
     setInterval: (fn: Callback, delay: number) => {
@@ -294,7 +296,9 @@ function fixture(
     frames,
     observers,
     configGate,
-    videoGate,
+    setVideoReady: () => {
+      state.videoReady = true;
+    },
     get frameRequests() {
       return frameRequests;
     },
@@ -541,7 +545,7 @@ test('same-session replacement rejects old attachment handles and same-source re
   assert.equal(h.wrapper.children.has(h.foreign), true);
 });
 
-test('raw await completions are defensively retired without canceling helper promises or newer sessions', async () => {
+test('session retirement cancels config or target startup and stale starts cannot attach', async () => {
   for (const phase of ['config', 'video']) {
     const h = fixture({
       delayConfig: phase === 'config',
@@ -553,11 +557,21 @@ test('raw await completions are defensively retired without canceling helper pro
       settled = true;
     });
     await flush();
+    if (phase === 'video') {
+      await pending;
+      await flush();
+      assert.equal(settled, true, 'Target acquisition does not block start');
+      assert.equal(h.intervals.size, 1, 'Owned target poll is active');
+    }
     h.renderer.stop();
     await flush();
-    assert.equal(settled, false, 'Stop does not cancel the uncancellable wait');
+    if (phase === 'config')
+      assert.equal(settled, false, 'Config read is still awaited');
+    else {
+      assert.equal(h.intervals.size, 0, 'Stop cancels the target poll');
+    }
     h.configGate.resolve(h.config);
-    h.videoGate.resolve(h.video);
+    h.setVideoReady();
     await pending;
     assert.equal(
       h.observers.length,

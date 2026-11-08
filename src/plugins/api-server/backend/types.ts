@@ -2,6 +2,7 @@ import { type serve } from '@hono/node-server';
 import { type OpenAPIHono as Hono } from '@hono/zod-openapi';
 
 import type { APIServerConfig } from '../config';
+import type { McpListener } from './mcp';
 import type { MusicGrantStore } from './music-grant-store';
 import type { MusicHttpListenerOwner } from './music-http-policy';
 import type { MusicService } from './music-service';
@@ -14,6 +15,10 @@ export type HonoApp = Hono<{
   Variables: { playlistQueueSignal?: AbortSignal };
 }>;
 export type BackendType = {
+  mcpListener?: McpListener;
+  mcpRevision?: number;
+  retireMcpListener(): void;
+  configureMcp(config: APIServerConfig): void;
   app?: HonoApp;
   server?: ReturnType<typeof serve>;
   oldConfig?: APIServerConfig;

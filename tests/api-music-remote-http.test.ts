@@ -6,6 +6,80 @@ import {
   parseMusicRuntimeAdmission,
   assertMusicRuntimeObservations,
 } from './helpers/api-music-remote-http';
+import { musicModuleSource } from './helpers/api-music-source';
+
+test('Phase5 remote native grant authorizes useful read and revocation preserves local access', async () => {
+  const m = await musicModuleSource('src/plugins/api-server/music-menu.ts');
+  expect(typeof m.createRemoteMusicGrantMenu).toBe('function');
+  const f = await musicRemoteHttpFixture();
+  const copied: string[] = [],
+    choices = [0, 2, 0, 0];
+  const selected = f.config.musicApiRemoteResource;
+  try {
+    const menu = await m.createRemoteMusicGrantMenu(
+      {
+        window: f.window,
+        getConfig: () => f.config,
+        setConfig: () => {},
+        refresh: () => {},
+      },
+      (resource: string) =>
+        resource === selected && f.service.restAvailable(resource)
+          ? f.service
+          : undefined,
+      {
+        prompt: async () => 'Phase5 owned playback',
+        promptResource: async () => selected,
+        show: async (options: any) => ({
+          response:
+            options.title === 'Revoke music API client grant'
+              ? options.buttons.findIndex((label: string) =>
+                  label.startsWith('Phase5 owned playback'),
+                )
+              : choices.shift(),
+        }),
+        copy: (token: string) => {
+          copied.push(token);
+        },
+      },
+    );
+    await menu
+      .find((entry: any) => entry.label === 'Create client grant…')
+      .click();
+    expect(copied.length).toBe(1);
+    expect(
+      (await f.http('/api/v1/music/current', 'GET', undefined, {}, copied[0]))
+        .status,
+    ).toBe(200);
+    await menu
+      .find((entry: any) => entry.label === 'Revoke client grants…')
+      .click();
+    const before = f.sent.filter(
+      (packet: any[]) => packet[0] === 'peard:music-read',
+    ).length;
+    expect(
+      (await f.http('/api/v1/music/current', 'GET', undefined, {}, copied[0]))
+        .status,
+    ).toBe(401);
+    expect(
+      f.sent.filter((packet: any[]) => packet[0] === 'peard:music-read').length,
+    ).toBe(before);
+    expect(
+      (
+        await f.http(
+          '/api/v1/music/current',
+          'GET',
+          undefined,
+          { host: `127.0.0.1:${f.port}` },
+          f.local.token,
+        )
+      ).status,
+    ).toBe(200);
+  } finally {
+    await f.close();
+    copied.length = 0;
+  }
+});
 
 for (const tls of [false, true])
   test(`owned loopback ${tls ? 'TLS' : 'HTTP'} explicit remote audience stays separate from local grants`, async () => {

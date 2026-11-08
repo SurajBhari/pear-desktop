@@ -13,7 +13,7 @@ export async function menuFixture() {
     entry,
     `export * from ${JSON.stringify(path.join(root, 'src/menu.ts'))};export * from 'owned-state';export * from '@/i18n';`,
   );
-  const state = `export const state={imports:[],language:'en',restart:false,restartCloses:true,hold:false,pending:[],menus:[],dialogs:[],sends:[],loads:[],templateHold:false,templates:[],controlledPlugin:false,enabledHoldOnce:false,enabledHolds:[],beforeBuild:undefined,afterPublish:undefined};export const config={get:(id)=>id==='options.language'?state.language:id==='options.restartOnConfigChanges'?state.restart:undefined,setMenuOption:(id,value)=>{if(id==='options.language')state.language=value;if(state.restart&&state.restartCloses)state.window.destroyed=true;},plugins:{isEnabled:async(id)=>{if(id==='owned'&&state.enabledHoldOnce){state.enabledHoldOnce=false;await new Promise(resolve=>state.enabledHolds.push(resolve));}return id==='in-app-menu';},enable(){},disable(){}},set(){}};`;
+  const state = `export const state={nativeWindowAttempts:0,imports:[],language:'en',restart:false,restartCloses:true,hold:false,pending:[],menus:[],dialogs:[],sends:[],loads:[],templateHold:false,templates:[],controlledPlugin:false,enabledHoldOnce:false,enabledHolds:[],beforeBuild:undefined,afterPublish:undefined};export const config={get:(id)=>id==='options.language'?state.language:id==='options.restartOnConfigChanges'?state.restart:undefined,setMenuOption:(id,value)=>{if(id==='options.language')state.language=value;if(state.restart&&state.restartCloses)state.window.destroyed=true;},plugins:{isEnabled:async(id)=>{if(id==='owned'&&state.enabledHoldOnce){state.enabledHoldOnce=false;await new Promise(resolve=>state.enabledHolds.push(resolve));}return id==='in-app-menu';},enable(){},disable(){}},set(){}};`;
   await build({
     configFile: false,
     logLevel: 'silent',
@@ -22,6 +22,7 @@ export async function menuFixture() {
       emptyOutDir: false,
       lib: { entry, formats: ['es'], fileName: () => 'fixture.mjs' },
       minify: false,
+      rolldownOptions: { external: ['node:path', 'node:url'] },
     },
     plugins: [
       {
@@ -70,7 +71,7 @@ export async function menuFixture() {
           if (id === '\0i18n')
             return `import {createInstance} from 'i18next';import {createLanguageController} from ${JSON.stringify(path.join(root, 'src/i18n/language-controller.ts'))};import {availableLanguages,loadLanguageResource} from 'virtual:i18n';import {state} from 'owned-state';export const engine=createInstance();const controller=createLanguageController(engine,async id=>{state.loads.push(id);if(state.hold&&id==='ru')await new Promise(resolve=>state.pending.push(resolve));return await loadLanguageResource(id);},availableLanguages);export const {initialize:loadI18n,setLanguage}=controller;export const t=engine.t.bind(engine);export const APPLICATION_NAME='Owned fixture';`;
           if (id === '\0electron')
-            return `import {state} from 'owned-state';export const app={name:'Owned fixture',getVersion:()=> '3.13.0',getPath:()=> ''};export const Menu={buildFromTemplate:template=>{const hook=state.beforeBuild;state.beforeBuild=undefined;hook?.();return template;},setApplicationMenu:menu=>{state.menus.push(menu);const hook=state.afterPublish;state.afterPublish=undefined;hook?.();}};export const dialog={showMessageBox:async(win,options)=>{state.dialogs.push(options);return {response:0};}};export const shell={openExternal(){}};export const clipboard={};`;
+            return `import {state} from 'owned-state';export class BrowserWindow{constructor(){state.nativeWindowAttempts++;throw new Error('Unexpected BrowserWindow construction in the pure menu fixture');}};export const app={name:'Owned fixture',getVersion:()=> '3.13.0',getPath:()=> ''};export const Menu={buildFromTemplate:template=>{const hook=state.beforeBuild;state.beforeBuild=undefined;hook?.();return template;},setApplicationMenu:menu=>{state.menus.push(menu);const hook=state.afterPublish;state.afterPublish=undefined;hook?.();}};export const dialog={showMessageBox:async(win,options)=>{state.dialogs.push(options);return {response:0};}};export const shell={openExternal(){}};export const clipboard={};`;
           if (id === '\0loader')
             return `import {state} from 'owned-state';export const getAllMenuTemplate=()=>({});export const loadAllMenuPlugins=async()=>{if(state.templateHold)await new Promise(resolve=>state.templates.push(resolve));};`;
           if (id === '\0is')

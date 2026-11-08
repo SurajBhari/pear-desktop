@@ -1,3 +1,5 @@
+import { isAbsolute, relative, resolve, sep } from 'node:path';
+
 import { app, type BrowserWindow } from 'electron';
 import is from 'electron-is';
 
@@ -5,6 +7,14 @@ const pendingErrors = new WeakMap<BrowserWindow, string>();
 
 export const getFolder = (customFolder?: string) =>
   customFolder || app.getPath('downloads');
+
+/** Logical index ownership only; library operations still validate canonical paths. */
+export const getLibraryRoot = (configuredRoot: string, destination: string) => {
+  const within = relative(resolve(configuredRoot), resolve(destination));
+  return within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)
+    ? destination
+    : configuredRoot;
+};
 
 export const sendFeedback = (win: BrowserWindow, message?: unknown) => {
   if (win.isDestroyed() || win.webContents.isDestroyed()) return;

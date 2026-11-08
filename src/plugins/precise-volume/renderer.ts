@@ -538,7 +538,12 @@ export function createVolumeSession(deps: VolumeSessionDependencies) {
       deps.window,
       'keydown',
       (event) => {
-        if (!alive(ticket) || config?.arrowsShortcut !== true) return;
+        if (
+          !alive(ticket) ||
+          config?.arrowsShortcut !== true ||
+          event.defaultPrevented
+        )
+          return;
         const key = (event as KeyboardEvent).code;
         if (!['ArrowUp', 'ArrowDown'].includes(key)) return;
         const search = doc.querySelector<HTMLElement & { opened?: boolean }>(

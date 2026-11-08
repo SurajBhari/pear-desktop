@@ -14,6 +14,7 @@ export type SyncedLyricsPluginConfig = {
   timingOffsetMs?: number;
   romanizationSizePercent?: number;
   enhancedLrc?: boolean;
+  enableDownload?: boolean;
   convertChineseCharacter?:
     | 'simplifiedToTraditional'
     | 'traditionalToSimplified'

@@ -1,6 +1,5 @@
 import { t } from '@/i18n';
 import { createPlugin } from '@/utils';
-import { waitForElement } from '@/utils/wait-for-element';
 
 import { menu } from './menu';
 import style from './style.css?inline';
@@ -27,6 +26,7 @@ type AmbientAttachment = {
 type AmbientSession = {
   ticket: number;
   alive: boolean;
+  initialization: AbortController;
   observer: MutationObserver | null;
   fallback: ReturnType<typeof setInterval> | null;
   attachment: AmbientAttachment | null;
@@ -36,11 +36,44 @@ type AmbientSession = {
 function createAmbientRenderer() {
   let ticket = 0;
   let current: AmbientSession | null = null;
+  const waitForVideo = (signal: AbortSignal) =>
+    new Promise<HTMLVideoElement | null>((resolve) => {
+      if (signal.aborted) {
+        resolve(null);
+        return;
+      }
+
+      let interval: ReturnType<typeof setInterval> | undefined;
+      let settled = false;
+      const finish = (video: HTMLVideoElement | null) => {
+        if (settled) return;
+        settled = true;
+        if (interval !== undefined) clearInterval(interval);
+        signal.removeEventListener('abort', onAbort);
+        resolve(video);
+      };
+      const onAbort = () => finish(null);
+      const check = () => {
+        if (signal.aborted) {
+          finish(null);
+          return;
+        }
+        const video = document.querySelector<HTMLVideoElement>(
+          '.html5-video-container > video',
+        );
+        if (video) finish(video);
+      };
+
+      interval = setInterval(check, 100);
+      signal.addEventListener('abort', onAbort, { once: true });
+      check();
+    });
   const owns = (owner: AmbientSession) =>
     current === owner && owner.alive && owner.ticket === ticket;
   const retire = (owner: AmbientSession | null) => {
     if (!owner?.alive) return;
     owner.alive = false;
+    owner.initialization.abort();
     const observer = owner.observer;
     owner.observer = null;
     observer?.disconnect();
@@ -89,6 +122,7 @@ function createAmbientRenderer() {
       const owner: AmbientSession = {
         ticket: ++ticket,
         alive: true,
+        initialization: new AbortController(),
         observer: null,
         fallback: null,
         attachment: null,
@@ -108,11 +142,25 @@ function createAmbientRenderer() {
       const image = songImage?.querySelector<HTMLImageElement>(
         'yt-img-shadow > img',
       );
-      // This helper remains uncancellable. Gate its continuation, not its promise.
-      const video = await waitForElement<HTMLVideoElement>(
-        '.html5-video-container > video',
-      );
-      if (!owns(owner)) return;
+      renderer
+        .initialize(owner, songImage, songVideo, image)
+        .catch((error: unknown) => {
+          if (!owns(owner)) return;
+          current = null;
+          ticket++;
+          resetPointers();
+          retire(owner);
+          console.error('[ambient-mode] Failed to initialize renderer', error);
+        });
+    },
+    async initialize(
+      owner: AmbientSession,
+      songImage: HTMLImageElement | null,
+      songVideo: HTMLDivElement | null,
+      image: HTMLImageElement | null | undefined,
+    ): Promise<void> {
+      const video = await waitForVideo(owner.initialization.signal);
+      if (!video || !owns(owner)) return;
       const videoWrapper = document.querySelector(
         '#song-video > .player-wrapper',
       );

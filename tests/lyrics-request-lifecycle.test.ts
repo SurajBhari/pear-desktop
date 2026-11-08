@@ -8,6 +8,12 @@ import { Window } from 'happy-dom';
 import { build } from 'vite';
 import solidPlugin from 'vite-plugin-solid';
 
+import type { LRC } from '../src/plugins/synced-lyrics/parsers/lrc';
+import type {
+  LyricResult,
+  SearchSongInfo,
+} from '../src/plugins/synced-lyrics/types';
+
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
 const directory = path.join(root, 'src/plugins/synced-lyrics/renderer');
@@ -19,7 +25,7 @@ test.beforeAll(async () => {
   const entry = path.join(scratch, 'entry.tsx');
   await writeFile(
     entry,
-    `import{renderer,_ytAPI,exportCurrentLyrics}from ${JSON.stringify(path.join(directory, 'index.ts'))};import{fetchLyrics,retrySearch,lyricsStore,setLyricsStore,currentLyrics}from ${JSON.stringify(path.join(directory, 'store.ts'))};import{config,currentTime}from ${JSON.stringify(path.join(directory, 'renderer.tsx'))};import{providerIdx}from ${JSON.stringify(path.join(directory, 'components/LyricsPicker.tsx'))};import{tabStates}from ${JSON.stringify(path.join(directory, 'utils.tsx'))};import{pending,setSong}from'fixture-lyrics-state';window.lyricsFixture={exporter:()=>exportCurrentLyrics,renderer,fetchLyrics,retrySearch,lyricsStore,setLyricsStore,currentLyrics,config,currentTime,providerIdx,tabStates,pending,setSong,api:()=>_ytAPI};`,
+    `import{renderer,_ytAPI,exportCurrentLyrics}from ${JSON.stringify(path.join(directory, 'index.ts'))};import{fetchLyrics,retrySearch,lyricsStore,setLyricsStore,currentLyrics}from ${JSON.stringify(path.join(directory, 'store.ts'))};import{config,currentTime}from ${JSON.stringify(path.join(directory, 'renderer.tsx'))};import{providerIdx}from ${JSON.stringify(path.join(directory, 'components/LyricsPicker.tsx'))};import{tabStates}from ${JSON.stringify(path.join(directory, 'utils.tsx'))};import{pending,setSong}from'fixture-lyrics-state';import{LRC}from ${JSON.stringify(path.join(directory, '../parsers/lrc.ts'))};window.lyricsFixture={parseLrc:LRC.parse,exporter:()=>exportCurrentLyrics,renderer,fetchLyrics,retrySearch,lyricsStore,setLyricsStore,currentLyrics,config,currentTime,providerIdx,tabStates,pending,setSong,api:()=>_ytAPI};`,
   );
   const result = await build({
     root,
@@ -122,6 +128,127 @@ const cfg = {
   defaultTextString: '',
   showTimeCodes: false,
 };
+
+test('completed cache replay preserves final LRC clocks and isolates nested word edits', async ({
+  page,
+}) => {
+  await page.addScriptTag({ content: code });
+  const observed = await page.evaluate(async () => {
+    const state = (
+      window as unknown as {
+        lyricsFixture: {
+          parseLrc: typeof LRC.parse;
+          renderer: {
+            start(context: unknown): Promise<void>;
+            stop(): void;
+          };
+          setSong(song: SearchSongInfo): void;
+          fetchLyrics(song: SearchSongInfo): void;
+          setLyricsStore(...args: unknown[]): void;
+          currentLyrics(): { data: LyricResult | null };
+          pending: {
+            info: SearchSongInfo;
+            provider: string;
+            resolve(result: LyricResult | null): void;
+          }[];
+        };
+      }
+    ).lyricsFixture;
+    const flush = async () => {
+      for (let i = 0; i < 16; i++) await Promise.resolve();
+    };
+    const play = async (videoId: string) => {
+      const song = {
+        videoId,
+        title: videoId,
+        artist: 'fixture',
+        tags: [],
+        songDuration: 120,
+      };
+      state.setSong(song);
+      state.fetchLyrics(song);
+      await flush();
+    };
+    const snapshot = (data: LyricResult | null) => {
+      const line = data?.lines?.[1];
+      if (!line) throw new Error('Missing final fixture cue');
+      return { ...line, words: line.words?.map((word) => ({ ...word })) };
+    };
+    await state.renderer.start({
+      getConfig: () => Promise.resolve({ enabled: true }),
+      ipc: { invoke: () => Promise.resolve(), subscribe: () => () => {} },
+    });
+    try {
+      await play('A');
+      const data = {
+        title: 'A',
+        artists: ['fixture'],
+        lines: state
+          .parseLrc(
+            '[00:00.00]Intro\n[00:01.00]<00:01.00>  東京<00:01.50>\t👩🏽‍🚀 е́  ',
+          )
+          .lines.map((line) => ({ ...line, status: 'upcoming' as const })),
+      };
+      for (const request of state.pending)
+        request.resolve(request.provider === 'LRCLib' ? data : null);
+      await flush();
+      state.setLyricsStore('provider', 'LRCLib');
+      await play('B');
+      for (const request of state.pending)
+        if (request.info.videoId === 'B') request.resolve(null);
+      await flush();
+      const requestCount = state.pending.length;
+      await play('A');
+      const first = snapshot(state.currentLyrics().data);
+      state.setLyricsStore(
+        'lyrics',
+        'LRCLib',
+        'data',
+        'lines',
+        1,
+        'duration',
+        9,
+      );
+      state.setLyricsStore(
+        'lyrics',
+        'LRCLib',
+        'data',
+        'lines',
+        1,
+        'words',
+        0,
+        'word',
+        'edited',
+      );
+      await play('B');
+      await play('A');
+      return {
+        first,
+        second: snapshot(state.currentLyrics().data),
+        providerInput: snapshot(data),
+        extraRequests: state.pending.length - requestCount,
+      };
+    } finally {
+      state.renderer.stop();
+    }
+  });
+  const finalCue = {
+    time: '00:01:00',
+    timeInMs: 1000,
+    duration: Infinity,
+    text: '  東京\t👩🏽‍🚀 е́  ',
+    words: [
+      { timeInMs: 1000, word: '  東京' },
+      { timeInMs: 1500, word: '\t👩🏽‍🚀 е́  ' },
+    ],
+    status: 'upcoming',
+  };
+  expect(observed.first).toEqual(finalCue);
+  expect(observed.second).toEqual(finalCue);
+  expect(observed.providerInput).toEqual(finalCue);
+  expect(observed.extraRequests).toBe(0);
+});
+
 function fixture() {
   const window = new Window();
   const intervals = new Map<number, () => void>();
@@ -876,7 +1003,7 @@ test('export bridge rejects wrong native identity and retires captured calls on 
   }
 });
 
-test('current provider export works through the actual keyboard-accessible picker button', async ({
+test('lyrics export visibility is reactive and the button remains keyboard accessible', async ({
   page,
 }) => {
   await page.setContent(
@@ -947,15 +1074,51 @@ test('current provider export works through the actual keyboard-accessible picke
     });
   });
   const button = page.locator('.lyrics-export');
+  const status = page.locator('.lyrics-export-status');
+  await expect(button).toBeVisible();
   await expect(button).toBeEnabled();
   await button.focus();
   await page.keyboard.press('Enter');
-  await expect(page.locator('.lyrics-export-status')).toHaveText(
-    'Lyrics saved',
-  );
+  await expect(status).toHaveText('Lyrics saved');
   expect(await page.evaluate(() => (window as any).exportCalls)).toHaveLength(
     1,
   );
+  const searchesBeforeToggle = await page.evaluate(
+    () => (window as any).lyricsFixture.pending.length,
+  );
+  await page.evaluate(() => {
+    const f = (window as any).lyricsFixture;
+    f.renderer.onConfigChange({
+      enabled: true,
+      lineEffect: 'fancy',
+      romanization: false,
+      defaultTextString: '',
+      showTimeCodes: false,
+      enableDownload: false,
+    });
+  });
+  await expect(button).toBeHidden();
+  await expect(status).toBeHidden();
+  expect(await page.evaluate(() => (window as any).exportCalls)).toHaveLength(
+    1,
+  );
+  await page.evaluate(() => {
+    const f = (window as any).lyricsFixture;
+    f.renderer.onConfigChange({
+      enabled: true,
+      lineEffect: 'fancy',
+      romanization: false,
+      defaultTextString: '',
+      showTimeCodes: false,
+      enableDownload: true,
+    });
+  });
+  await expect(button).toBeVisible();
+  await expect(status).toHaveText('Lyrics saved');
+  expect(
+    await page.evaluate(() => (window as any).lyricsFixture.pending.length),
+  ).toBe(searchesBeforeToggle);
+  await button.focus();
   expect(
     await button.evaluate((node) => getComputedStyle(node).outlineStyle),
   ).not.toBe('none');
@@ -967,4 +1130,72 @@ test('current provider export works through the actual keyboard-accessible picke
       ),
     });
   await page.evaluate(() => (window as any).lyricsFixture.renderer.stop());
+});
+
+test('lyrics service errors show a readable retry state without exception details and recover through the selected provider', async () => {
+  const f = fixture();
+  try {
+    f.mountDom(true);
+    await f.state.renderer.start(f.context);
+    const api = f.api();
+    await f.state.renderer.onPlayerApiReady(api);
+    await f.track('A');
+    f.window.localStorage.setItem(
+      'ytmd-sl-starred-A',
+      JSON.stringify({ provider: 'LRCLib' }),
+    );
+    api.emit('dataupdated', { videoId: 'A' });
+    for (const pending of f.state.pending)
+      pending.provider === 'LRCLib'
+        ? pending.reject(
+            new Error(
+              'LRCLib HTTP 503 at file:///Users/private/renderer.js:42',
+            ),
+          )
+        : pending.resolve(null);
+    await settle();
+    expect(f.state.lyricsStore.provider).toBe('LRCLib');
+    const panel = f.window.document.querySelector('#synced-lyrics-container')!;
+    expect(panel.textContent).toContain('plugins.synced-lyrics.errors.fetch');
+    expect(panel.textContent).not.toMatch(/file:|Users|HTTP 503|renderer.js/);
+    expect(panel.querySelector('pre')).toBeNull();
+    const retry = panel.querySelector('button.lyrics-retry') as any;
+    expect(retry).not.toBeNull();
+    expect(retry.textContent).toBe('plugins.synced-lyrics.refetch-btn.normal');
+    retry.click();
+    await settle();
+    expect(f.request().provider).toBe('LRCLib');
+    f.request().resolve(result('Recovered lyrics'));
+    await settle();
+    expect(f.state.lyricsStore.provider).toBe('LRCLib');
+    expect(f.state.currentLyrics().data?.lyrics).toBe('Recovered lyrics');
+    expect(panel.querySelector('.lyrics-status')).toBeNull();
+    expect(
+      (panel.querySelector('.description yt-formatted-string') as any).text
+        .runs,
+    ).toEqual([{ text: 'Recovered lyrics' }]);
+  } finally {
+    await f.close();
+  }
+});
+
+test('an empty lyrics result explains that no lyrics were found instead of rendering only a shrug', async () => {
+  const f = fixture();
+  try {
+    f.mountDom(true);
+    await f.state.renderer.start(f.context);
+    await f.state.renderer.onPlayerApiReady(f.api());
+    await f.track('A');
+    for (const pending of f.state.pending) pending.resolve(null);
+    await settle();
+    const panel = f.window.document.querySelector('#synced-lyrics-container')!;
+    expect(panel.textContent).toContain(
+      'plugins.synced-lyrics.errors.not-found',
+    );
+    expect(panel.textContent).not.toContain(
+      'plugins.synced-lyrics.errors.fetch',
+    );
+  } finally {
+    await f.close();
+  }
 });

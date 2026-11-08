@@ -1,3 +1,4 @@
+import { rendererMusicActionsOwnerSource } from './helpers/playlist-provider-source';
 import { test, expect } from '@playwright/test';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import {
@@ -12,6 +13,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn, execFile } from 'node:child_process';
 import { build, normalizePath } from 'vite';
+import { headlessApiMenuBoundary } from './helpers/api-headless-menu-boundary';
 const root = path.resolve(import.meta.dirname, '..'),
   requireRoot = createRequire(path.join(root, 'package.json'));
 const nativeQueryQuarantine = new Set<any>();
@@ -777,6 +779,7 @@ export async function queueActionsNative<T>(
     'src/providers/queue-playlist-renderer.ts',
     'src/plugins/api-server/music-menu.ts',
     'tests/helpers/api-music-native.ts',
+    'tests/helpers/api-headless-menu-boundary.ts',
     'tests/helpers/electron-startup-observer.cjs',
   ];
   const factsPath = path.join(owned, 'startup-facts.json');
@@ -970,11 +973,7 @@ export async function queueActionsNative<T>(
         ].join('\n'),
       );
       const core = await readFile(path.join(root, 'src/renderer.ts'), 'utf8');
-      const init = core.slice(
-        core.indexOf('async function onApiLoaded() {') +
-          'async function onApiLoaded() {'.length,
-        core.indexOf('  // Workaround for macOS traffic lights'),
-      );
+      const init = rendererMusicActionsOwnerSource(core);
       await writeFile(
         rendererEntry,
         [
@@ -993,6 +992,7 @@ export async function queueActionsNative<T>(
         logLevel: 'silent' as const,
         resolve: { alias: {} },
         plugins: [
+          headlessApiMenuBoundary(root),
           {
             name: 'native-app-boundaries',
             enforce: 'pre' as const,

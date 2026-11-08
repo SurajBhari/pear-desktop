@@ -1,3 +1,4 @@
+import { rendererAudioFixtureSource } from './helpers/renderer-audio-source';
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
 import { Window } from 'happy-dom';
@@ -76,13 +77,8 @@ async function fixture(mode = 'ALL') {
       /initObserver\(\)\s*\.then\(preload\)[\s\S]*?;\s*$/,
       'export {onApiLoaded};',
     );
-  const audioProvider = stripTypeScriptTypes(
-    await readFile(
-      new URL('../src/providers/renderer-audio.ts', import.meta.url),
-      'utf8',
-    ),
-  ).replace(/^export /gm, '');
-  const boundaries = `const fixture=globalThis[${JSON.stringify(key)}];const window=fixture.dom;const document=window.document;const Element=window.Element;const HTMLElement=window.HTMLElement;const Event=window.Event;const CustomEvent=window.CustomEvent;const setTheme=()=>{};const registerWindowDefaultTrustedTypePolicy=()=>{};const LoggerPrefix='fixture';const retireLanguageRequests=()=>{};const i18t=x=>x;const getAllLoadedRendererPlugins=()=>({});const startingPages={};class AudioContext extends window.EventTarget{destination={};createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return{mediaElement:element,connect(){},disconnect(){}}}};`;
+  const audioProvider = await rendererAudioFixtureSource(false);
+  const boundaries = `const fixture=globalThis[${JSON.stringify(key)}];const window=fixture.dom;const document=window.document;const Element=window.Element;const HTMLElement=window.HTMLElement;const Event=window.Event;const CustomEvent=window.CustomEvent;const MutationObserver=window.MutationObserver;const setTheme=()=>{};const registerWindowDefaultTrustedTypePolicy=()=>{};const LoggerPrefix='fixture';const retireLanguageRequests=()=>{};const i18t=x=>x;const getAllLoadedRendererPlugins=()=>({});const startingPages={};class AudioContext extends window.EventTarget{destination={};createGain(){return {gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return{mediaElement:element,connect(){},disconnect(){}}}};`;
   const source = await import(
     `data:text/javascript;base64,${Buffer.from(boundaries + audioProvider + helper + (await playlistProviderSource()) + actual).toString('base64')}`
   );

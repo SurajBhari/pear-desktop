@@ -1,3 +1,4 @@
+import { rendererAudioFixtureSource } from './helpers/renderer-audio-source';
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
 import { test, expect } from '@playwright/test';
@@ -51,12 +52,7 @@ async function entry() {
       'utf8',
     ),
   );
-  const audio = strip(
-    await readFile(
-      new URL('../src/providers/renderer-audio.ts', import.meta.url),
-      'utf8',
-    ),
-  );
+  const audio = await rendererAudioFixtureSource(false);
   const raw = stripTypeScriptTypes(
     await readFile(new URL('../src/renderer.ts', import.meta.url), 'utf8'),
   )
@@ -67,7 +63,7 @@ async function entry() {
     );
   const key = 'queueEntry_' + crypto.randomUUID();
   (globalThis as any)[key] = { dom: f.dom, make: f.make };
-  const boundary = `const fixture=globalThis[${JSON.stringify(key)}];const window=fixture.dom;const document=window.document;const {Element,HTMLElement,Event,CustomEvent}=window;const createPlaylistQueueController=fixture.make;const setTheme=()=>{};const registerWindowDefaultTrustedTypePolicy=()=>{};const LoggerPrefix='fixture';const retireLanguageRequests=()=>{};const i18t=x=>x;const getAllLoadedRendererPlugins=()=>({});const startingPages={};class AudioContext extends window.EventTarget{destination={};createGain(){return{gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return{mediaElement:element,connect(){},disconnect(){}}}};`;
+  const boundary = `const fixture=globalThis[${JSON.stringify(key)}];const window=fixture.dom;const document=window.document;const {Element,HTMLElement,Event,CustomEvent,MutationObserver}=window;const createPlaylistQueueController=fixture.make;const setTheme=()=>{};const registerWindowDefaultTrustedTypePolicy=()=>{};const LoggerPrefix='fixture';const retireLanguageRequests=()=>{};const i18t=x=>x;const getAllLoadedRendererPlugins=()=>({});const startingPages={};class AudioContext extends window.EventTarget{destination={};createGain(){return{gain:{value:1},connect(){},disconnect(){}}}createMediaElementSource(element){return{mediaElement:element,connect(){},disconnect(){}}}};`;
   const source = await import(
     'data:text/javascript;base64,' +
       Buffer.from(boundary + actions + repeat + audio + raw).toString('base64')

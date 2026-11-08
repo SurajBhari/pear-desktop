@@ -22,6 +22,7 @@ import {
   configureLegacyClock,
   stopLegacyClock,
 } from './legacy-clock';
+import { publishMcpGrantTarget, retireMcpGrantTarget } from './mcp-owner';
 import { MusicGrantStore } from './music-grant-store';
 import {
   musicHttpResources,
@@ -45,6 +46,7 @@ import type { MiddlewareHandler } from 'hono';
 
 export const backend = createBackend<BackendType, APIServerConfig>({
   async start(ctx) {
+    this.retireMcpListener();
     this.retireMusicHttpOwner();
     if (this.musicWindow) stopLegacyClock(this.musicWindow);
     this.musicService?.stop();
@@ -106,6 +108,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     this.end();
   },
   onConfigChange(config) {
+    this.retireMcpListener();
     this.retireMusicHttpOwner();
     this.musicConfigRevision = (this.musicConfigRevision ?? 0) + 1;
     // Reconfiguration, including authorization changes, retires admitted playlist work.
@@ -306,7 +309,27 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       server.on('connection', (socket: object) => sockets.add(socket));
       server.on('secureConnection', (socket: object) => sockets.add(socket));
       server.once('listening', () => {
-        if (this.server === server) this.publishMusicHttpOwner();
+        if (this.server !== server) return;
+        this.publishMusicHttpOwner();
+        const owner = this.musicHttpOwner,
+          service = this.musicService,
+          window = this.musicWindow;
+        if (!owner || !service || !window || !service.enabled) return;
+        const isCurrent = () =>
+          this.musicHttpOwner === owner &&
+          this.server === server &&
+          this.musicService === service &&
+          this.musicWindow === window &&
+          !window.isDestroyed() &&
+          !window.webContents.isDestroyed() &&
+          owner.current();
+        // A startup menu may have captured unavailable REST access before bind.
+        // Fence its replacement to this exact listener/authorization lifetime.
+        import('@/menu')
+          .then(({ refreshMenu }) =>
+            isCurrent() ? refreshMenu(window, isCurrent) : undefined,
+          )
+          .catch(() => {});
       });
       const retired = () => {
         if (this.server === server) {
@@ -322,6 +345,7 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     }
   },
   end() {
+    this.retireMcpListener();
     this.retireMusicHttpOwner();
     this.musicHttpServer = undefined;
     this.musicHttpSockets = undefined;
@@ -392,9 +416,11 @@ export const backend = createBackend<BackendType, APIServerConfig>({
     this.musicConfig = { ...config };
     if (this.musicService) {
       this.musicService.configure(config);
+      this.configureMcp(config);
       return;
     }
-    if (!config.musicApiEnabled || !this.musicWindow) return;
+    if ((!config.musicApiEnabled && !config.mcpEnabled) || !this.musicWindow)
+      return;
     this.musicGrants ??= new MusicGrantStore(
       path.join(electronApp.getPath('userData'), 'music-client-grants'),
     );
@@ -403,6 +429,77 @@ export const backend = createBackend<BackendType, APIServerConfig>({
       config,
       grants: this.musicGrants,
       restListenerOwner: () => this.musicHttpOwner,
+      resolveAccessOwner: (transport, resource) =>
+        transport === 'mcp' && this.mcpListener?.resource === resource
+          ? this.mcpListener.owner
+          : undefined,
     });
+    this.configureMcp(config);
+  },
+  retireMcpListener() {
+    this.mcpRevision = (this.mcpRevision ?? 0) + 1;
+    const listener = this.mcpListener;
+    this.mcpListener = undefined;
+    if (listener) {
+      if (this.musicWindow) retireMcpGrantTarget(this.musicWindow, listener);
+      listener.stop().catch(() => {});
+    }
+  },
+  configureMcp(config) {
+    this.retireMcpListener();
+    const revision = this.mcpRevision,
+      service = this.musicService,
+      grants = this.musicGrants,
+      window = this.musicWindow;
+    const port = config.mcpPort ?? 26539;
+    if (
+      !config.enabled ||
+      !config.mcpEnabled ||
+      !service ||
+      !grants ||
+      !window ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65535
+    )
+      return;
+    import('./mcp')
+      .then(async ({ createMcpListener }) => {
+        if (
+          revision !== this.mcpRevision ||
+          this.musicService !== service ||
+          this.musicWindow !== window
+        )
+          return;
+        const listener = createMcpListener({ service, grants, port });
+        this.mcpListener = listener;
+        const isCurrent = () =>
+          revision === this.mcpRevision &&
+          this.mcpListener === listener &&
+          this.musicService === service &&
+          this.musicWindow === window &&
+          !window.isDestroyed() &&
+          !window.webContents.isDestroyed() &&
+          listener.owner.current();
+        try {
+          await listener.start();
+          if (!isCurrent()) {
+            await listener.stop();
+            return;
+          }
+          publishMcpGrantTarget(window, listener);
+          // Config-driven menus can snapshot before the asynchronous bind is ready.
+          // Keep later template publication fenced to this exact listener owner.
+          import('@/menu')
+            .then(({ refreshMenu }) =>
+              isCurrent() ? refreshMenu(window, isCurrent) : undefined,
+            )
+            .catch(() => {});
+        } catch {
+          if (this.mcpListener === listener) this.mcpListener = undefined;
+          await listener.stop();
+        }
+      })
+      .catch(() => {});
   },
 });

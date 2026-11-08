@@ -51,10 +51,27 @@ export class MusixMatch implements LyricProvider {
       title: track.track_name,
       artists: [track.artist_name],
       lines: subtitle
-        ? LRC.parse(subtitle.subtitle.subtitle_body).lines.map((l) => ({
-            ...l,
-            status: 'upcoming' as const,
-          }))
+        ? LRC.parse(subtitle.subtitle.subtitle_body).lines.map((line) => {
+            const prefix = line.text.match(/^[ \t]+/)?.[0].length ?? 0;
+            if (!prefix) return { ...line, status: 'upcoming' as const };
+
+            let remaining = prefix;
+            // Invalid joins stay plain-text fallbacks, never guessed word alignment.
+            const words =
+              line.words.map((word) => word.word).join('') === line.text
+                ? line.words.map((word) => {
+                    const removed = Math.min(remaining, word.word.length);
+                    remaining -= removed;
+                    return { ...word, word: word.word.slice(removed) };
+                  })
+                : [];
+            return {
+              ...line,
+              text: line.text.slice(prefix),
+              words,
+              status: 'upcoming' as const,
+            };
+          })
         : undefined,
       lyrics: lyrics,
     };

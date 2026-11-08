@@ -14,6 +14,7 @@ import viteResolve from 'vite-plugin-resolve';
 import solidPlugin from 'vite-plugin-solid';
 
 import { i18nImporter } from './vite-plugins/i18n-importer.mjs';
+import { mcpNoticesPlugin } from './vite-plugins/mcp-notices.mjs';
 import { pluginVirtualModuleGenerator } from './vite-plugins/plugin-importer.mjs';
 import pluginLoader from './vite-plugins/plugin-loader.mjs';
 
@@ -27,9 +28,14 @@ const resolveAlias = {
 export default defineConfig(({ mode }) => {
   const isDev = mode === 'development';
 
-  const mainAndPreloadExcludes = ['electron', 'custom-electron-prompt', ...builtinModules];
+  const mainAndPreloadExcludes = [
+    'electron',
+    'custom-electron-prompt',
+    ...builtinModules,
+  ];
   const mainConfig: MainViteConfig = {
     plugins: [
+      mcpNoticesPlugin(__dirname),
       pluginLoader('backend'),
       viteResolve({
         'virtual:i18n': i18nImporter(),

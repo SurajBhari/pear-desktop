@@ -1,0 +1,33 @@
+{
+  "format": 1,
+  "name": "@modelcontextprotocol/sdk",
+  "version": "1.32.0",
+  "qualification": "REGISTRY_ARCHIVE_INTEGRITY_AND_ORIGINAL_NOTICE_BYTES_VERIFIED_SOURCE_ONLY",
+  "registry": "https://registry.npmjs.org",
+  "publishedUTC": "2026-10-02T17:32:51.427Z",
+  "archiveUrl": "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.32.0.tgz",
+  "archiveIntegrity": "sha512-8BviX/hK4Gd2eL1KdTwm0gfl4d3wdoErW0Jd00h6nomUAtk6IJk5vwQJc6kfWtJTzN5OEV/lgIiJKI8fiDGAlA==",
+  "archiveSha1": "534d2c2793fd38a621edbca3238580fdb56898bc",
+  "archiveSha256": "41dd4776a00ed50eaaa43ee335e27363ad1f53c3b7fa27fd0f75c0520f5342ec",
+  "packageJsonSha256": "e2978955f1e20cce7a22ed5daea0bed7e7d8e0a0e1b8fe170773dd15787a51b3",
+  "originalNoticePath": "package/LICENSE",
+  "noticeSha256": "5e13dbbc1d120fc2a03cecde7c91424ae2d7de11b63d58ded2f4431e261ee50d",
+  "noticeBytes": 1071,
+  "licenseLabel": {
+    "registry_expression": "MIT",
+    "package_json_literal": "MIT",
+    "validation": "SOURCE_ONLY_NO_LICENSE_EXPRESSION_AUDIT"
+  },
+  "previousAcceptedInputHashes": {
+    "catalog": "aa4f779f9245b5df98046292dd9000fb96eb5308f6976bd0bcdebd9131c5c422",
+    "portableIndex": "e5df948807bc41b76a42ebcd0948c9a77f26b78964d12007fe6646237a44c08d",
+    "closure": "388775c9161abdbdde8bdd21243dac63f818350513fd11701b7976cd7fac5dbf"
+  },
+  "upgradeScope": "Replace only SDK 1.30.0 source identity with independently recaptured published SDK 1.32.0; other 93 accepted source records remain unchanged.",
+  "dependencyMetadataComparison": "All package.json fields except version are byte-equivalent after JSON parsing; no dependency, peer, engine or export change.",
+  "limits": [
+    "Source bytes and registry integrity only; no application-wide legal acceptance.",
+    "Identical LICENSE bytes do not reuse the old-version source identity.",
+    "Original source qualification limits for the other 93 records are retained."
+  ]
+}

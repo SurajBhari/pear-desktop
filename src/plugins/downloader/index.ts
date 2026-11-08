@@ -5,9 +5,9 @@ import { onConfigChange, onMainLoad, onMainStop } from './main';
 import { onMenu } from './menu';
 import { onPlayerApiReady, onRendererLoad, onRendererStop } from './renderer';
 import style from './style.css?inline';
-import { DefaultPresetList, type Preset } from './types';
 
 import type { AudioPreference, DuplicatePolicy } from './audio';
+import type { Preset } from './types';
 
 export type DownloaderPluginConfig = {
   enabled: boolean;
@@ -20,7 +20,7 @@ export type DownloaderPluginConfig = {
     folder?: string;
   };
   selectedPreset: string;
-  customPresetSetting: Preset;
+  customPresetSetting?: Preset;
   skipExisting: boolean;
   playlistMaxItems?: number;
   sourceAudio?: AudioPreference;
@@ -39,7 +39,8 @@ export const defaultConfig: DownloaderPluginConfig = {
     folder: undefined,
   },
   selectedPreset: 'mp3 (256kbps)', // Selected preset
-  customPresetSetting: DefaultPresetList['mp3 (256kbps)'], // Presets
+  // Merge defaults must not prepend arguments to a saved Custom recipe.
+  customPresetSetting: undefined,
   skipExisting: false,
   playlistMaxItems: undefined,
   sourceAudio: { mode: 'best', language: 'original', drc: false },

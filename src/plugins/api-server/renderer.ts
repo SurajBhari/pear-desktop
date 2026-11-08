@@ -58,7 +58,7 @@ const activate = () => {
   if (
     !running ||
     config?.enabled !== true ||
-    config.musicApiEnabled !== true ||
+    (config.musicApiEnabled !== true && config.mcpEnabled !== true) ||
     !currentApi ||
     !currentContext ||
     controller

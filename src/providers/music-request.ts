@@ -27,6 +27,16 @@ export interface MusicAdmission {
   readonly frame: WebFrameMain;
   readonly generation: number;
 }
+/** Main-owned per-source lifetime; distinct from admission/window retirement. */
+export interface MusicResultOwner {
+  readonly epoch: string;
+  readonly retirementSignal: AbortSignal;
+  current(): boolean;
+}
+interface SourceState {
+  retired: boolean;
+  controller: AbortController;
+}
 export type MusicPhysicalSettlementReason =
   | 'owned_settled'
   | 'authenticated_ack'
@@ -96,12 +106,13 @@ function buildMusicRequestBroker(window: BrowserWindow) {
     }
   };
   const retirementObservers = new Set<() => void>();
-  const resultOwners = new WeakMap<
-    object,
-    { epoch: string; current(): boolean }
-  >();
-  const sourceOwners = new Map<string, { retired: boolean }>();
-  const clockSourceOwners = new Map<string, { retired: boolean }>();
+  const resultOwners = new WeakMap<object, MusicResultOwner>();
+  const sourceOwners = new Map<string, SourceState>();
+  const clockSourceOwners = new Map<string, SourceState>();
+  const retireSourceState = (state: SourceState) => {
+    state.retired = true;
+    state.controller.abort();
+  };
   const alive = () => {
     try {
       return (
@@ -129,13 +140,21 @@ function buildMusicRequestBroker(window: BrowserWindow) {
   // Separate factory: cursor ownership must not retain a completed Pending,
   // its resolved value or its request callbacks through a closure environment.
   const resultOwnerFor = (
-    state: { retired: boolean },
+    state: SourceState,
     epoch: string,
     admission: MusicAdmission,
-  ) => ({
-    epoch,
-    current: () => !state.retired && current(admission),
-  });
+  ): MusicResultOwner =>
+    Object.freeze(
+      Object.defineProperty(
+        {
+          epoch,
+          retirementSignal: state.controller.signal,
+          current: () => !state.retired && current(admission),
+        },
+        'retirementSignal',
+        { enumerable: false },
+      ),
+    );
   const active = () =>
     [...records.values()].filter((r) => r.phase !== 'queued');
   const owned = (r: Pending) =>
@@ -167,12 +186,12 @@ function buildMusicRequestBroker(window: BrowserWindow) {
       const epoch = `${r.documentId}:${r.sourceId}`;
       let owner = owners.get(epoch);
       if (!owner) {
-        owner = { retired: false };
+        owner = { retired: false, controller: new AbortController() };
         owners.set(epoch, owner);
         if (owners.size > 128) {
           const oldest = owners.entries().next().value;
           if (oldest) {
-            oldest[1].retired = true;
+            retireSourceState(oldest[1]);
             owners.delete(oldest[0]);
           }
         }
@@ -375,7 +394,7 @@ function buildMusicRequestBroker(window: BrowserWindow) {
           const owner = (clock ? clockSourceOwners : sourceOwners).get(
             `${packet.documentId}:${packet.sourceId}`,
           );
-          if (owner) owner.retired = true;
+          if (owner) retireSourceState(owner);
         }
       } catch {
         return;

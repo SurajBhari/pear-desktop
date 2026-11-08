@@ -73,7 +73,7 @@ export function localMusicHttpResource(
     `${https ? 'https' : 'http'}://${advertised}:${config.port}${prefix}`,
   ).href;
 }
-function remoteResource(value: unknown): string | undefined {
+export function parseRemoteMusicResource(value: unknown): string | undefined {
   if (typeof value !== 'string') return;
   try {
     const url = new URL(value);
@@ -107,7 +107,7 @@ export function musicHttpResources(
   const local = localMusicHttpResource(config);
   const remote =
     config.musicApiRemoteEnabled === true
-      ? remoteResource(config.musicApiRemoteResource)
+      ? parseRemoteMusicResource(config.musicApiRemoteResource)
       : undefined;
   return Object.freeze({
     ...(local ? { local } : {}),

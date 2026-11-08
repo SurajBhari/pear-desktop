@@ -14,6 +14,7 @@ test('installed Ghostery teardown preserves BetterWebRequest app handlers, nativ
   const directory = await mkdtemp(
     path.join(tmpdir(), 'pear-blocker-session-test-'),
   );
+  let primaryFailed = false;
   try {
     const adapterPath = path.join(
       root,
@@ -117,7 +118,22 @@ const { ElectronBlocker } = requireRoot('@ghostery/adblocker-electron');
       expect(phase.requests).toEqual([result.unrelated]);
       expect(phase.preloads).toEqual(result.baselinePreloads);
     }
+  } catch (error) {
+    primaryFailed = true;
+    throw error;
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    try {
+      await rm(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 100,
+      });
+    } catch (error) {
+      if (!primaryFailed) throw error;
+      console.warn(
+        'Ghostery fixture cleanup also failed; the primary failure is preserved',
+      );
+    }
   }
 });

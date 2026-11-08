@@ -8,6 +8,8 @@ allowBuilds:
   unrs-resolver: true
   utf-8-validate: true
 overrides:
+  'express@5.3.0>body-parser': 2.4.0
+  '@modelcontextprotocol/sdk@1.32.0>jose': 6.2.12
   seroval: 1.6.3
   vite: 8.1.0
   node-gyp: 13.0.0
@@ -17,11 +19,14 @@ overrides:
   '@babel/runtime': 8.0.0
   '@xmldom/xmldom@<0.8.15': 0.8.15
 patchedDependencies:
+  app-builder-lib@26.15.3: patches/app-builder-lib@26.15.3.patch
   vudio@2.1.1: patches/vudio@2.1.1.patch
   '@malept/flatpak-bundler@0.4.0': patches/@malept__flatpak-bundler@0.4.0.patch
   kuromoji@0.1.2: patches/kuromoji@0.1.2.patch
   electron-is@3.0.0: patches/electron-is@3.0.0.patch
   mdui@2.1.4: patches/mdui@2.1.4.patch
+  '@modelcontextprotocol/sdk@1.32.0': patches/@modelcontextprotocol__sdk@1.32.0.patch
+  '@ffmpeg.wasm/main@0.12.0': patches/@ffmpeg.wasm__main@0.12.0.patch
 engineStrict: true
 minimumReleaseAgeExclude:
   - vite@8.1.0

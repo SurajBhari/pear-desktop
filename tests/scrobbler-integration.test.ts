@@ -1349,6 +1349,113 @@ test('metadata preparation cannot delay the admitted timer, publish after retire
   expect(f.calls).toHaveLength(2);
 });
 
+test('regex menu appends every Add using the latest list and refreshes after changes', async () => {
+  const f = await fixture();
+  f.config.customRegexFilters = [];
+  let refreshes = 0;
+  const menu = await f.module.onMenu({
+    ...f.context,
+    refresh() {
+      refreshes++;
+    },
+  });
+  const filters = menu.find(
+    (item: any) => item.label === 'plugins.scrobbler.menu.regex-filters',
+  ).submenu;
+  const add = filters.at(-1);
+  for (const pattern of ['first-pattern', 'second-pattern', 'third-pattern']) {
+    f.boundary.prompt = async () => pattern;
+    await add.click();
+  }
+  expect(f.config.customRegexFilters).toEqual([
+    'first-pattern',
+    'second-pattern',
+    'third-pattern',
+  ]);
+  expect(refreshes).toBe(3);
+});
+
+test('regex menu refuses a stale entry after deletion and refreshed entries edit the intended filter', async () => {
+  const f = await fixture();
+  f.config.customRegexFilters = ['first-pattern', 'second-pattern'];
+  let refreshes = 0;
+  let prompts = 0;
+  const context = { ...f.context, refresh: () => void refreshes++ };
+  const find = (menu: any) =>
+    menu.find(
+      (item: any) => item.label === 'plugins.scrobbler.menu.regex-filters',
+    ).submenu;
+  const entries = find(await f.module.onMenu(context));
+  f.boundary.prompt = async () => {
+    prompts++;
+    return '';
+  };
+  await entries[1].click();
+  expect(f.config.customRegexFilters).toEqual(['second-pattern']);
+  expect(refreshes).toBe(1);
+  f.boundary.prompt = async () => {
+    prompts++;
+    return 'third-pattern';
+  };
+  await entries[2].click();
+  expect(prompts).toBe(1);
+  expect(f.writes).toHaveLength(1);
+  const refreshed = find(await f.module.onMenu(context));
+  await refreshed[1].click();
+  expect(f.config.customRegexFilters).toEqual(['third-pattern']);
+  expect(refreshes).toBe(2);
+});
+
+test('regex Add from an old menu cannot overwrite the last filter at the limit', async () => {
+  const f = await fixture();
+  f.config.customRegexFilters = Array.from({ length: 31 }, (_, i) => `p${i}`);
+  const menu = await f.module.onMenu({ ...f.context, refresh() {} });
+  const add = menu
+    .find((item: any) => item.label === 'plugins.scrobbler.menu.regex-filters')
+    .submenu.at(-1);
+  let prompts = 0;
+  f.boundary.prompt = async () => {
+    prompts++;
+    return prompts === 1 ? 'last-pattern' : 'must-not-replace';
+  };
+  await add.click();
+  await add.click();
+  expect(prompts).toBe(1);
+  expect(f.config.customRegexFilters).toHaveLength(32);
+  expect(f.config.customRegexFilters.at(-1)).toBe('last-pattern');
+  expect(f.writes).toHaveLength(1);
+});
+
+for (const operation of ['add', 'edit']) {
+  test(`regex ${operation} result cannot overwrite a concurrent list update`, async () => {
+    const f = await fixture();
+    f.config.customRegexFilters = ['first-pattern'];
+    let refreshes = 0;
+    const menu = await f.module.onMenu({
+      ...f.context,
+      refresh: () => void refreshes++,
+    });
+    const entries = menu.find(
+      (item: any) => item.label === 'plugins.scrobbler.menu.regex-filters',
+    ).submenu;
+    const gate = deferred();
+    let opened = false;
+    f.boundary.prompt = () => {
+      opened = true;
+      return gate.promise;
+    };
+    const pending = (operation === 'add' ? entries.at(-1) : entries[1]).click();
+    await flush();
+    expect(opened).toBe(true);
+    f.config.customRegexFilters = ['newer-pattern'];
+    gate.resolve('late-pattern');
+    await pending;
+    expect(f.config.customRegexFilters).toEqual(['newer-pattern']);
+    expect(f.writes).toEqual([]);
+    expect(refreshes).toBe(0);
+  });
+}
+
 test('metadata menu requires explicit consent, writes leaves and fences stale contact prompts', async () => {
   const f = await fixture();
   let menu = await f.module.onMenu(f.context);

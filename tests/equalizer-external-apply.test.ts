@@ -35,7 +35,12 @@ test('external config apply prepares retained wet tail before a queued volume ev
         "class Ready extends DattorroReverbProcessor{handleMessage(data){super.handleMessage(data);if(data.type==='setParams')this.port.postMessage('ready')}};registerProcessor('dattorro-reverb',Ready);",
       );
       const addModule = ctx.audioWorklet.addModule.bind(ctx.audioWorklet);
-      ctx.audioWorklet.addModule = async () => {
+      ctx.audioWorklet.addModule = async (moduleUrl) => {
+        const moduleSource = await fetch(moduleUrl).then((response) =>
+          response.text(),
+        );
+        if (!moduleSource.includes("registerProcessor('dattorro-reverb'"))
+          return addModule(moduleUrl);
         const url = URL.createObjectURL(
           new Blob([raw], { type: 'application/javascript' }),
         );

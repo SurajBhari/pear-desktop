@@ -1,13 +1,158 @@
-import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { build } from 'vite';
+import { build, type Plugin } from 'vite';
 import solid from 'vite-plugin-solid';
 import { Window, PropertySymbol } from 'happy-dom';
+import { ts } from 'ts-morph';
 
 const root = path.resolve(import.meta.dirname, '../..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
+const electronRequest = (id: string) => {
+  const normalized = id.replaceAll('\\', '/');
+  return (
+    /^electron(?:\/|$)/i.test(normalized) ||
+    /(?:^|\/)node_modules\/electron(?:\/|$)/i.test(normalized)
+  );
+};
+const refuseElectron = (id: string): never => {
+  throw new Error(`OWNED_PLAYER_ACTIONS_ELECTRON_IMPORT_REFUSED: ${id}`);
+};
+
+/** The real importer must bind exactly the one fixture-owned value export. */
+function qualifyElectronSurface(code: string, id: string): boolean {
+  const source = ts.createSourceFile(
+    id,
+    code,
+    ts.ScriptTarget.Latest,
+    true,
+    id.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+  function refuse(): never {
+    throw new Error('OWNED_PLAYER_ACTIONS_ELECTRON_SURFACE_REFUSED');
+  }
+  const diagnostics = (
+    source as ts.SourceFile & { parseDiagnostics?: readonly unknown[] }
+  ).parseDiagnostics;
+  if (diagnostics?.length) refuse();
+  const literal = (node: ts.Node | undefined) =>
+    node &&
+    (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))
+      ? node.text
+      : undefined;
+  let named = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node)) {
+      const specifier = literal(node.moduleSpecifier);
+      if (specifier && electronRequest(specifier)) {
+        if (specifier !== 'electron') refuse();
+        const clause = node.importClause;
+        if (!clause?.isTypeOnly) {
+          const bindings = clause?.namedBindings;
+          if (
+            clause?.name ||
+            !bindings ||
+            !ts.isNamedImports(bindings) ||
+            node.attributes
+          )
+            refuse();
+          const values = bindings.elements.filter((item) => !item.isTypeOnly);
+          if (
+            values.length &&
+            (values.length !== 1 ||
+              (values[0].propertyName ?? values[0].name).text !==
+                'globalShortcut')
+          )
+            refuse();
+          if (values.length) named = true;
+        }
+      }
+    } else if (ts.isExportDeclaration(node)) {
+      const specifier = literal(node.moduleSpecifier);
+      if (
+        specifier &&
+        electronRequest(specifier) &&
+        (specifier !== 'electron' || !node.isTypeOnly)
+      )
+        refuse();
+    } else if (ts.isImportEqualsDeclaration(node)) {
+      const reference = node.moduleReference;
+      if (ts.isExternalModuleReference(reference)) {
+        const specifier = literal(reference.expression);
+        if (specifier && electronRequest(specifier)) refuse();
+      }
+    } else if (
+      ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) &&
+          node.expression.text === 'require'))
+    ) {
+      const specifier = literal(node.arguments[0]);
+      if (!specifier || electronRequest(specifier)) refuse();
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return named;
+}
+
+export function playerActionsElectronBoundary(ownedDirectory: string): Plugin {
+  const virtual = '\0player-actions-electron';
+  const ownedRoots = [path.join(root, 'src'), ownedDirectory].flatMap((base) =>
+    [base, realpathSync(base)].map(
+      (value) => value.replaceAll('\\', '/') + '/',
+    ),
+  );
+  const ownedSource = (id: string) =>
+    ownedRoots.some((base) => id.replaceAll('\\', '/').startsWith(base));
+  return {
+    name: 'controlled-player-electron-export',
+    enforce: 'pre' as const,
+    async resolveId(id: string, importer?: string) {
+      if (id === 'electron') {
+        const file = importer?.split('?')[0];
+        if (
+          !file ||
+          !ownedSource(file) ||
+          !qualifyElectronSurface(await readFile(file, 'utf8'), file)
+        )
+          refuseElectron(id);
+        return virtual;
+      }
+      if (electronRequest(id)) refuseElectron(id);
+      return undefined;
+    },
+    transform(code: string, id: string) {
+      const file = id.split('?')[0];
+      if (ownedSource(file) && /\.[cm]?[jt]sx?$/.test(file))
+        qualifyElectronSurface(code, file);
+    },
+    load(id: string) {
+      if (id !== virtual) return undefined;
+      return `
+const methods=['register','registerAll','unregister','unregisterAll','isRegistered'];
+const counts=Object.fromEntries(methods.map(method=>[method,0]));
+export const globalShortcut=Object.freeze(Object.fromEntries(methods.map(method=>[method,()=>{
+  throw Object.assign(new Error('OWNED_PLAYER_ACTIONS_SHORTCUT_INVOCATION_REFUSED'),{method,attempt:++counts[method]});
+}])));
+`;
+    },
+    generateBundle(_options, bundle) {
+      if ([...this.getModuleIds()].some(electronRequest))
+        refuseElectron('generated module graph');
+      for (const output of Object.values(bundle)) {
+        if (
+          output.type === 'chunk' &&
+          [...output.imports, ...output.dynamicImports].some(electronRequest)
+        )
+          refuseElectron('generated external import');
+      }
+    },
+  };
+}
+
 const deferred = () => {
   let resolve!: () => void;
   let reject!: (error: unknown) => void;
@@ -18,7 +163,17 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 
-export async function playerActionsFixture({ nativeTimers = false } = {}) {
+export async function playerActionsFixture({
+  nativeTimers = false,
+  onConstructionFailure,
+}: {
+  nativeTimers?: boolean;
+  onConstructionFailure?: (owned: {
+    dom: Window;
+    directory: string;
+    key: string;
+  }) => void | Promise<void>;
+} = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), 'pear-player-actions-'));
   const dom = new Window({ url: 'https://fixture.invalid/' });
   dom.document.body.innerHTML =
@@ -36,7 +191,9 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
     'Event',
     'AudioWorkletNode',
   ];
-  const saved = new Map(keys.map((key) => [key, globals[key]]));
+  const saved = new Map(
+    keys.map((key) => [key, Object.getOwnPropertyDescriptor(globals, key)]),
+  );
   const intervals = new Map<number, { fn: () => void; ms: number }>();
   const timeouts = new Map<number, { fn: () => void; ms: number }>();
   const activeObservers = new Set<unknown>();
@@ -118,6 +275,12 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
       cancelScheduledValues() {
         return this;
       },
+      cancelAndHoldAtTime() {
+        return this;
+      },
+      linearRampToValueAtTime(value: number) {
+        this.value = value;
+      },
       setValueAtTime(value: number) {
         this.value = value;
         return this;
@@ -152,8 +315,11 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
     }
   }
   class Worklet extends Node {
-    constructor(context: any) {
-      super(context, 'worklet');
+    constructor(context: any, name = 'dattorro-reverb') {
+      super(
+        context,
+        name === 'renderer-output-peak' ? 'output-worklet' : 'worklet',
+      );
     }
   }
   Object.assign(globals, {
@@ -168,13 +334,31 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
     Event: dom.Event,
     AudioWorkletNode: Worklet,
   });
+  const ownedGlobals = new Map(keys.map((name) => [name, globals[name]]));
   const entry = path.join(directory, 'entry.ts');
   await writeFile(
     entry,
     `export {default as plugin} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/index.ts'))};export {createSectionRepeatController} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/section-repeat/controller.ts'))};export {createSlowedReverbController} from ${JSON.stringify(path.join(root, 'src/plugins/player-actions/slowed-reverb/controller.ts'))};export * from '@/providers/renderer-audio';export * from '@/plugins/utils/renderer/player-panel';export * from '@/plugins/utils/renderer/playback-rate-owner';export {createAdSpeedup} from ${JSON.stringify(path.join(root, 'src/plugins/adblocker/ad-speedup.ts'))};export * as playbackSpeed from ${JSON.stringify(path.join(root, 'src/plugins/playback-speed/renderer.tsx'))};export {default as playbackSpeedPlugin} from ${JSON.stringify(path.join(root, 'src/plugins/playback-speed/index.ts'))};`,
   );
   const output = path.join(directory, 'actual.cjs');
-  await build({
+  const releaseEnvironment = async () => {
+    delete requireRoot.cache[output];
+    if (globals[key] === clock) delete globals[key];
+    try {
+      await dom.happyDOM.close();
+    } finally {
+      try {
+        await rm(directory, { recursive: true, force: true });
+      } finally {
+        for (const [name, descriptor] of saved) {
+          if (globals[name] !== ownedGlobals.get(name)) continue;
+          if (descriptor) Object.defineProperty(globals, name, descriptor);
+          else delete globals[name];
+        }
+      }
+    }
+  };
+  const source = await build({
     root,
     configFile: false,
     logLevel: 'silent',
@@ -187,11 +371,13 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
           ]),
         ),
     plugins: [
+      playerActionsElectronBoundary(directory),
       solid(),
       {
         name: 'controlled-player-native-boundaries',
         enforce: 'pre',
         async resolveId(id: string, importer?: string) {
+          if (electronRequest(id)) refuseElectron(id);
           if (id === 'solid-js')
             return requireRoot
               .resolve('solid-js/dist/solid.js')
@@ -267,8 +453,20 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
       minify: false,
       lib: { entry, formats: ['cjs'], fileName: () => 'actual.cjs' },
     },
-  });
-  const source = requireRoot(output);
+  })
+    .then(() => requireRoot(output))
+    .catch(async (error: unknown) => {
+      try {
+        await releaseEnvironment();
+        await onConstructionFailure?.({ dom, directory, key });
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Player-actions fixture construction and cleanup failed',
+        );
+      }
+      throw error;
+    });
   function video() {
     const media = dom.document.querySelector('video')! as any;
     if (!trackedMedia.has(media)) {
@@ -301,6 +499,7 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
   }
   const media = video();
   const graph = (id: string) => {
+    let firstOutputModule = true;
     const context: any = {
       id,
       destination: { id: 'destination-' + id },
@@ -311,8 +510,15 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
       removeEventListener() {},
       createGain: () => new Node(context, 'gain'),
       createBiquadFilter: () => new Node(context, 'biquad'),
+      createWaveShaper: () => new Node(context, 'fault-guard'),
       audioWorklet: {
         addModule: (url: string) => {
+          // The renderer output module has separate native/failure coverage.
+          // Keep the existing deferred seam specific to Dattorro registration.
+          if (firstOutputModule) {
+            firstOutputModule = false;
+            return Promise.resolve();
+          }
           const d = deferred();
           loads.push({ url, resolve: () => d.resolve(), reject: d.reject });
           return d.promise;
@@ -386,14 +592,7 @@ export async function playerActionsFixture({ nativeTimers = false } = {}) {
       for (let i = 0; i < 8; i++) await Promise.resolve();
       intervals.clear();
       timeouts.clear();
-      delete requireRoot.cache[output];
-      delete globals[key];
-      await dom.happyDOM.close();
-      await rm(directory, { recursive: true, force: true });
-      for (const [name, value] of saved) {
-        if (value === undefined) delete globals[name];
-        else globals[name] = value;
-      }
+      await releaseEnvironment();
     },
   };
 }

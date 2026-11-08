@@ -7,6 +7,10 @@ import {
   type NativeQueueActionValue,
 } from '@/plugins/api-server/music-types';
 
+import {
+  createPlaybackNavigation,
+  type PlaybackNavigation,
+} from './playback-navigation';
 import { isPlaylistId, isVideoId, isInsertPosition } from './queue-playlist';
 
 import type { createMusicQueueOwner } from './music-queue';
@@ -15,6 +19,7 @@ import type { createRepeatPreference } from './repeat-preference';
 import type { MusicPlayer } from '@/types/music-player';
 
 type Bindings = {
+  navigation?: PlaybackNavigation;
   repeatPreference: ReturnType<typeof createRepeatPreference>;
   playlistQueue: ReturnType<typeof createPlaylistQueueController>;
   getApi(this: void): MusicPlayer | null;
@@ -25,8 +30,12 @@ type ActionsOwner = Readonly<Bindings> & {
 };
 const owners = new WeakMap<MusicPlayer, ActionsOwner>();
 const retirees = new WeakMap<ActionsOwner, () => void>();
+const publicationRevisions = new WeakMap<MusicPlayer, symbol>();
 /** Import-safe bridge to the core's existing instances; publication has no native effect. */
 export function publishMusicActionsOwner(api: MusicPlayer, bindings: Bindings) {
+  const revision = Symbol('music-actions-publication');
+  publicationRevisions.set(api, revision);
+  const latest = () => publicationRevisions.get(api) === revision;
   const previous = owners.get(api);
   if (previous) retirees.get(previous)?.();
   const page = window,
@@ -47,8 +56,30 @@ export function publishMusicActionsOwner(api: MusicPlayer, bindings: Bindings) {
     // An unsupported proof must not interrupt unrelated core startup.
   }
   let active = true;
+  let published: ActionsOwner | undefined;
+  let navigation = bindings.navigation;
+  if (!navigation && rootQuery && publishingDocument) {
+    try {
+      if (
+        Reflect.apply(rootQuery, api, [{ composed: true }]) ===
+        publishingDocument
+      )
+        navigation = createPlaybackNavigation(
+          api,
+          () =>
+            latest() &&
+            !!published &&
+            owners.get(api) === published &&
+            published.current() &&
+            published.nativeCurrent(),
+        );
+    } catch {
+      // Unsupported navigation proof must not disable ordinary core controls.
+    }
+  }
   const owner: ActionsOwner = Object.freeze({
     ...bindings,
+    navigation,
     nativeCurrent: () => {
       if (!rootQuery || !publishingDocument) return false;
       try {
@@ -63,25 +94,36 @@ export function publishMusicActionsOwner(api: MusicPlayer, bindings: Bindings) {
       }
     },
     current: () => {
-      if (!active || owners.get(api) !== owner) return false;
+      if (!active || !latest() || owners.get(api) !== owner) return false;
       const current = getApi();
       return (
         active &&
+        latest() &&
         owners.get(api) === owner &&
         current === api &&
         (api as MusicPlayer & Partial<HTMLElement>).isConnected !== false &&
-        active
+        active &&
+        latest()
       );
     },
   });
   const dispose = () => {
     if (!active) return;
     active = false;
+    navigation?.dispose();
     if (owners.get(api) === owner) owners.delete(api);
     page.removeEventListener('pagehide', dispose);
     retirees.delete(owner);
   };
+  // Native listener registration can synchronously publish a successor. The
+  // earlier constructor must retire only its own observer, never adopt over it.
+  if (!latest()) {
+    active = false;
+    navigation?.dispose();
+    return () => {};
+  }
   owners.set(api, owner);
+  published = owner;
   retirees.set(owner, dispose);
   page.addEventListener('pagehide', dispose);
   return dispose;
@@ -401,9 +443,26 @@ export function dispatchMusicControl(
     cancel();
     fence();
   }
+  // Sample before the last provider fence. Only private scalar arming may occur
+  // after it; navigation proof failure never prevents the ordinary command.
+  const navigationTicket =
+    command.action === 'previous'
+      ? owner.navigation?.preparePrevious()
+      : undefined;
+  if (['next', 'seek', 'toggle_shuffle'].includes(command.action))
+    owner.navigation?.cancel();
+  else if (command.action !== 'previous') owner.navigation?.interrupt();
+  const armNavigation = navigationTicket?.arm;
+  fence();
   // No playback fence after invocation: the delivered command may itself change tracks.
   context.enter();
-  target();
+  armNavigation?.();
+  try {
+    target();
+  } catch (error) {
+    navigationTicket?.cancel();
+    throw error;
+  }
   after?.();
   return { version: 1, phase: 'owned_control_dispatch' };
 }
@@ -483,6 +542,7 @@ export function startMusicQueueAction(
 ) {
   const owner = getMusicActionsOwner(api);
   if (!owner) throw new MusicServiceError('unavailable');
+  owner.navigation?.cancel();
   const links: Link[] = [],
     absent: { object: object; key: string }[] = [];
   const current = () =>

@@ -1,0 +1,14 @@
+diff --git a/out/targets/snap/coreLegacy.js b/out/targets/snap/coreLegacy.js
+--- a/out/targets/snap/coreLegacy.js
++++ b/out/targets/snap/coreLegacy.js
+@@ -246,8 +246,8 @@ class SnapCoreLegacy extends SnapTarget_1.SnapCore {
+         builder_util_1.log.info({ releaseName }, "downloading snap template");
+         const templateDir = await (0, electronGet_1.downloadBuilderToolset)({ releaseName, filenameWithExt, checksums, githubOrgRepo: "electron-userland/electron-builder-binaries" });
+         await this.stageSnapFiles({ stageDir, appOutDir, hooksDir, extraAppArgs, isTemplate: true });
+-        // Best-effort: remove chrome-sandbox from app dir before mksquashfs scans it.
+-        await (0, promises_1.rm)(path.join(appOutDir, "chrome-sandbox"), { force: true });
++        // Keep the shared app directory intact for parallel targets.
++        // readDirPaths below excludes chrome-sandbox from this Snap's inputs.
+         // chmod -R g-s to avoid setgid bits in final image
+         for (const dir of [stageDir, appOutDir, templateDir]) {
+             await (0, builder_util_1.exec)("chmod", ["-R", "g-s", dir]).catch(err => builder_util_1.log.warn({ error: err.message }, "chmod g-s failed"));

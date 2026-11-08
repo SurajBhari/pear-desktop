@@ -674,3 +674,27 @@ test('owned queue snapshot reads real native methods without catalog fetch and r
     f.controller.dispose(); expect(listeners.size).toBe(0);
   } finally { f.close(); }
 });
+
+test('MCP-only and combined configuration share one renderer controller and both-off retires it', async () => {
+  const f = await admissionFixture({ enabled: true, musicApiEnabled: false, mcpEnabled: true } as any);
+  try {
+    await f.renderer.start(f.context);
+    await f.renderer.onPlayerApiReady(f.api, f.context);
+    f.query();
+    expect(f.sent.filter((row: any) => row.packet.type === 'ready')).toHaveLength(1);
+    f.sent.length = 0;
+    await f.renderer.onConfigChange?.({enabled: true, musicApiEnabled: true, mcpEnabled: true});
+    f.sent.length = 0;
+    f.query();
+    expect(f.sent.filter((row: any) => row.packet.type === 'ready')).toHaveLength(1);
+    f.sent.length = 0;
+    await f.renderer.onConfigChange?.({enabled: true, musicApiEnabled: false, mcpEnabled: false});
+    expect(f.sent.map((row: any) => row.packet.type)).toEqual(['retire']);
+    f.sent.length = 0;
+    const before = f.probes();
+    await admissionTick();
+    f.query();
+    expect(f.sent).toEqual([]);
+    expect(f.probes()).toBe(before);
+  } finally { await f.close(); }
+});

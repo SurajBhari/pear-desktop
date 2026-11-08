@@ -27,6 +27,10 @@ const leaseLifetimes = new WeakMap<
   MusicGrantRecord,
   { store: MusicGrantStore; signal: AbortSignal }
 >();
+// Deliberately captured once; every use supplies the exact native signal receiver.
+const nativeAborted: (this: AbortSignal) => boolean =
+  // oxlint-disable-next-line typescript/unbound-method -- Captured native getter; every use calls it with the exact signal receiver.
+  Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
 /** Main-only negative fence; exact object provenance, with no authority callouts. */
 export function musicGrantLifetimeSignal(
   store: MusicGrantStore,
@@ -294,6 +298,55 @@ export class MusicGrantStore {
       );
     });
   }
+  private principal(record: MusicGrantRecord): MusicGrantRecord {
+    const lease = structuredClone(record);
+    Object.freeze(lease.scopes);
+    leaseLifetimes.set(lease, {
+      store: this,
+      signal: this.epochs.get(record.id)!.controller.signal,
+    });
+    return Object.freeze(lease);
+  }
+  /** Authenticate identity without inventing a permission for initialize/list. */
+  authenticate(
+    token: unknown,
+    transport: MusicTransport,
+    resource: string,
+  ): Promise<MusicGrantRecord> {
+    return this.transact(async () => {
+      await this.load();
+      const record = this.records!.find((r) =>
+        grantMatches(r, token, transport, resource, this.now()),
+      );
+      if (!record) return failMusic('unauthorized');
+      return this.principal(record);
+    });
+  }
+  /** Only this store's authenticated, still-current exact epoch is a principal. */
+  isCurrentPrincipal(record: MusicGrantRecord): boolean {
+    const lifetime = leaseLifetimes.get(record);
+    const epoch = this.epochs.get(record.id);
+    if (
+      lifetime?.store !== this ||
+      !epoch ||
+      epoch.controller.signal !== lifetime.signal ||
+      nativeAborted.call(lifetime.signal)
+    )
+      return false;
+    const current = epoch.record;
+    return (
+      this.records?.some((r) => r.id === current.id) === true &&
+      current.digest === record.digest &&
+      current.transport === record.transport &&
+      current.resource === record.resource &&
+      current.createdAt === record.createdAt &&
+      current.expiresAt === record.expiresAt &&
+      current.scopes.length === record.scopes.length &&
+      current.scopes.every((scope) => record.scopes.includes(scope)) &&
+      this.now() >= current.createdAt &&
+      this.now() < current.expiresAt
+    );
+  }
   authorize(
     token: unknown,
     transport: MusicTransport,
@@ -307,13 +360,7 @@ export class MusicGrantStore {
       );
       if (!record) return failMusic('unauthorized');
       if (!record.scopes.includes(scope)) return failMusic('forbidden');
-      const lease = structuredClone(record);
-      Object.freeze(lease.scopes);
-      leaseLifetimes.set(lease, {
-        store: this,
-        signal: this.epochs.get(record.id)!.controller.signal,
-      });
-      return Object.freeze(lease);
+      return this.principal(record);
     });
   }
   isCurrent(record: MusicGrantRecord, scope: MusicScope): boolean {

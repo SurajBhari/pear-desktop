@@ -716,3 +716,153 @@ test('N1 optional physical hook preserves exact legacy clock ABI and millisecond
     f.broker.dispose();
   }
 });
+
+test('source result retirement signal is monotonic while admission remains live', async () => {
+  const f = await musicRequestFixture();
+  try {
+    const admission = f.broker.capture();
+    const pending = f.read();
+    f.ready();
+    f.settled();
+    const owner = f.broker.resultOwner(await pending);
+    expect(owner.retirementSignal.aborted).toBe(false);
+    expect(
+      Object.getOwnPropertyDescriptor(owner, 'retirementSignal'),
+    ).toMatchObject({ enumerable: false, writable: false });
+    expect(JSON.stringify(owner)).toBe(
+      JSON.stringify({ epoch: '1'.repeat(32) + ':' + '2'.repeat(32) }),
+    );
+    f.emit(
+      { type: 'retire', documentId: '1'.repeat(32), sourceId: '2'.repeat(32) },
+      {},
+    );
+    expect(owner.retirementSignal.aborted).toBe(false);
+    f.emit({
+      type: 'retire',
+      documentId: '1'.repeat(32),
+      sourceId: '2'.repeat(32),
+    });
+    expect(owner.retirementSignal.aborted).toBe(true);
+    expect(f.broker.isCurrent(admission)).toBe(true);
+  } finally {
+    f.broker.dispose();
+  }
+});
+
+test('source signal catches non-atomic current frame reentry and keeps old owner shape', async () => {
+  const f = await musicRequestFixture();
+  try {
+    const pending = f.read();
+    f.ready();
+    f.settled();
+    const owner = f.broker.resultOwner(await pending);
+    const frame = f.contents.mainFrame;
+    let armed = true;
+    Object.defineProperty(f.contents, 'mainFrame', {
+      configurable: true,
+      get() {
+        if (armed) {
+          armed = false;
+          f.emit({
+            type: 'retire',
+            documentId: '1'.repeat(32),
+            sourceId: '2'.repeat(32),
+          });
+        }
+        return frame;
+      },
+    });
+    expect(owner.current()).toBe(true);
+    expect(owner.retirementSignal.aborted).toBe(true);
+    expect(Object.isFrozen(owner)).toBe(true);
+    expect(Object.keys(owner)).toEqual(['epoch', 'current']);
+  } finally {
+    f.broker.dispose();
+  }
+});
+
+test('bounded source epoch eviction retires an old signal without rotating admission', async () => {
+  const f = await musicRequestFixture();
+  try {
+    const admission = f.broker.capture();
+    let oldest: any;
+    for (let index = 0; index < 129; index++) {
+      const sourceId = (index + 2).toString(16).padStart(32, '0');
+      const pending = f.read();
+      const packet = f.challenge(index);
+      f.ready(packet, '1'.repeat(32), sourceId);
+      f.emit({
+        ...packet,
+        type: 'settled',
+        documentId: '1'.repeat(32),
+        sourceId,
+        result: {
+          ok: true,
+          value: {
+            version: 1,
+            items: [],
+            shelves: [],
+            continuation: null,
+            targetRecipes: [],
+          },
+        },
+      });
+      const owner = f.broker.resultOwner(await pending);
+      oldest ??= owner;
+      if (index === 127) expect(oldest.retirementSignal.aborted).toBe(false);
+    }
+    expect(oldest.retirementSignal.aborted).toBe(true);
+    expect(f.broker.isCurrent(admission)).toBe(true);
+  } finally {
+    f.broker.dispose();
+  }
+});
+
+test('clock retirement cannot retire the music source signal for the same epoch', async () => {
+  const f = await musicRequestFixture();
+  try {
+    const music = f.read();
+    f.ready();
+    f.settled();
+    const musicOwner = f.broker.resultOwner(await music);
+    const binding = {
+      documentId: '1'.repeat(32),
+      episodeId: '2'.repeat(32),
+      videoId: 'abcdefghijk',
+    };
+    const pending = f.broker.readClock(
+      f.broker.capture(),
+      binding,
+      'clock-owned',
+    );
+    const packet = f.sent
+      .filter((p) => p[0] === 'peard:legacy-clock-owner-query')
+      .at(-1)[1];
+    const event = { sender: f.contents, senderFrame: f.contents.mainFrame };
+    const reply = (value: any) =>
+      f.ipcMain.emit('peard:legacy-clock-reply', event, value);
+    reply({
+      ...packet,
+      type: 'ready',
+      documentId: binding.documentId,
+      sourceId: binding.episodeId,
+    });
+    reply({
+      ...packet,
+      type: 'settled',
+      documentId: binding.documentId,
+      sourceId: binding.episodeId,
+      result: { ok: true, value: { ...binding, elapsedMilliseconds: 1 } },
+    });
+    const clockOwner = f.broker.clockResultOwner(await pending);
+    reply({
+      type: 'retire',
+      documentId: binding.documentId,
+      sourceId: binding.episodeId,
+    });
+    expect(clockOwner.retirementSignal.aborted).toBe(true);
+    expect(musicOwner.retirementSignal.aborted).toBe(false);
+  } finally {
+    f.broker.dispose();
+  }
+});

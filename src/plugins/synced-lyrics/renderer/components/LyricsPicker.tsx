@@ -222,20 +222,6 @@ export const LyricsPicker = (props: {
         </mdui-button-icon>
       </div>
 
-      <button
-        aria-busy={exporting()}
-        aria-disabled={exporting()}
-        class="lyrics-export"
-        disabled={currentLyrics().state !== 'done' || !currentLyrics().data}
-        onClick={exportLyrics}
-        title={t('plugins.synced-lyrics.tools.export')}
-        type="button"
-      >
-        {t('plugins.synced-lyrics.tools.export')}
-      </button>
-      <span class="lyrics-export-status" role="status">
-        {exportStatus()}
-      </span>
       <div class="lyrics-picker-content">
         <div class="lyrics-picker-content-label">
           <Index each={providerNames}>
@@ -243,7 +229,7 @@ export const LyricsPicker = (props: {
               <div
                 class="lyrics-picker-item"
                 style={{
-                  transform: `translateX(${providerIdx() * -100 - 5}%)`,
+                  transform: `translateX(${providerIdx() * -100}%)`,
                 }}
                 tabindex="-1"
               >
@@ -338,6 +324,24 @@ export const LyricsPicker = (props: {
           />
         </mdui-button-icon>
       </div>
+      <Show when={config()?.enableDownload !== false}>
+        <>
+          <button
+            aria-busy={exporting()}
+            aria-disabled={exporting()}
+            class="lyrics-export"
+            disabled={currentLyrics().state !== 'done' || !currentLyrics().data}
+            onClick={exportLyrics}
+            title={t('plugins.synced-lyrics.tools.export')}
+            type="button"
+          >
+            {t('plugins.synced-lyrics.tools.export')}
+          </button>
+          <span class="lyrics-export-status" role="status">
+            {exportStatus()}
+          </span>
+        </>
+      </Show>
     </div>
   );
 };

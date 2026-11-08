@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { musicModuleSource } from './helpers/api-music-source';
 import { musicRequestFixture } from './helpers/api-music-request';
+import { windowsLaunchEvidence } from './helpers/windows-launch-evidence';
 
 const resource = 'http://127.0.0.1:26539/mcp';
 const videoId = 'abcdefghijk';
@@ -124,6 +125,7 @@ async function fixture(rest = false) {
     [
       'src/plugins/api-server/backend/music-service.ts',
       'src/plugins/api-server/backend/music-grant-store.ts',
+      'src/plugins/api-server/backend/windows-private-path.ts',
     ],
     { ipcMain: f.ipcMain },
   );
@@ -137,14 +139,23 @@ async function fixture(rest = false) {
     port: 26538,
     useHttps: false,
   };
-  const store = new g.MusicGrantStore(path.join(folder, 'owned'), now);
-  const grant = await store.issue(
-    'Owned MCP',
-    'mcp',
-    resource,
-    scopes,
-    () => true,
-  );
+  const evidence = windowsLaunchEvidence();
+  const windows =
+    process.platform === 'win32'
+      ? g.createWindowsPrivatePath({ launch: evidence.launch })
+      : undefined;
+  const store = new g.MusicGrantStore(path.join(folder, 'owned'), now, windows);
+  const grant = await store
+    .issue('Owned MCP', 'mcp', resource, scopes, () => true)
+    .catch((error: unknown) => {
+      // Only enums, byte counts and timing; preserve the original failure and worker.
+      if (windows)
+        console.error(
+          'MUSIC_GRANT_SETUP_FAILURE',
+          JSON.stringify(evidence.snapshot()),
+        );
+      throw error;
+    });
   const owner = { identity: {}, current: () => true };
   let registered: any = owner;
   const webCalls: any[] = [],
@@ -919,62 +930,77 @@ test('scope-specific read For admission retains all seven scopes without cross-r
   }
 });
 
-test('reentrant session retirement during cache sweep cannot republish private payload', async () => {
-  async function run(retireAt?: number) {
-    const f = await fixture();
-    try {
-      await f.finish(
-        f.service.searchFor(f.invocation(), { query: 'first', limit: 100 }),
-        catalog(),
+const cacheSweepShards = 4;
+async function runCacheSweepRetirement(retireAt?: number) {
+  const f = await fixture();
+  try {
+    await f.finish(
+      f.service.searchFor(f.invocation(), { query: 'first', limit: 100 }),
+      catalog(),
+    );
+    const check = f.store.isCurrent.bind(f.store);
+    let count = 0,
+      armed = false;
+    f.store.isCurrent = (...args: any[]) => {
+      const result = check(...args);
+      if (armed && ++count === retireAt) f.service.retireSession(f.session);
+      return result;
+    };
+    const pending = f.service
+      .searchFor(f.invocation(), { query: 'second', limit: 100 })
+      .then(
+        () => 'success',
+        (e: any) => e.code,
       );
-      const check = f.store.isCurrent.bind(f.store);
-      let count = 0,
-        armed = false;
-      f.store.isCurrent = (...args: any[]) => {
-        const result = check(...args);
-        if (armed && ++count === retireAt) f.service.retireSession(f.session);
-        return result;
-      };
-      const pending = f.service
-        .searchFor(f.invocation(), { query: 'second', limit: 100 })
-        .then(
-          () => 'success',
-          (e: any) => e.code,
-        );
-      await expect
-        .poll(
-          () => f.sent.filter((p) => p[0] === 'peard:music-owner-query').length,
-        )
-        .toBe(2);
-      const packet = f.challenge(1);
-      f.ready(packet);
-      armed = true;
-      await f.step(catalog());
-      const result = await pending;
-      if (retireAt !== undefined) {
-        expect(result).toBe('retired');
-        expect(f.service.stats()).toEqual({
-          cursors: 0,
-          references: 0,
-          cacheBytes: 0,
-        });
-        expect(f.service.sessionLeases.size).toBe(0);
-        expect(
-          await f.finish(
-            f.service.currentFor(f.invocation({ session: { ...f.session } })),
-            snapshot,
-          ),
-        ).toEqual(snapshot);
-      } else expect(result).toBe('success');
-      return count;
-    } finally {
-      await f.close();
-    }
+    await expect
+      .poll(
+        () => f.sent.filter((p) => p[0] === 'peard:music-owner-query').length,
+      )
+      .toBe(2);
+    const packet = f.challenge(1);
+    f.ready(packet);
+    armed = true;
+    await f.step(catalog());
+    const result = await pending;
+    if (retireAt !== undefined) {
+      expect(result).toBe('retired');
+      expect(f.service.stats()).toEqual({
+        cursors: 0,
+        references: 0,
+        cacheBytes: 0,
+      });
+      expect(f.service.sessionLeases.size).toBe(0);
+      expect(
+        await f.finish(
+          f.service.currentFor(f.invocation({ session: { ...f.session } })),
+          snapshot,
+        ),
+      ).toEqual(snapshot);
+    } else expect(result).toBe('success');
+    return count;
+  } finally {
+    await f.close();
   }
-  const count = await run();
-  expect(count).toBeGreaterThan(1);
-  for (let at = 1; at <= count; at++) await run(at);
-});
+}
+for (let shard = 0; shard < cacheSweepShards; shard++) {
+  test(`reentrant session retirement during cache sweep cannot republish private payload shard ${shard + 1}/${cacheSweepShards}`, async () => {
+    const count = await runCacheSweepRetirement();
+    expect(count).toBeGreaterThan(1);
+    const checkpoints: number[] = [];
+    for (let at = shard + 1; at <= count; at += cacheSweepShards) {
+      console.info(
+        'CACHE_SWEEP_ITERATION',
+        JSON.stringify({ shard, at, count }),
+      );
+      await runCacheSweepRetirement(at);
+      checkpoints.push(at);
+    }
+    console.info(
+      'CACHE_SWEEP_SHARD',
+      JSON.stringify({ shard, shards: cacheSweepShards, count, checkpoints }),
+    );
+  });
+}
 
 test('read wrappers and For methods preserve equivalent useful local REST results', async () => {
   const f = await fixture(true);
@@ -1361,19 +1387,18 @@ for (const mode of ['remainder', 'continuation']) {
           };
           enter('issuer-read');
           const pending = f.own(
-            f.service
-              .browseFor(f.invocation(), { cursor, limit: 100 })
-              .then(
-                (page: any) => ({ code: 'success', page }),
-                (e: any) => ({ code: e.code }),
-              ),
+            f.service.browseFor(f.invocation(), { cursor, limit: 100 }).then(
+              (page: any) => ({ code: 'success', page }),
+              (e: any) => ({ code: e.code }),
+            ),
           );
           if (mode === 'continuation') {
             enter('continuation-query');
             await expect
               .poll(
                 () =>
-                  f.sent.filter((p) => p[0] === 'peard:music-owner-query').length,
+                  f.sent.filter((p) => p[0] === 'peard:music-owner-query')
+                    .length,
               )
               .toBe(3);
             f.ready(f.challenge(2));
@@ -1396,7 +1421,9 @@ for (const mode of ['remainder', 'continuation']) {
             enter('recovery-current');
             expect(
               await f.finish(
-                f.service.currentFor(f.invocation({ session: { ...f.session } })),
+                f.service.currentFor(
+                  f.invocation({ session: { ...f.session } }),
+                ),
                 snapshot,
               ),
             ).toEqual(snapshot);

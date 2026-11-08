@@ -1,6 +1,51 @@
-import { FormatUtils, type YT } from 'youtubei.js';
+import { FormatUtils, Utils, type YT } from 'youtubei.js';
 
 import { validAudioLength } from './audio';
+
+// Keep transport diagnostics independent of SDK response objects, which can
+// contain signed media URLs, response headers and bodies.
+export class AudioTransferError extends Error {
+  readonly stage = 'transfer';
+  readonly httpStatus?: number;
+
+  constructor(
+    reason: 'failed' | 'Incomplete' | 'Excess' = 'failed',
+    error?: unknown,
+  ) {
+    let status: unknown;
+    const info: unknown =
+      error instanceof Utils.InnertubeError ? error.info : undefined;
+    if (
+      typeof info === 'object' &&
+      info !== null &&
+      'error_type' in info &&
+      info.error_type === 'FETCH_FAILED' &&
+      'response' in info
+    ) {
+      const response = info.response;
+      if (
+        typeof response === 'object' &&
+        response !== null &&
+        'ok' in response &&
+        response.ok === false &&
+        'status' in response
+      )
+        status = response.status;
+    }
+    const httpStatus =
+      typeof status === 'number' &&
+      Number.isInteger(status) &&
+      status >= 100 &&
+      status <= 599 &&
+      (status < 200 || status >= 300)
+        ? status
+        : undefined;
+    super(
+      `${reason === 'failed' ? 'Audio transfer failed' : `${reason} audio transfer`} (stage: transfer${httpStatus === undefined ? '' : `; HTTP status: ${httpStatus}`}); no file or completion record saved`,
+    );
+    this.httpStatus = httpStatus;
+  }
+}
 
 export type DownloadInfo = Pick<
   YT.VideoInfo,
@@ -60,16 +105,10 @@ export async function downloadSelectedAudio(
         assertCurrent();
         if (result.done) break;
         received += result.value.byteLength;
-        if (received > length)
-          throw new Error(
-            `Excess audio bytes: expected ${length}, received ${received}`,
-          );
+        if (received > length) throw new AudioTransferError('Excess');
         yield result.value;
       }
-      if (received !== length)
-        throw new Error(
-          `Incomplete audio transfer: expected ${length}, received ${received}`,
-        );
+      if (received !== length) throw new AudioTransferError('Incomplete');
       complete = true;
     } finally {
       if (!complete) await reader.cancel().catch(() => {});

@@ -7,6 +7,7 @@ import {
   config as currentConfig,
   setConfig,
   setCurrentTime,
+  setIsPlaying,
   startLyricsEffects,
 } from './renderer';
 import {
@@ -114,6 +115,7 @@ export const renderer = createRenderer<
       clearInterval(this.updateTimestampInterval);
     this.updateTimestampInterval = undefined;
     disposeLyricsView();
+    setIsPlaying(false);
     _ytAPI = null;
   },
   async onPlayerApiReady(api) {
@@ -168,8 +170,10 @@ export const renderer = createRenderer<
     const generation = this.generation;
     if (this.updateTimestampInterval === undefined)
       this.updateTimestampInterval = setInterval(() => {
-        if (this.active && this.generation === generation && _ytAPI === api)
+        if (this.active && this.generation === generation && _ytAPI === api) {
           setCurrentTime(api.getCurrentTime() * 1000);
+          setIsPlaying(api.getPlayerState?.() === 1);
+        }
       }, 100);
     this.headerController?.abort();
     const controller = new AbortController();

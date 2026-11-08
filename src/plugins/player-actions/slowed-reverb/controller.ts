@@ -36,6 +36,8 @@ import {
 } from './panel';
 import { DATTORRO_WORKLET_SOURCE } from './worklet';
 
+import type { WetOutputLease } from '@/providers/renderer-output';
+
 export interface SlowedReverbConfig {
   slow: number;
   reverbIntensity: number;
@@ -55,6 +57,16 @@ interface FeatureContext<Slice> {
 
 const PLUGIN_ID = 'slowed-reverb';
 const WET_VOLUME_EPSILON = 1e-6;
+const WET_GAIN_RAMP_SECONDS = 0.02;
+type WetEnvelope = { from: number; to: number; start: number; end: number };
+
+function wetLevelAt(envelope: WetEnvelope, time: number): number {
+  if (time <= envelope.start) return envelope.from;
+  if (time >= envelope.end) return envelope.to;
+  const fraction = (time - envelope.start) / (envelope.end - envelope.start);
+  const change = (envelope.to - envelope.from) * fraction;
+  return envelope.from + change;
+}
 // Native registration survives node teardown; weak keys do not retain old graphs.
 const registeredWorklets = new WeakSet<AudioContext>();
 
@@ -90,6 +102,7 @@ export interface SlowedReverbController {
   config: SlowedReverbConfig | null;
   audioContext: AudioContext | null;
   audioSource: MediaElementAudioSourceNode | null;
+  audioGraph: RendererAudioGraph | null;
   wetGain: GainNode | null;
   wetInput: GainNode | null;
   wetVolumeMedia: HTMLMediaElement | null;
@@ -116,6 +129,9 @@ export interface SlowedReverbController {
   rateVideo: HTMLVideoElement | null;
   pitchOverridden: boolean;
   lastWetGain: number;
+  wetOutput: WetOutputLease | null;
+  wetEnvelope: WetEnvelope;
+  wetVolumeScale: number;
   start: (ctx: FeatureContext<SlowedReverbConfig>) => Promise<void>;
   stop: () => void;
   onPlayerApiReady: () => void;
@@ -151,6 +167,7 @@ export function createSlowedReverbController(): SlowedReverbController {
     config: null,
     audioContext: null,
     audioSource: null,
+    audioGraph: null,
     wetGain: null,
     wetInput: null,
     wetVolumeMedia: null,
@@ -177,6 +194,9 @@ export function createSlowedReverbController(): SlowedReverbController {
     rateVideo: null,
     pitchOverridden: false,
     lastWetGain: 0,
+    wetOutput: null,
+    wetEnvelope: { from: 0, to: 0, start: 0, end: 0 },
+    wetVolumeScale: 0,
 
     async start(ctx) {
       const generation = ++this.generation;
@@ -252,6 +272,7 @@ export function createSlowedReverbController(): SlowedReverbController {
       this.restoreVideo();
       this.audioContext = null;
       this.audioSource = null;
+      this.audioGraph = null;
       this.workletReadyFor = null;
       this.ctx = null;
     },
@@ -429,6 +450,9 @@ export function createSlowedReverbController(): SlowedReverbController {
 
     wireAudio(audioContext, audioSource) {
       if (!this.ctx) return;
+      const graph = graphFromAnnouncement({ audioContext, audioSource });
+      if (this.audioGraph !== graph) this.workletFailed = false;
+      this.audioGraph = graph;
       this.audioContext = audioContext;
       this.audioSource = audioSource;
       if (this.workletFailed) return;
@@ -452,9 +476,28 @@ export function createSlowedReverbController(): SlowedReverbController {
         // Wet reverb joins the renderer master mix so EQ/output sink cover it.
         // Raw analyser taps and the compressor's dry insert remain untouched.
         this.wetGain.gain.value = 0;
-        this.volumeGraph = graphFromAnnouncement({ audioContext, audioSource });
-        this.wetGain.connect(this.volumeGraph.masterInput);
+        this.volumeGraph = graph;
+        const epoch = this.workletEpoch;
+        // Publish ownership before registration: allocation can fail inline.
         this.wiredSource = audioSource;
+        const outputLease = this.volumeGraph.registerWetOutput(
+          this.wetGain,
+          () => {
+            if (epoch !== this.workletEpoch || this.wiredSource !== audioSource)
+              return;
+            this.workletFailed = true;
+            this.teardownAudio();
+          },
+        );
+        if (
+          epoch !== this.workletEpoch ||
+          this.wiredSource !== audioSource ||
+          !this.wetGain
+        ) {
+          outputLease.release();
+          return;
+        }
+        this.wetOutput = outputLease;
         this.wetVolumeMedia = audioSource.mediaElement;
         this.releaseVolumePreparation =
           this.volumeGraph.registerVolumePreparation?.('scale', () =>
@@ -520,9 +563,16 @@ export function createSlowedReverbController(): SlowedReverbController {
       if (!this.ctx) return;
       const detail = (event as CustomEvent<AudioCanPlayDetail>).detail;
       if (!detail?.audioContext || !detail?.audioSource) return;
+      const graph = graphFromAnnouncement(detail);
       // Record the announced graph even while the reverb is silent: the lazy
       // tap wires it as soon as the intensity rises above 0.
-      if (this.audioContext !== detail.audioContext) this.workletFailed = false;
+      if (
+        this.audioGraph !== graph ||
+        this.audioContext !== detail.audioContext ||
+        this.audioSource !== detail.audioSource
+      )
+        this.workletFailed = false;
+      this.audioGraph = graph;
       this.audioContext = detail.audioContext;
       this.audioSource = detail.audioSource;
       this.syncWetTap();
@@ -540,6 +590,8 @@ export function createSlowedReverbController(): SlowedReverbController {
         return;
       }
       const epoch = this.workletEpoch;
+      const protection = this.wetOutput;
+      if (!protection) return;
       try {
         if (!registeredWorklets.has(audioContext)) {
           // Share the in-flight module load so a re-wire mid-load awaits
@@ -593,6 +645,16 @@ export function createSlowedReverbController(): SlowedReverbController {
           // while awaiting (or while skipping) the module load.
           return;
         }
+        if (!(await protection.ready)) return;
+        if (
+          epoch !== this.workletEpoch ||
+          this.wetOutput !== protection ||
+          this.audioContext !== audioContext ||
+          this.audioSource !== audioSource ||
+          this.wetGain === null ||
+          this.wiredSource !== audioSource
+        )
+          return;
         // A concurrent caller for this generation may have created the node
         // while we awaited the shared load: single node per generation.
         if (this.reverbNode) return;
@@ -642,6 +704,30 @@ export function createSlowedReverbController(): SlowedReverbController {
         ? clampIntensity(current.reverbIntensity)
         : 0;
       const params = computeDattorroParams(intensity);
+      const now = this.audioContext?.currentTime ?? 0;
+      const level = wetLevelAt(this.wetEnvelope, now);
+      const changed = params.wetGain !== this.wetEnvelope.to;
+      if (changed && this.wetGain) {
+        // Freeze an interrupted ramp BEFORE notifying the graph/EQ owner;
+        // their callbacks may run while the audio clock continues advancing.
+        this.wetGain.gain.cancelAndHoldAtTime(now);
+        this.wetGain.gain.setValueAtTime(this.wetVolumeScale * level, now);
+        this.wetEnvelope = { from: level, to: level, start: now, end: now };
+      }
+      if (changed) {
+        const from = level;
+        const start = now;
+        const end =
+          now === 0 || from === params.wetGain
+            ? start
+            : start + WET_GAIN_RAMP_SECONDS;
+        this.wetEnvelope = {
+          from: now === 0 ? params.wetGain : from,
+          to: params.wetGain,
+          start,
+          end,
+        };
+      }
       if (this.wetHighpass)
         this.wetHighpass.frequency.value = clampWetHighpass(
           current.wetHighpass,
@@ -654,7 +740,7 @@ export function createSlowedReverbController(): SlowedReverbController {
         );
       }
       // No dry tap: the base path carries dry at unity. The wet tail is
-      // silent at intensity 0 (params.wetGain 0 inside the worklet), so
+      // silent at intensity 0 (the wet tap is retired), so
       // enabling at defaults changes no loudness. Worklet failure just
       // skips the wet path and slow keeps working.
       this.wetVolumeHandler?.();
@@ -664,7 +750,13 @@ export function createSlowedReverbController(): SlowedReverbController {
         if (prevWet === 0 && params.wetGain > 0) {
           this.reverbNode?.port.postMessage({ type: 'reset' });
         }
-        this.reverbNode?.port.postMessage({ type: 'setParams', params });
+        this.reverbNode?.port.postMessage({
+          type: 'setParams',
+          // Keep delay/tone memory independent of output intensity. Scaling
+          // inside the worklet would leave HP/LP state at the previous gain
+          // during intensity changes, instead of scaling every retained sample.
+          params: { ...params, wetGain: params.wetGain > 0 ? 1 : 0 },
+        });
       } catch {}
     },
 
@@ -679,12 +771,27 @@ export function createSlowedReverbController(): SlowedReverbController {
         volume <= 1;
       const now = this.audioContext.currentTime;
       // The native source already contains volume. Undo it only for wet DSP,
-      // then apply current volume after the delay/tone state so retained tails
-      // follow the same headroom as dry. No second volume factor is introduced.
+      // then apply current volume AND intensity after the delay/tone state.
+      // Both filters' retained samples therefore obey the current peak reserve
+      // immediately, without guessing a filter-tail timeout or double volume.
       this.wetInput.gain.cancelScheduledValues(now);
-      this.wetGain.gain.cancelScheduledValues(now);
+      this.wetGain.gain.cancelAndHoldAtTime(now);
       this.wetInput.gain.setValueAtTime(audible ? 1 / volume : 0, now);
-      this.wetGain.gain.setValueAtTime(audible ? volume : 0, now);
+      const scale = audible ? volume : 0;
+      this.wetVolumeScale = scale;
+      const envelope = this.wetEnvelope;
+      this.wetGain.gain.setValueAtTime(scale * wetLevelAt(envelope, now), now);
+      if (envelope.end > now) {
+        if (envelope.start > now)
+          this.wetGain.gain.setValueAtTime(
+            scale * envelope.from,
+            envelope.start,
+          );
+        this.wetGain.gain.linearRampToValueAtTime(
+          scale * envelope.to,
+          envelope.end,
+        );
+      }
     },
 
     applySlow() {
@@ -887,6 +994,10 @@ export function createSlowedReverbController(): SlowedReverbController {
       try {
         this.wetGain?.disconnect();
       } catch {}
+      this.wetOutput?.release();
+      this.wetOutput = null;
+      this.wetEnvelope = { from: 0, to: 0, start: 0, end: 0 };
+      this.wetVolumeScale = 0;
       try {
         this.wetHighpass?.disconnect();
       } catch {}

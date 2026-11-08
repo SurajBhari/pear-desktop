@@ -1,3 +1,4 @@
+import { getMusicActionsOwner } from '@/providers/music-actions';
 import { getSongInfo } from '@/providers/song-info-front';
 
 import type { SongInfo } from '@/providers/song-info';
@@ -77,6 +78,7 @@ const claims = new WeakMap<
     owners: Set<symbol>;
     itemIndex?: number;
     pendingPlayback?: boolean;
+    crossfadeToken?: symbol;
   }
 >();
 
@@ -84,6 +86,10 @@ const claims = new WeakMap<
 export function createPlaybackFilter(
   context: Pick<RendererContext<{ enabled: boolean }>, 'ipc'>,
   matches: (track: FilterTrack) => boolean,
+  policy?: {
+    kind: 'artist' | 'live';
+    allowIntentionalPrevious?: () => boolean;
+  },
 ) {
   let disposed = false;
   const owner = Symbol('playback-filter');
@@ -92,6 +98,7 @@ export function createPlaybackFilter(
     | ((name: 'dataloaded' | 'dataupdated', data: VideoDataChangeValue) => void)
     | undefined;
   let apiEpoch = 0;
+  let evaluationRevision = 0;
   let videoId = '';
   let seenBegin = false;
   let beginVideoId = '';
@@ -107,6 +114,7 @@ export function createPlaybackFilter(
   };
 
   const refresh = () => {
+    const evaluation = ++evaluationRevision;
     const currentVideo = document.querySelector('video');
     if (video !== currentVideo) {
       video = currentVideo;
@@ -115,16 +123,29 @@ export function createPlaybackFilter(
       if (claim) claim.pendingPlayback = true;
     }
     if (disposed || !api || !mediaReady || !videoId) return;
+    const player = api,
+      epoch = apiEpoch,
+      identity = videoId,
+      media = video;
+    const current = () =>
+      !disposed &&
+      api === player &&
+      apiEpoch === epoch &&
+      evaluationRevision === evaluation &&
+      videoId === identity &&
+      video === media &&
+      mediaReady;
     try {
-      const native = api.getVideoData();
-      const details = api.getPlayerResponse()?.videoDetails;
+      const native = player.getVideoData();
+      const details = player.getPlayerResponse()?.videoDetails;
+      if (!current()) return;
       if (native?.video_id !== videoId || details?.videoId !== videoId) return;
       // Only unresolved begins survive a ready hook; a settled owner can hand over.
       seenBegin = false;
-      let claim = claims.get(api);
+      let claim = claims.get(player);
       if (!claim) {
         claim = { videoId, skipped: false, owners: new Set([owner]) };
-        claims.set(api, claim);
+        claims.set(player, claim);
       } else if (claim.videoId !== videoId) {
         claim.videoId = videoId;
         claim.skipped = false;
@@ -135,7 +156,10 @@ export function createPlaybackFilter(
       // Shared claim mutation makes duplicate hooks from both filters harmless.
       const item = currentQueueItem(videoId);
       const index =
-        item && api.getPlaylistIndex() === item.index ? item.index : undefined;
+        item && player.getPlaylistIndex() === item.index
+          ? item.index
+          : undefined;
+      if (!current()) return;
       if (index !== undefined && beginVideoId === videoId) {
         if (
           claim.pendingPlayback ||
@@ -169,9 +193,29 @@ export function createPlaybackFilter(
         channelId: text(details.channelId),
         artists: currentArtists(videoId),
       };
+      if (!current()) return;
       if (!matches(track)) return;
+      if (!current()) return;
+      const allowed =
+        policy?.kind === 'artist' &&
+        policy.allowIntentionalPrevious?.() &&
+        getMusicActionsOwner(player)?.navigation?.allowsArtist(videoId, owner);
+      if (!current() || allowed) return;
+      // Resolve even a provider method accessor before the final private fence.
+      // No predicate/native getter follows this fence or the shared claim write.
+      const advance = player.nextVideo;
+      if (
+        !current() ||
+        typeof advance !== 'function' ||
+        claims.get(player) !== claim ||
+        !claim.owners.has(owner) ||
+        claim.videoId !== identity ||
+        claim.skipped
+      )
+        return;
+      claim.crossfadeToken = undefined;
       claim.skipped = true;
-      api.nextVideo();
+      Reflect.apply(advance, player, []);
     } catch (error) {
       console.warn(
         '[playback-filter] Current playback could not be confirmed',
@@ -242,8 +286,14 @@ export function createPlaybackFilter(
   document.addEventListener('videodatachange', onDocumentData);
   return {
     refresh,
+    retirePermission() {
+      evaluationRevision++;
+      if (api && policy?.kind === 'artist')
+        getMusicActionsOwner(api)?.navigation?.retireArtist(owner);
+    },
     attach(player: MusicPlayer) {
       if (disposed) return;
+      evaluationRevision++;
       if (api === player) {
         refresh();
         return;
@@ -251,6 +301,8 @@ export function createPlaybackFilter(
       if (apiHandler) api?.removeEventListener('videodatachange', apiHandler);
       releaseClaim();
       api = player;
+      if (policy?.kind === 'artist')
+        getMusicActionsOwner(player)?.navigation?.retireArtist(owner);
       const claim = claims.get(player);
       if (claim) claim.owners.add(owner);
       else
@@ -282,6 +334,9 @@ export function createPlaybackFilter(
     stop() {
       if (disposed) return;
       disposed = true;
+      evaluationRevision++;
+      if (api && policy?.kind === 'artist')
+        getMusicActionsOwner(api)?.navigation?.retireArtist(owner);
       apiEpoch++;
       if (apiHandler) api?.removeEventListener('videodatachange', apiHandler);
       apiHandler = undefined;
@@ -294,6 +349,50 @@ export function createPlaybackFilter(
       metadata = undefined;
       video = null;
       videoId = '';
+    },
+  };
+}
+
+/** Shares physical next arbitration with filters, without adopting their claims. */
+export function claimCrossfadeNext(
+  api: MusicPlayer,
+  videoId: string,
+  itemIndex: number,
+): { release(): void; commit(): void } | null {
+  const existing = claims.get(api);
+  if (
+    existing &&
+    (existing.videoId !== videoId ||
+      existing.skipped ||
+      (existing.itemIndex !== undefined && existing.itemIndex !== itemIndex))
+  )
+    return null;
+  const owner = Symbol('crossfade-next');
+  const claim: NonNullable<ReturnType<typeof claims.get>> = existing ?? {
+    videoId,
+    skipped: false,
+    owners: new Set<symbol>(),
+    itemIndex,
+  };
+  claim.owners.add(owner);
+  claim.crossfadeToken = owner;
+  claim.skipped = true;
+  claim.itemIndex = itemIndex;
+  claims.set(api, claim);
+  let committed = false;
+  return {
+    commit() {
+      committed = true;
+    },
+    release() {
+      if (claims.get(api) !== claim) return;
+      if (claim.crossfadeToken === owner) {
+        claim.crossfadeToken = undefined;
+        // Roll back only our unconsumed reservation, never a filter's physical skip.
+        if (!committed && claim.videoId === videoId) claim.skipped = false;
+      }
+      claim.owners.delete(owner);
+      if (claim.owners.size === 0) claims.delete(api);
     },
   };
 }

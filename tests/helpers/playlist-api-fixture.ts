@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { build, transformWithOxc } from 'vite';
+import { headlessApiMenuBoundary } from './api-headless-menu-boundary';
 
 export async function playlistApiFixture() {
   const root = path.resolve(import.meta.dirname, '../..');
@@ -67,6 +68,7 @@ export async function playlistApiFixture() {
     logLevel: 'silent',
     ssr: { noExternal: true },
     plugins: [
+      headlessApiMenuBoundary(root),
       {
         name: 'playlist-node-boundaries',
         enforce: 'pre',

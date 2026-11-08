@@ -407,6 +407,37 @@ for (const obstruction of [
     page,
   }) => {
     await fixture(page);
+    if (obstruction === 'canceled sample') {
+      await page.evaluate(() => {
+        const state = window as any;
+        state.canceledWheel = { armed: false, consumed: null };
+        // Chromium decides cancelability when routing wheel input. Register
+        // before the stream, not while an earlier sample may still be pending.
+        window.addEventListener(
+          'wheel',
+          (event) => {
+            if (
+              !state.canceledWheel.armed ||
+              event.deltaX !== 20 ||
+              event.deltaY !== 0
+            )
+              return;
+            state.canceledWheel.armed = false;
+            event.preventDefault();
+            const sample = {
+              deltaX: event.deltaX,
+              trusted: event.isTrusted,
+              cancelable: event.cancelable,
+              prevented: event.defaultPrevented,
+            };
+            // The production listener registered first and queued its consumer
+            // before this timer. Observe actual cancellation after consumption.
+            setTimeout(() => (state.canceledWheel.consumed = sample), 0);
+          },
+          { passive: false },
+        );
+      });
+    }
     await page.mouse.move(700, 500);
     await swipe(page, -80);
     await expect(page).toHaveURL('https://navigation.fixture/one');
@@ -414,13 +445,16 @@ for (const obstruction of [
     await page.mouse.wheel(1, 0);
     if (obstruction === 'diagonal movement') await page.mouse.wheel(20, 30);
     else if (obstruction === 'canceled sample') {
-      await page.evaluate(() =>
-        window.addEventListener('wheel', (event) => event.preventDefault(), {
-          passive: false,
-          once: true,
-        }),
-      );
+      await page.evaluate(() => ((window as any).canceledWheel.armed = true));
       await page.mouse.wheel(20, 0);
+      await expect
+        .poll(() => page.evaluate(() => (window as any).canceledWheel.consumed))
+        .toEqual({
+          deltaX: 20,
+          trusted: true,
+          cancelable: true,
+          prevented: true,
+        });
     } else {
       await page.locator('#shadow').evaluate((host) => {
         host.shadowRoot!.innerHTML = '<div role="dialog">Visible overlay</div>';

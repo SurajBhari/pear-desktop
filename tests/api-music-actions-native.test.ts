@@ -1,3 +1,4 @@
+import { rendererMusicActionsOwnerSource } from './helpers/playlist-provider-source';
 import { test, expect } from '@playwright/test';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { existsSync, statSync, lstatSync, realpathSync } from 'node:fs';
@@ -6,6 +7,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { build, normalizePath } from 'vite';
+import { headlessApiMenuBoundary } from './helpers/api-headless-menu-boundary';
 const root = path.resolve(import.meta.dirname, '..'),
   requireRoot = createRequire(path.join(root, 'package.json'));
 /** Actual broker/controller and Electron IPC; only native getters and service responses are synthetic. */
@@ -71,11 +73,13 @@ export async function actionsNative<T>(task: () => Promise<T>): Promise<T> {
     'src/plugins/api-server/backend/routes/music.ts',
     'tests/api-music-actions-native.test.ts',
     'tests/helpers/api-music-native.ts',
+    'tests/helpers/api-headless-menu-boundary.ts',
     'tests/helpers/electron-startup-observer.cjs',
   ];
   const factsPath = path.join(owned, 'startup-facts.json');
   let keepFixture = false;
   let child: ReturnType<typeof spawn> | undefined;
+  let closeObserved = false;
   try {
     if (!prepared) {
       const mainEntry = path.join(owned, 'main-source.ts'),
@@ -90,11 +94,7 @@ export async function actionsNative<T>(task: () => Promise<T>): Promise<T> {
         ].join('\n'),
       );
       const core = await readFile(path.join(root, 'src/renderer.ts'), 'utf8');
-      const init = core.slice(
-        core.indexOf('async function onApiLoaded() {') +
-          'async function onApiLoaded() {'.length,
-        core.indexOf('  // Workaround for macOS traffic lights'),
-      );
+      const init = rendererMusicActionsOwnerSource(core);
       await writeFile(
         rendererEntry,
         [
@@ -113,6 +113,7 @@ export async function actionsNative<T>(task: () => Promise<T>): Promise<T> {
         logLevel: 'silent' as const,
         resolve: { alias: {} },
         plugins: [
+          headlessApiMenuBoundary(root),
           {
             name: 'native-app-boundaries',
             enforce: 'pre' as const,
@@ -335,6 +336,7 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
         reject(e);
       });
       child!.on('close', (code) => {
+        closeObserved = true;
         clearTimeout(timer);
         code === 0
           ? resolve()
@@ -379,7 +381,13 @@ let stage='ready';const mark=label=>{stage=label;console.log('MUSIC_NATIVE_STAGE
           : process.kill(-child.pid, 'SIGKILL');
       } catch {}
     }
-    if (!keepFixture) await rm(owned, { recursive: true, force: true });
+    if (!keepFixture)
+      await rm(owned, {
+        recursive: true,
+        force: true,
+        maxRetries: closeObserved ? 5 : 0,
+        retryDelay: 100,
+      });
   }
 }
 

@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { once } from 'node:events';
 import { test, expect } from '@playwright/test';
+import { headlessApiMenuBoundary } from './helpers/api-headless-menu-boundary';
 
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
@@ -53,6 +54,7 @@ export const dialog={showMessageBox:async()=>({response:1})};
     input: entry,
     platform: 'node',
     plugins: [
+      headlessApiMenuBoundary(root),
       {
         name: 'controlled-native-boundaries',
         async resolveId(id: string) {
@@ -95,7 +97,7 @@ export const dialog={showMessageBox:async()=>({response:1})};
     ],
   });
   const output = path.join(directory, 'actual-source.cjs');
-  await bundle.write({ file: output, format: 'cjs' });
+  await bundle.write({ file: output, format: 'cjs', codeSplitting: false });
   await bundle.close();
   // Only native/config/translation boundaries are supplied. Provider, mutex,
   // backend lifecycle, Hono middleware, route handlers and schemas are real.

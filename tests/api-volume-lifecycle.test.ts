@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { EventEmitter, once } from 'node:events';
 import { test, expect } from '@playwright/test';
 import { Window } from 'happy-dom';
+import { headlessApiMenuBoundary } from './helpers/api-headless-menu-boundary';
 
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
@@ -61,6 +62,7 @@ export const dialog={};export const nativeImage={};export const net={fetch:()=>{
     input: entry,
     platform: 'node',
     plugins: [
+      headlessApiMenuBoundary(root),
       {
         name: 'native-config-translation-boundaries',
         async resolveId(id: string) {
@@ -101,7 +103,7 @@ export const dialog={};export const nativeImage={};export const net={fetch:()=>{
     ],
   });
   const output = path.join(directory, 'actual-source.cjs');
-  await build.write({ file: output, format: 'cjs' });
+  await build.write({ file: output, format: 'cjs', codeSplitting: false });
   await build.close();
   source = requireRoot(output);
   const playerState = { volume: 37, muted: true, reads: 0 };

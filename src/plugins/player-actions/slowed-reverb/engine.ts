@@ -118,6 +118,6 @@ export function computeDattorroParams(intensity: number): DattorroParams {
     // Keep low settings gentle; reserve the extra tail and level for the upper range.
     decay: Math.pow(i, 0.75) * 0.58 + Math.pow(i, 3) * 0.2,
     damping: Math.min(0.5 + Math.pow(i, 0.6) * 0.4, 0.78),
-    wetGain: Math.pow(i, 0.75) * 0.42 + Math.pow(i, 3) * 0.68,
+    wetGain: Math.pow(i, 0.75) * 0.42 + Math.pow(i, 3) * 0.78,
   };
 }

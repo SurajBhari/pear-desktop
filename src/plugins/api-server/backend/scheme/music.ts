@@ -643,3 +643,15 @@ export function parseMusicControlMutationInput(
   if (!command) return failMusic('invalid');
   return { ...command, operationId: parseMusicOperationId(operationId) };
 }
+
+/** SDK-neutral read descriptors; existing service parsers remain authoritative. */
+export {
+  queueInputSchema as musicQueueArgumentsSchema,
+  queueInputSchema as musicCollectionArgumentsSchema,
+  metadataSelector as musicLyricsArgumentsSchema,
+  relatedSelector as musicRelatedArgumentsSchema,
+  commentsSelector as musicCommentsArgumentsSchema,
+};
+export const musicCurrentArgumentsSchema = z.object({}).strict();
+export const musicSearchArgumentsSchema = z.union([searchSchema, cursorSchema]);
+export const musicBrowseArgumentsSchema = z.union([browseSchema, cursorSchema]);

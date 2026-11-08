@@ -6,6 +6,8 @@ export enum AuthStrategy {
 export interface APIServerConfig {
   enabled: boolean;
   musicApiEnabled: boolean;
+  mcpEnabled?: boolean;
+  mcpPort?: number;
   musicApiRemoteEnabled?: boolean;
   musicApiRemoteResource?: string;
   hostname: string;
@@ -22,6 +24,8 @@ export interface APIServerConfig {
 export const defaultAPIServerConfig: APIServerConfig = {
   enabled: false,
   musicApiEnabled: false,
+  mcpEnabled: false,
+  mcpPort: 26539,
   musicApiRemoteEnabled: false,
   hostname: '127.0.0.1',
   port: 26538,

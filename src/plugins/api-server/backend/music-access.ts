@@ -1,9 +1,13 @@
 /** Main-owned adapter authority. Never accept these fields from client input. */
+import type { MusicDeliverySink } from './music-publication';
+
 export interface MusicSessionOwner {
+  readonly signal?: AbortSignal;
   readonly id: string;
   current(): boolean;
 }
 export interface MusicInvocation {
+  readonly delivery?: MusicDeliverySink;
   readonly token: unknown;
   readonly transport: 'rest' | 'mcp';
   readonly resource: string;
@@ -11,6 +15,7 @@ export interface MusicInvocation {
   readonly session?: MusicSessionOwner;
 }
 export interface MusicAccessOwner {
+  readonly signal?: AbortSignal;
   readonly identity: object;
   current(): boolean;
 }
@@ -24,6 +29,7 @@ export interface MusicAccessBinding {
 function musicOwnerFor(owner: MusicAccessOwner): MusicAccessOwner {
   return Object.freeze({
     identity: owner.identity,
+    ...(owner.signal ? { signal: owner.signal } : {}),
     current: () => owner.current(),
   });
 }

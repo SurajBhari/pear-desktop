@@ -323,9 +323,9 @@ test('LRCLib observed renderer stop prevents late empty response from dispatchin
     await f.close();
   }
 });
-test('LRCLib HTTP failure keeps a provider error and no extra queries', async () => {
+test('LRCLib permanent HTTP failure keeps a provider error and no extra queries', async () => {
   const f = await lrclibFixture(
-    () => new Response('unavailable', { status: 503 }),
+    () => new Response('unavailable', { status: 400 }),
   );
   try {
     await expect(f.provider.search(lrclibSong)).rejects.toThrow();
@@ -561,7 +561,7 @@ for (const rejection of ['http', 'declared-budget'] as const) {
       const f = await lrclibFixture(
         () =>
           new Response(body, {
-            status: rejection === 'http' ? 503 : 200,
+            status: rejection === 'http' ? 400 : 200,
             headers:
               rejection === 'declared-budget'
                 ? { 'content-length': String(1024 * 1024 + 1) }
@@ -581,7 +581,7 @@ for (const rejection of ['http', 'declared-budget'] as const) {
           }),
         ]);
         await expect(bounded).rejects.toThrow(
-          rejection === 'http' ? /HTTP 503/ : /response budget/,
+          rejection === 'http' ? /HTTP 400/ : /response budget/,
         );
         expect(canceled).toBe(true);
         expect(f.calls).toHaveLength(1);
@@ -729,3 +729,120 @@ test('LRCLib keeps finite negative enhanced clocks and the legal trailing infini
     await f.close();
   }
 });
+
+for (const status of [429, 502, 503, 504])
+  test(`LRCLib recovers a transient HTTP ${status} with one delayed retry of the same query`, async () => {
+    let canceled = false;
+    const f = await lrclibFixture(({ index }) =>
+      index === 0
+        ? new Response(
+            new ReadableStream({
+              cancel() {
+                canceled = true;
+              },
+            }),
+            { status },
+          )
+        : [lrclibTrack()],
+    );
+    try {
+      const start = Date.now();
+      const result = await f.provider.search(lrclibSong);
+      expect(result?.title).toBe('Yellow');
+      expect(f.calls).toHaveLength(2);
+      expect(f.calls[0].url.href).toBe(f.calls[1].url.href);
+      expect(Date.now() - start).toBeGreaterThanOrEqual(450);
+      expect(canceled).toBe(true);
+    } finally {
+      await f.close();
+    }
+  });
+
+test('LRCLib persistent transient failure stops after one retry, preserving the service error', async () => {
+  const f = await lrclibFixture(
+    () => new Response('unavailable', { status: 503 }),
+  );
+  try {
+    await expect(f.provider.search(lrclibSong)).rejects.toThrow(
+      'LRCLib HTTP 503',
+    );
+    expect(f.calls).toHaveLength(2);
+  } finally {
+    await f.close();
+  }
+});
+
+test('LRCLib respects Retry-After without retrying outside its overall deadline', async () => {
+  const f = await lrclibFixture(
+    () =>
+      new Response('unavailable', {
+        status: 503,
+        headers: { 'Retry-After': '60' },
+      }),
+  );
+  try {
+    await expect(f.provider.search(lrclibSong)).rejects.toThrow(
+      'LRCLib HTTP 503',
+    );
+    expect(f.calls).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test('LRCLib Retry-After delays its only retry and never expands the four-request search budget', async () => {
+  const f = await lrclibFixture(({ index }) =>
+    index === 0
+      ? new Response('slow down', {
+          status: 429,
+          headers: { 'Retry-After': '1' },
+        })
+      : [],
+  );
+  try {
+    const start = Date.now();
+    expect(
+      await f.provider.search({ ...lrclibSong, alternativeTitle: '黄色' }),
+    ).toBeNull();
+    expect(Date.now() - start).toBeGreaterThanOrEqual(950);
+    expect(f.calls).toHaveLength(4);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const retire of ['supersede', 'disable', 'deadline'])
+  test(`LRCLib pending retry cannot dispatch after ${retire}`, async () => {
+    const f = await lrclibFixture(({ index }) =>
+      index === 0
+        ? new Response('unavailable', { status: 503 })
+        : [lrclibTrack({ trackName: 'Blue' })],
+    );
+    const original = globalThis.setTimeout;
+    const timers: { callback: () => void; delay: number }[] = [];
+    try {
+      globalThis.setTimeout = ((callback: () => void, delay: number) => {
+        timers.push({ callback, delay });
+        return { unref() {} };
+      }) as unknown as typeof setTimeout;
+      const old = f.provider.search(lrclibSong);
+      void old.catch(() => {});
+      await settleLRCLib();
+      expect(timers.some((timer) => timer.delay === 500)).toBe(true);
+      globalThis.setTimeout = original;
+      if (retire === 'supersede')
+        expect(
+          (await f.provider.search({ ...lrclibSong, title: 'Blue' }))?.title,
+        ).toBe('Blue');
+      if (retire === 'disable') f.state.config.enabled = false;
+      if (retire === 'deadline')
+        timers.find((timer) => timer.delay === 8000)!.callback();
+      timers.find((timer) => timer.delay === 500)!.callback();
+      if (retire === 'deadline') await expect(old).rejects.toThrow(/deadline/i);
+      else expect(await old).toBeNull();
+      expect(f.calls).toHaveLength(retire === 'supersede' ? 2 : 1);
+    } finally {
+      globalThis.setTimeout = original;
+      await f.close();
+    }
+  });

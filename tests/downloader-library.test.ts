@@ -1,4 +1,4 @@
-import { existsSync, renameSync, symlinkSync } from 'node:fs';
+import { existsSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
 import {
   mkdtemp,
   mkdir,
@@ -595,3 +595,63 @@ test('dotted Unicode filenames inside the library remain verified rather than tr
       'skip',
     );
   }));
+
+for (const boundary of ['audio-link', 'index-rename'] as const) {
+  test(`retirement during awaited validation cannot cross the pre-${boundary} boundary`, async () =>
+    withRoot(async (root) => {
+      await writeFile(path.join(root, 'prior.webm'), 'owned-prior');
+      let retired = false;
+      let armed = false;
+      let beforeLinkChecks = 0;
+      const guard = () => {
+        if (retired) throw new Error('Owned backend retired');
+        const files = readdirSync(root);
+        const target =
+          boundary === 'index-rename'
+            ? files.some((name) => name.startsWith('.pear-index-'))
+            : files.some((name) => name.startsWith('.pear-audio-')) &&
+              !files.includes('new.webm') &&
+              ++beforeLinkChecks === 2;
+        if (target && !armed) {
+          armed = true;
+          queueMicrotask(() => {
+            retired = true;
+          });
+        }
+      };
+      await expect(
+        publishCompleted(
+          root,
+          root,
+          'new.webm',
+          new Uint8Array([1, 2, 3]),
+          input(),
+          guard,
+        ),
+      ).rejects.toThrow(
+        boundary === 'index-rename'
+          ? /index update failed/
+          : /Owned backend retired/,
+      );
+      expect(armed).toBe(true);
+      expect(retired).toBe(true);
+      expect(await readFile(path.join(root, 'prior.webm'), 'utf8')).toBe(
+        'owned-prior',
+      );
+      expect(await readdir(root)).toEqual(
+        boundary === 'index-rename'
+          ? ['new.webm', 'prior.webm']
+          : ['prior.webm'],
+      );
+      if (boundary === 'index-rename') {
+        expect(await readFile(path.join(root, 'new.webm'))).toEqual(
+          Buffer.from([1, 2, 3]),
+        );
+        expect(
+          (await scanLibrary(root)).files.find(
+            (file) => file.path === 'new.webm',
+          )?.status,
+        ).toBe('uncertain');
+      }
+    }));
+}

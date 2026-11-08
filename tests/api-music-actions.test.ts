@@ -1,3 +1,4 @@
+import { rendererMusicActionsOwnerSource } from './helpers/playlist-provider-source';
 import { test, expect } from '@playwright/test';
 import { musicHttpFixture } from './helpers/api-music-http';
 import { musicModuleSource } from './helpers/api-music-source';
@@ -98,11 +99,7 @@ test.beforeAll(async () => {
   try {
     const entry = path.join(owned, 'entry.ts');
     const core = await readFile(path.join(root, 'src/renderer.ts'), 'utf8');
-    coreInit = core.slice(
-      core.indexOf('async function onApiLoaded() {') +
-        'async function onApiLoaded() {'.length,
-      core.indexOf('  // Workaround for macOS traffic lights'),
-    );
+    coreInit = rendererMusicActionsOwnerSource(core);
     const navigationStart = core.indexOf(
       "  window.ipcRenderer.on('peard:previous-video'",
     );
@@ -119,7 +116,7 @@ test.beforeAll(async () => {
         `export * from ${JSON.stringify(path.join(root, 'src/providers/music-actions.ts'))};`,
         `export * from ${JSON.stringify(path.join(root, 'src/providers/music-renderer.ts'))};`,
         `export * from ${JSON.stringify(path.join(root, 'src/plugins/api-server/backend/scheme/music.ts'))};`,
-        `import {publishMusicActionsOwner} from ${JSON.stringify(path.join(root, 'src/providers/music-actions.ts'))};`,
+        `import {publishMusicActionsOwner,getMusicActionsOwner} from ${JSON.stringify(path.join(root, 'src/providers/music-actions.ts'))};`,
         `import {createRepeatPreference} from ${JSON.stringify(path.join(root, 'src/providers/repeat-preference.ts'))};`,
         `import {createPlaylistQueueController} from ${JSON.stringify(path.join(root, 'src/providers/queue-playlist-renderer.ts'))};`,
         `let api,repeatPreference,playlistQueue,disposeMusicActionsOwner; export function initializeCore(next){api=next;${coreInit};return{repeatPreference,playlistQueue,disposeMusicActionsOwner};}`,

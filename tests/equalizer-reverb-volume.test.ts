@@ -59,7 +59,7 @@ import {DATTORRO_WORKLET_SOURCE} from '@/plugins/player-actions/slowed-reverb/wo
 export {createSlowedReverbController, initializeAudioGraph, EqualizerController};
 export {graphFromAnnouncement} from '@/providers/renderer-audio';
 export async function renderWetVolume(options = {}) {
-  const {initialVolume=1, finalVolume=initialVolume, changeAt=.5, delay=0, eqFirst=false, eqGain=36, muted=false, observeBetween=false, observeGate=false, initialMuted=false} = options;
+  const {initialVolume=1, finalVolume=initialVolume, changeAt=.5, delay=0, eqFirst=false, eqGain=36, muted=false, observeBetween=false, observeGate=false, initialMuted=false,amplitude=.9} = options;
   const context = new OfflineAudioContext(2,96000,48000);
   // Acknowledge actual parameter delivery; offline rendering can otherwise
   // outrun queued MessagePort messages. The inherited production DSP is intact.
@@ -68,7 +68,9 @@ export async function renderWetVolume(options = {}) {
     "class Ready extends DattorroReverbProcessor {handleMessage(data){super.handleMessage(data);if(data.type==='setParams')this.port.postMessage('ready')}};registerProcessor('dattorro-reverb',Ready);"
   );
   const addModule=context.audioWorklet.addModule.bind(context.audioWorklet);
-  context.audioWorklet.addModule=async()=>{
+  context.audioWorklet.addModule=async(moduleUrl)=>{
+    const moduleSource=await fetch(moduleUrl).then(response=>response.text());
+    if(!moduleSource.includes("registerProcessor('dattorro-reverb'"))return addModule(moduleUrl);
     const url=URL.createObjectURL(new Blob([workletSource],{type:'application/javascript'}));
     try{await addModule(url);}finally{URL.revokeObjectURL(url);}
   };
@@ -81,7 +83,7 @@ export async function renderWetVolume(options = {}) {
   media.removeEventListener = (name,...args) => {if(name==='volumechange')subscriptions--;return remove(name,...args);};
   const source = context.createBufferSource();
   const buffer = context.createBuffer(2,96000,48000);
-  for(let i=0;i<24000;i++)for(let c=0;c<2;c++)buffer.getChannelData(c)[i]=.9*Math.sin(2*Math.PI*1000*i/48000);
+  for(let i=0;i<24000;i++)for(let c=0;c<2;c++)buffer.getChannelData(c)[i]=amplitude*Math.sin(2*Math.PI*1000*i/48000);
   source.buffer=buffer;
   const volume = context.createGain();volume.gain.value=initialMuted?0:initialVolume;source.connect(volume);
   Object.defineProperty(volume,'mediaElement',{value:media});
@@ -123,11 +125,11 @@ export async function renderWetVolume(options = {}) {
     if(i>=26400&&i<72000){peak=Math.max(peak,Math.abs(value));energy+=value*value;count++;}
     if(i>=72000)lateEnergy+=value*value;
   }
-  const preamp=eq.getResponse().effectivePreampDb;
+  const preamp=eq.getResponse().effectivePreampDb, mixGain=graph.masterInput.gain.value, sourcePeak=media.muted?0:media.volume;
   const inputGain=wet.wetInput?.gain.value,outputGain=wet.wetGain?.gain.value;
   const ownedInput=wet.wetInput;
   wet.teardownAudio();const afterWetStop=subscriptions;eq.stop();
-  return {preparation,samples:rendered.getChannelData(0),peak,rms:Math.sqrt(energy/count),lateEnergy,preamp,inputGain,outputGain,liveSubscriptions,afterWetStop,afterStop:subscriptions,inputReleased:wet.wetInput===null&&ownedInput!==null};
+  return {gateGain:graph.musicGate.gain.value,mixGain,sourcePeak,preparation,samples:rendered.getChannelData(0),peak,rms:Math.sqrt(energy/count),lateEnergy,preamp,inputGain,outputGain,liveSubscriptions,afterWetStop,afterStop:subscriptions,inputReleased:wet.wetInput===null&&ownedInput!==null};
 }
 `);
 });
@@ -145,6 +147,7 @@ for (const eqFirst of [false, true]) {
         steady: steady.peak,
         lower: lower.peak,
         preamp: lower.preamp,
+        sourcePeak: lower.sourcePeak,
         inputGain: lower.inputGain,
         outputGain: lower.outputGain,
         live: lower.liveSubscriptions,
@@ -155,9 +158,17 @@ for (const eqFirst of [false, true]) {
     }, eqFirst);
     expect(result.lower).toBeLessThan(1);
     expect(result.lower).toBeCloseTo(result.steady, 5);
-    expect(result.preamp).toBeCloseTo(-36 - 20 * Math.log10(0.03) - 0.1, 3);
+    expect(result.preamp).toBeCloseTo(
+      -36 - 20 * Math.log10(result.sourcePeak) - 0.1,
+      3,
+    );
     expect(result.inputGain).toBeCloseTo(1 / 0.03, 4);
-    expect(result.outputGain).toBeCloseTo(0.03, 6);
+    // The post-filter node owns intensity as well as the single media-volume
+    // factor, so retained HP/LP samples follow the current output reserve.
+    expect(result.outputGain).toBeCloseTo(
+      0.03 * computeDattorroParams(1).wetGain,
+      6,
+    );
     expect(result.live).toBe(3);
     expect(result.wetStopped).toBe(2);
     expect(result.stopped).toBe(1);
@@ -215,15 +226,18 @@ test('steady wet/dry mix has one volume factor and zero/mute/epsilon stay finite
   await fixturePage(page, bundle);
   const result = await page.evaluate(async () => {
     const run = (window as any).EqualizerFixture.renderWetVolume;
-    const reference = await run({ eqGain: 0 });
+    const reference = await run({ eqGain: 0, amplitude: 0.02 });
     const scaled = [];
     for (const initialVolume of [0.25, 0.03, 0.00001]) {
-      const low = await run({ eqGain: 0, initialVolume });
+      const low = await run({ eqGain: 0, initialVolume, amplitude: 0.02 });
       let error = 0;
       for (let i = 0; i < low.samples.length; i++)
         error = Math.max(
           error,
-          Math.abs(low.samples[i] / initialVolume - reference.samples[i]),
+          Math.abs(
+            low.samples[i] / (initialVolume * low.mixGain) -
+              reference.samples[i] / reference.mixGain,
+          ),
         );
       scaled.push({
         error,
@@ -292,6 +306,17 @@ test('wet volume listeners follow the wired source through replacement, failure 
     const second = create();
     wet.wireAudio(second.context, second.source);
     await wet.ensureWorklet();
+    // The listener assertions below require the existing intensity ramp to end.
+    const rampEnd = wet.wetEnvelope.end;
+    const readyBy = performance.now() + 5000;
+    for (;;) {
+      if (performance.now() >= readyBy)
+        throw new Error('Owned wet intensity ramp did not finish');
+      if (second.context.currentTime >= rampEnd) break;
+      if (second.context.state !== 'running')
+        throw new Error('Owned wet intensity ramp has no running audio clock');
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
     const switched = [first.count(), second.count()];
     const writes: { input: number[]; output: number[] } = {
       input: [],
@@ -363,11 +388,17 @@ test('wet volume listeners follow the wired source through replacement, failure 
   expect(result.switched).toEqual([1, 2]);
   expect(result.staleWrites).toBe(0);
   expect(result.currentWrite[0]).toBeCloseTo(10, 6);
-  expect(result.currentWrite[1]).toBeCloseTo(0.1, 6);
+  expect(result.currentWrite[1]).toBeCloseTo(
+    0.1 * computeDattorroParams(1).wetGain,
+    6,
+  );
   expect(result.epsilon).toEqual([0, 0]);
   expect(result.nearZero[0]).toBeLessThanOrEqual(1e6);
   expect(result.nearZero[0]).toBeCloseTo(100000, 3);
-  expect(result.nearZero[1]).toBeCloseTo(1e-5, 8);
+  expect(result.nearZero[1]).toBeCloseTo(
+    1e-5 * computeDattorroParams(1).wetGain,
+    8,
+  );
   expect(result.muted).toEqual([0, 0]);
   expect(result.repeated).toBe(2);
   expect(result.stopped).toEqual([1, true, true]);
@@ -394,7 +425,10 @@ test('wet scaling and EQ tightening finish before intervening volume listeners c
     return { down: down.preparation.between[0], up: up.preparation.between[0] };
   });
   expect(result.down.wet).not.toBeUndefined();
-  expect(result.down.wet).toBeCloseTo(0.03, 6);
+  expect(result.down.wet).toBeCloseTo(
+    0.03 * computeDattorroParams(1).wetGain,
+    6,
+  );
   expect(result.up.eq).not.toBeUndefined();
   expect(result.up.eq).toBeLessThanOrEqual(10 ** (-36.09 / 20));
 });
@@ -495,15 +529,19 @@ test('native music gate prepares zero and muted chains before reopening ahead of
           finalVolume: 1,
           observeGate: true,
         });
-        results.push(output.preparation.gate[0]);
+        results.push({
+          ...output.preparation.gate[0],
+          finalGate: output.gateGain,
+        });
       }
     return results;
   });
   for (const state of result) {
-    expect(state.gate).toBe(1);
+    expect(state.gate).toBe(0);
+    expect(state.finalGate).toBe(1);
     expect(state.eq).not.toBeUndefined();
     expect(state.eq).toBeLessThanOrEqual(10 ** (-36.09 / 20));
-    expect(state.wet).toBe(1);
+    expect(state.wet).toBe(computeDattorroParams(1).wetGain);
   }
 });
 

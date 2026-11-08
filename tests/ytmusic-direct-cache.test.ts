@@ -8,6 +8,8 @@ import { Window } from 'happy-dom';
 import { build } from 'vite';
 import solidPlugin from 'vite-plugin-solid';
 
+import type { LyricResult } from '../src/plugins/synced-lyrics/types';
+
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
 const directory = path.join(root, 'src/plugins/synced-lyrics/renderer');
@@ -140,6 +142,8 @@ function fixture() {
     }
   }
   Object.assign(window, {
+    // happy-dom's VM omits the native clone available in the Chromium renderer.
+    structuredClone: globalThis.structuredClone,
     MutationObserver: TrackedObserver,
     setInterval: (callback: () => void) => {
       intervals.set(++intervalId, callback);
@@ -363,6 +367,85 @@ test('unchanged mode and unrelated preferences retain completed caches and reque
     expect(f.state.pending.length).toBe(before);
     expect(f.state.lyricsStore.lyrics.YTMusic.data.lyrics).toBe(
       'cached-YTMusic',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('completed cache revisits preserve open-ended words and errors while isolating displayed edits', async () => {
+  type CacheFixtureState = Pick<
+    typeof import('../src/plugins/synced-lyrics/renderer/store'),
+    'lyricsStore' | 'setLyricsStore'
+  > & {
+    renderer: { start(context: unknown): Promise<void> };
+    pending: {
+      provider: string;
+      completed: boolean;
+      resolve(result: LyricResult | null): void;
+      reject(error: Error): void;
+    }[];
+  };
+  const f = fixture();
+  const state = f.state as CacheFixtureState;
+  try {
+    await state.renderer.start(f.context);
+    await f.track('A');
+    for (const request of state.pending) {
+      request.completed = true;
+      if (request.provider === 'YTMusic')
+        request.resolve({
+          ...result('open-ended'),
+          lines: [
+            {
+              time: '00:01.00',
+              timeInMs: 1000,
+              duration: Infinity,
+              text: 'last word',
+              status: 'upcoming',
+              words: [
+                { timeInMs: 1000, word: 'last word', endTimeInMs: Infinity },
+              ],
+            },
+          ],
+        });
+      else if (request.provider === 'LRCLib')
+        request.reject(new f.window.Error('owned provider failure'));
+      else request.resolve(null);
+    }
+    await settle();
+    await f.track('B');
+    await complete(f, 'B');
+    const before = state.pending.length;
+    await f.track('A');
+    expect(state.pending.length).toBe(before);
+    const restored = state.lyricsStore.lyrics;
+    expect(restored.YTMusic.data.lines[0].duration).toBe(Infinity);
+    expect(restored.YTMusic.data.lines[0].words[0].endTimeInMs).toBe(Infinity);
+    expect(restored.LRCLib.state).toBe('error');
+    expect(restored.LRCLib.error.name).toBe('Error');
+    expect(restored.LRCLib.error.message).toBe('owned provider failure');
+    expect(restored.MusixMatch.state).toBe('done');
+    expect(restored.MusixMatch.data).toBeNull();
+    state.setLyricsStore(
+      'lyrics',
+      'YTMusic',
+      'data',
+      'lines',
+      0,
+      'words',
+      0,
+      'word',
+      'display-only edit',
+    );
+    expect(state.lyricsStore.lyrics.YTMusic.data.lines[0].words[0].word).toBe(
+      'display-only edit',
+    );
+    await f.track('B');
+    await f.track('A');
+    expect(state.pending.length).toBe(before);
+    expect(state.lyricsStore.lyrics.YTMusic.data.lines[0].words[0].word).toBe(
+      'last word',
     );
   } finally {
     await f.close();

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { build, normalizePath } from 'vite';
+import { headlessApiMenuBoundary } from './api-headless-menu-boundary';
 const root = path.resolve(import.meta.dirname, '../..'),
   requireRoot = createRequire(path.join(root, 'package.json'));
 function nativeRouteSelection() {
@@ -90,6 +91,7 @@ export async function musicNative<T>(
       logLevel: 'silent' as const,
       resolve: { alias: {} },
       plugins: [
+        headlessApiMenuBoundary(root),
         {
           name: 'native-app-boundaries',
           enforce: 'pre' as const,

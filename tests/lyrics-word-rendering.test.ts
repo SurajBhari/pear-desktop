@@ -30,6 +30,7 @@ let scratch: string;
 let code: string;
 let css: string;
 let clip: string | undefined;
+let gapClip: string | undefined;
 
 test.use({
   video: process.env.PEAR_LYRICS_EVIDENCE_DIR ? 'on' : 'off',
@@ -42,7 +43,7 @@ test.beforeAll(async () => {
   const entry = path.join(scratch, 'entry.tsx');
   await writeFile(
     entry,
-    `import{render}from'solid-js/web';import{LyricsRenderer,currentTime,setCurrentTime,setIsVisible,setConfig,startLyricsEffects}from ${JSON.stringify(renderer)};import{renderer as plugin}from ${JSON.stringify(lifecycle)};import{LRCLib}from ${JSON.stringify(provider)};import{__ownedFixturePlayerAPI}from ${JSON.stringify(component)};import{setLyrics}from'fixture-state';const settings={enabled:true,lineEffect:'fancy',romanization:false,convertChineseCharacter:'disabled',defaultTextString:'',showTimeCodes:false};window.mount=(lines)=>{setConfig(settings);startLyricsEffects();setLyrics({state:'done',data:{lines}});setIsVisible(true);const dispose=render(()=> <LyricsRenderer/>,document.querySelector('#lyrics-tab'));window.fixture={setConfig,setTime:setCurrentTime,time:currentTime,setVisible:setIsVisible,setLines:lines=>setLyrics({state:'done',data:{lines}}),dispose,plugin};setCurrentTime(0)};window.searchProvider=async data=>{window.fetch=async()=>new Response(JSON.stringify(data),{status:200});return new LRCLib().search({title:'Song',artist:'Artist',album:'Album',songDuration:10,videoId:'A'})};window.nativeClock=async()=>{const video=document.createElement('video');document.body.append(video);const header=new Uint8Array(44+44100*40*2);const view=new DataView(header.buffer);const ascii=(offset,value)=>[...value].forEach((c,i)=>header[offset+i]=c.charCodeAt(0));ascii(0,'RIFF');view.setUint32(4,header.length-8,true);ascii(8,'WAVE');ascii(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,44100,true);view.setUint32(28,88200,true);view.setUint16(32,2,true);view.setUint16(34,16,true);ascii(36,'data');view.setUint32(40,header.length-44,true);const url=URL.createObjectURL(new Blob([header],{type:'audio/wav'}));video.src=url;await new Promise((yes,no)=>{video.onloadedmetadata=yes;video.onerror=no});const events=new EventTarget();const api={getCurrentTime:()=>video.currentTime,getVideoData:()=>({video_id:'A'}),getPlayerResponse:()=>({videoDetails:{videoId:'A'}}),addEventListener:events.addEventListener.bind(events),removeEventListener:events.removeEventListener.bind(events),seekTo:t=>video.currentTime=t};await plugin.start({getConfig:async()=>settings,ipc:{invoke:async()=>{},subscribe:()=>()=>{}}});await plugin.onPlayerApiReady(api);if(__ownedFixturePlayerAPI()!==api)throw new Error('Fixture lifecycle and lyric component have different player API owners');window.fixture.video=video;window.fixture.disposeClock=()=>{plugin.stop();video.pause();video.remove();URL.revokeObjectURL(url)};return video.duration};`,
+    `import{render}from'solid-js/web';import{LyricsRenderer,currentTime,setCurrentTime,setIsVisible,setConfig,startLyricsEffects}from ${JSON.stringify(renderer)};import{renderer as plugin}from ${JSON.stringify(lifecycle)};import{LRCLib}from ${JSON.stringify(provider)};import{__ownedFixturePlayerAPI}from ${JSON.stringify(component)};import{setLyrics}from'fixture-state';const settings={enabled:true,lineEffect:'fancy',romanization:false,convertChineseCharacter:'disabled',defaultTextString:'',showTimeCodes:false};window.mount=(lines)=>{setConfig(settings);startLyricsEffects();setLyrics({state:'done',data:{lines}});setIsVisible(true);const dispose=render(()=> <LyricsRenderer/>,document.querySelector('#lyrics-tab'));window.fixture={setConfig,setTime:setCurrentTime,time:currentTime,setVisible:setIsVisible,setLines:lines=>setLyrics({state:'done',data:{lines}}),dispose,plugin};setCurrentTime(0)};window.searchProvider=async data=>{window.fetch=async()=>new Response(JSON.stringify(data),{status:200});return new LRCLib().search({title:'Song',artist:'Artist',album:'Album',songDuration:10,videoId:'A'})};window.nativeClock=async()=>{const video=document.createElement('video');document.body.append(video);const header=new Uint8Array(44+44100*40*2);const view=new DataView(header.buffer);const ascii=(offset,value)=>[...value].forEach((c,i)=>header[offset+i]=c.charCodeAt(0));ascii(0,'RIFF');view.setUint32(4,header.length-8,true);ascii(8,'WAVE');ascii(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,44100,true);view.setUint32(28,88200,true);view.setUint16(32,2,true);view.setUint16(34,16,true);ascii(36,'data');view.setUint32(40,header.length-44,true);const url=URL.createObjectURL(new Blob([header],{type:'audio/wav'}));video.src=url;await new Promise((yes,no)=>{video.onloadedmetadata=yes;video.onerror=no});const events=new EventTarget();const api={getPlayerState:()=>video.paused?2:1,getCurrentTime:()=>video.currentTime,getVideoData:()=>({video_id:'A'}),getPlayerResponse:()=>({videoDetails:{videoId:'A'}}),addEventListener:events.addEventListener.bind(events),removeEventListener:events.removeEventListener.bind(events),seekTo:t=>video.currentTime=t};await plugin.start({getConfig:async()=>settings,ipc:{invoke:async()=>{},subscribe:()=>()=>{}}});await plugin.onPlayerApiReady(api);if(__ownedFixturePlayerAPI()!==api)throw new Error('Fixture lifecycle and lyric component have different player API owners');window.fixture.video=video;window.fixture.disposeClock=()=>{plugin.stop();video.pause();video.remove();URL.revokeObjectURL(url)};return video.duration};`,
   );
   const result = await build({
     root,
@@ -161,6 +162,11 @@ test.afterEach(async ({ page }, info) => {
     info.title.startsWith('real virtualized')
   )
     clip = await page.video()?.path();
+  if (
+    process.env.PEAR_LYRICS_EVIDENCE_DIR &&
+    info.title.startsWith('only the playing current gap')
+  )
+    gapClip = await page.video()?.path();
 });
 test.afterAll(async () => {
   await rm(scratch, { recursive: true, force: true });
@@ -171,6 +177,11 @@ test.afterAll(async () => {
         process.env.PEAR_LYRICS_EVIDENCE_DIR,
         'lyrics-scroll-word-fixture.webm',
       ),
+    );
+  if (gapClip && process.env.PEAR_LYRICS_EVIDENCE_DIR)
+    await copyFile(
+      gapClip,
+      path.join(process.env.PEAR_LYRICS_EVIDENCE_DIR, 'lyrics-gap-breath.webm'),
     );
 });
 
@@ -357,6 +368,250 @@ test('explicit silent intervals get calm accessible feedback and hidden panels s
     (window as any).fixture.setTime(11000);
   });
   await expect(page.locator('.synced-lyrics-vlist')).toHaveCount(0);
+});
+
+test('finite gaps replace the configured bullet cycle instead of stacking two indicators', async ({
+  page,
+}) => {
+  await mount(page, [
+    { ...timed, timeInMs: 0, duration: 10000, text: '', words: [] },
+    { ...timed, timeInMs: 10000 },
+  ]);
+  await page.evaluate(() => {
+    const f = (window as any).fixture;
+    f.setConfig({
+      enabled: true,
+      lineEffect: 'fancy',
+      defaultTextString: ['•', '••', '•••'],
+    });
+    f.setTime(2500);
+  });
+  const gap = page.locator('.synced-line.current');
+  await expect(gap.locator('.instrumental-indicator')).toHaveCount(1);
+  await expect(gap.locator('.lyrics-placeholder')).toHaveCount(0);
+  await expect(gap.locator('.instrumental-indicator i')).toHaveCount(3);
+  await page.evaluate(() => {
+    const f = (window as any).fixture;
+    f.setLines([
+      {
+        time: '',
+        timeInMs: 0,
+        duration: Infinity,
+        text: '',
+        words: [],
+        status: 'upcoming',
+      },
+    ]);
+    f.setTime(2500);
+  });
+  await expect(page.locator('.instrumental-indicator')).toHaveCount(0);
+  await expect(page.locator('.lyrics-placeholder')).toHaveCount(0);
+  await expect(page.locator('.synced-line')).toHaveCount(0);
+});
+
+test('only the playing current gap breathes, freezes on pause and respects reduced motion', async ({
+  page,
+}) => {
+  await mount(page, [
+    { ...timed, timeInMs: 0, duration: 10000, text: '', words: [] },
+    { ...timed, timeInMs: 10000 },
+    { ...timed, timeInMs: 20000 },
+  ]);
+  await page.evaluate(async () => {
+    await (window as any).nativeClock();
+    (window as any).fixture.video.currentTime = 2;
+  });
+  const marker = page.locator('.synced-line.current .instrumental-indicator');
+  const pulse = marker.locator(':scope > span');
+  await expect(marker).toHaveCount(1);
+  const playState = () =>
+    pulse.evaluate((node) => node.getAnimations()[0]?.playState ?? 'none');
+  await expect.poll(playState).toBe('paused');
+  await page.waitForTimeout(300);
+  const geometry = await marker.boundingBox();
+  const nextLine = page.locator('.lyrics-original').first();
+  const lyricGeometry = await nextLine.boundingBox();
+  await page.evaluate(() => (window as any).fixture.video.play());
+  await expect.poll(playState).toBe('running');
+  const sample = () =>
+    pulse.evaluate((node) => {
+      const s = getComputedStyle(node);
+      return { opacity: s.opacity, transform: s.transform };
+    });
+  const first = await sample();
+  await expect.poll(sample).not.toEqual(first);
+  if (process.env.PEAR_LYRICS_EVIDENCE_DIR)
+    await page.locator('#lyrics-tab').screenshot({
+      path: path.join(
+        process.env.PEAR_LYRICS_EVIDENCE_DIR,
+        'lyrics-gap-playing.png',
+      ),
+    });
+  expect(await marker.boundingBox()).toEqual(geometry);
+  expect(await nextLine.boundingBox()).toEqual(lyricGeometry);
+  expect(
+    await page
+      .locator('.synced-line.upcoming .instrumental-indicator > span')
+      .evaluateAll(
+        (nodes) => nodes.flatMap((node) => node.getAnimations()).length,
+      ),
+  ).toBe(0);
+  await page.evaluate(() => (window as any).fixture.video.pause());
+  await expect.poll(playState).toBe('paused');
+  await pulse.evaluate(async (node) => {
+    const animation = node.getAnimations()[0];
+    if (!animation) throw new Error('Expected the current gap animation');
+    await animation.ready;
+    if (
+      node.getAnimations()[0] !== animation ||
+      animation.pending ||
+      animation.playState !== 'paused'
+    )
+      throw new Error('The current gap pause did not settle');
+  });
+  const frozen = await sample();
+  await page.waitForTimeout(200);
+  expect(await sample()).toEqual(frozen);
+  await page.evaluate(() => ((window as any).fixture.video.currentTime = 11));
+  await expect(
+    page.locator('.synced-line.current .instrumental-indicator'),
+  ).toHaveCount(0);
+  expect(
+    await page
+      .locator('.instrumental-indicator > span')
+      .evaluateAll(
+        (nodes) => nodes.flatMap((node) => node.getAnimations()).length,
+      ),
+  ).toBe(0);
+  await page.evaluate(() => ((window as any).fixture.video.currentTime = 2));
+  await expect.poll(playState).toBe('paused');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.evaluate(() => (window as any).fixture.video.play());
+  await expect.poll(playState).toBe('none');
+  expect(await pulse.evaluate((node) => getComputedStyle(node).transform)).toBe(
+    'none',
+  );
+  await page.evaluate(() => {
+    const f = (window as any).fixture;
+    f.plugin.stop();
+  });
+  expect(
+    await page
+      .locator('.instrumental-indicator > span')
+      .evaluateAll(
+        (nodes) => nodes.flatMap((node) => node.getAnimations()).length,
+      ),
+  ).toBe(0);
+  await page.evaluate(() => (window as any).fixture.setLines([]));
+  await expect(page.locator('.instrumental-indicator')).toHaveCount(0);
+  await page.evaluate(() => (window as any).fixture.disposeClock());
+});
+
+test('known instrumental intervals stay visible at every status without changing row layout', async ({
+  page,
+}) => {
+  await mount(page, [
+    { ...timed, timeInMs: 0, duration: 10000, text: '', words: [] },
+    { ...timed, timeInMs: 10000 },
+    { ...timed, timeInMs: 20000 },
+  ]);
+  const markers = page.locator('.instrumental-indicator');
+  await expect(markers).toHaveCount(2);
+  const layout = () =>
+    markers.evaluateAll((nodes) =>
+      nodes.map((node) => {
+        const marker = node as HTMLElement;
+        const row = marker.closest('.synced-line') as HTMLElement;
+        return [marker.offsetWidth, marker.offsetHeight, row.offsetHeight];
+      }),
+    );
+  const initialLayout = await layout();
+  for (const dimensions of initialLayout)
+    for (const dimension of dimensions) expect(dimension).toBeGreaterThan(0);
+
+  for (const time of [0, 11000, 15000, 21000, 2000]) {
+    await page.evaluate((time) => (window as any).fixture.setTime(time), time);
+    await expect(markers.nth(0)).toBeVisible();
+    await expect(markers.nth(1)).toBeVisible();
+    await expect(markers.nth(0).locator('i')).toHaveCount(3);
+    await expect(markers.nth(1).locator('i')).toHaveCount(3);
+  }
+  expect(await layout()).toEqual(initialLayout);
+});
+
+test('blank interval boundary keeps two-second seekable dots and hides short or unknown tails', async ({
+  page,
+}) => {
+  await mount(page, [{ ...timed }]);
+  await page.evaluate(async () => {
+    await (window as any).nativeClock();
+    (window as any).fixture.setLines([
+      { time: '00:00', timeInMs: 0, duration: 1999, text: '', words: [] },
+      { time: '00:02', timeInMs: 2000, duration: 2000, text: '', words: [] },
+      {
+        time: '00:04',
+        timeInMs: 4000,
+        duration: Infinity,
+        text: '',
+        words: [],
+      },
+      { time: '00:06', timeInMs: 6000, duration: NaN, text: '', words: [] },
+    ]);
+  });
+  const gap = page.getByRole('button', { name: 'Instrumental', exact: true });
+  await expect(gap).toHaveCount(1);
+  await expect(gap.locator('.instrumental-indicator i')).toHaveCount(3);
+  await expect(page.locator('.lyrics-placeholder')).toHaveCount(0);
+  await gap.click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fixture.video.currentTime))
+    .toBeCloseTo(2.01, 3);
+  await page.evaluate(() => ((window as any).fixture.video.currentTime = 0));
+  await gap.focus();
+  await page.keyboard.press('Enter');
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fixture.video.currentTime))
+    .toBeCloseTo(2.01, 3);
+  await page.evaluate(() => ((window as any).fixture.video.currentTime = 0));
+  await page.keyboard.press('Space');
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fixture.video.currentTime))
+    .toBeCloseTo(2.01, 3);
+  await page.evaluate(() => (window as any).fixture.disposeClock());
+});
+
+test('future pause dots remain visible in narrow and wide lyric layouts', async ({
+  page,
+}) => {
+  await mount(page, [
+    { ...timed, timeInMs: 0, duration: 10000, text: '', words: [] },
+    { ...timed, timeInMs: 10000 },
+    { ...timed, timeInMs: 20000 },
+  ]);
+  await page.evaluate(() => (window as any).fixture.setTime(11000));
+  for (const width of [360, 960]) {
+    await page.setViewportSize({ width, height: 600 });
+    await page.locator('#lyrics-tab').evaluate((node) => {
+      (node as HTMLElement).style.width = '100%';
+    });
+    const future = page.locator(
+      '.synced-line.upcoming .instrumental-indicator',
+    );
+    await expect(future).toBeVisible();
+    expect(await future.locator('i').count()).toBe(3);
+    expect(
+      await future
+        .locator('span')
+        .evaluate((node) => node.getAnimations().length),
+    ).toBe(0);
+    if (process.env.PEAR_LYRICS_EVIDENCE_DIR)
+      await page.locator('#lyrics-tab').screenshot({
+        path: path.join(
+          process.env.PEAR_LYRICS_EVIDENCE_DIR,
+          `lyrics-future-gap-${width}.png`,
+        ),
+      });
+  }
 });
 
 test('actual LRCLib uses optional lyricsfile, keeps ordinary LRC fallback and represents verified instrumental metadata', async ({

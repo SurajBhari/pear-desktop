@@ -23,6 +23,8 @@ import type { MusicPlayer } from '@/types/music-player';
 
 const MIN_PLAYBACK_SPEED = 0.07;
 const MAX_PLAYBACK_SPEED = 16;
+// The slider snaps relative to min; match the existing two-decimal rates.
+const PLAYBACK_SPEED_SLIDER_STEP = 0.01;
 const PLUGIN_ID = 'playback-speed';
 const roundToTwo = (n: number) => Math.round(n * 1e2) / 1e2;
 const [speed, setSpeed] = createSignal(1);
@@ -287,6 +289,8 @@ export const onPlayerApiReady = (
   dispose = render(
     () => (
       <PlaybackSpeedSlider
+        max={MAX_PLAYBACK_SPEED}
+        min={MIN_PLAYBACK_SPEED}
         onImmediateValueChanged={(event) => {
           if (!active || currentGeneration !== generation) return;
           let target = Number(event.detail.value ?? MIN_PLAYBACK_SPEED);
@@ -315,6 +319,7 @@ export const onPlayerApiReady = (
           updatePlaybackSpeed();
         }}
         speed={speed()}
+        step={PLAYBACK_SPEED_SLIDER_STEP}
         title={t('plugins.playback-speed.templates.button')}
       />
     ),

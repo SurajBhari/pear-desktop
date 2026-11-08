@@ -180,6 +180,11 @@ class DattorroReverbProcessor extends AudioWorkletProcessor {
         x = this.allpassAp(d.buf, d.mask, d.off, g, x);
       }
 
+      // Each tank leg attenuates twice by decay (at cross-feed and before its
+      // second diffuser). Normalize that coherent feedback build-up, rather
+      // than driving a waveshaper harder as the decay control rises.
+      x *= 1 - this.decayAmt * this.decayAmt;
+
       if ((this.t & 0x7ff) === 0) {
         // Slow triangle LFO: sweep the modulated-delay read offsets a few
         // samples each way so the reverb tail stays shimmering, not metallic.
@@ -225,8 +230,11 @@ class DattorroReverbProcessor extends AudioWorkletProcessor {
             - this.decayDiff2[1].readTap(this.t, 'out1')
             + this.postDampDL[1].readTap(this.t, 'out1'));
 
-      outL[i] = this.wetGain * (wL / (1 + Math.abs(wL)));
-      outR[i] = this.wetGain * (wR / (1 + Math.abs(wR)));
+      // Seven signed tank taps form the stereo output. Normalize their energy
+      // linearly: waveshaping this sum adds audible harmonics to ordinary PCM.
+      // The renderer reserves dry+wet output headroom before the shared EQ.
+      outL[i] = this.wetGain * wL / Math.sqrt(7);
+      outR[i] = this.wetGain * wR / Math.sqrt(7);
 
       this.t++;
     }

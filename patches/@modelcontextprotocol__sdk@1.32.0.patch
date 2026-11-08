@@ -1,0 +1,98 @@
+--- a/dist/esm/server/webStandardStreamableHttp.js
++++ b/dist/esm/server/webStandardStreamableHttp.js
+@@ -936,13 +936,39 @@
+                     if (this.sessionId !== undefined) {
+                         headers['mcp-session-id'] = this.sessionId;
+                     }
+-                    const responses = relatedIds.map(id => this._requestResponseMap.get(id));
+-                    if (responses.length === 1) {
+-                        stream.resolveJson(new Response(JSON.stringify(responses[0]), { status: 200, headers }));
+-                    }
+-                    else {
+-                        stream.resolveJson(new Response(JSON.stringify(responses), { status: 200, headers }));
+-                    }
++                    const jsonStream = stream;
++                    const jsonStreamId = streamId;
++                    const jsonIds = relatedIds.slice();
++                    const jsonResponses = jsonIds.map(id => this._requestResponseMap.get(id));
++                    const jsonResolve = jsonStream.resolveJson;
++                    const jsonFailure = this.createJsonErrorResponse(500, -32603, 'Internal server error', { headers });
++                    const jsonOwnershipFailure = new Error('JSON response ownership changed');
++                    const ownsJson = () => this._streamMapping.get(jsonStreamId) === jsonStream && jsonIds.every((id, index) => this._requestToStreamMapping.get(id) === jsonStreamId && this._requestResponseMap.get(id) === jsonResponses[index]);
++                    const cleanupJson = () => {
++                        if (this._streamMapping.get(jsonStreamId) !== jsonStream) return;
++                        jsonStream.cleanup();
++                        for (const id of jsonIds) {
++                            if (this._requestToStreamMapping.get(id) === jsonStreamId) {
++                                this._requestResponseMap.delete(id);
++                                this._requestToStreamMapping.delete(id);
++                            }
++                        }
++                        this._resumableStreams.delete(jsonStreamId);
++                    };
++                    try {
++                        const serialized = JSON.stringify(jsonResponses.length === 1 ? jsonResponses[0] : jsonResponses);
++                        const response = new Response(serialized, { status: 200, headers });
++                        if (!ownsJson()) throw jsonOwnershipFailure;
++                        jsonResolve(response);
++                    }
++                    catch (error) {
++                        jsonResolve(jsonFailure);
++                        throw error;
++                    }
++                    finally {
++                        cleanupJson();
++                    }
++                    return;
+                 }
+                 else {
+                     // End the SSE stream
+--- a/dist/cjs/server/webStandardStreamableHttp.js
++++ b/dist/cjs/server/webStandardStreamableHttp.js
+@@ -939,13 +939,39 @@
+                     if (this.sessionId !== undefined) {
+                         headers['mcp-session-id'] = this.sessionId;
+                     }
+-                    const responses = relatedIds.map(id => this._requestResponseMap.get(id));
+-                    if (responses.length === 1) {
+-                        stream.resolveJson(new Response(JSON.stringify(responses[0]), { status: 200, headers }));
+-                    }
+-                    else {
+-                        stream.resolveJson(new Response(JSON.stringify(responses), { status: 200, headers }));
+-                    }
++                    const jsonStream = stream;
++                    const jsonStreamId = streamId;
++                    const jsonIds = relatedIds.slice();
++                    const jsonResponses = jsonIds.map(id => this._requestResponseMap.get(id));
++                    const jsonResolve = jsonStream.resolveJson;
++                    const jsonFailure = this.createJsonErrorResponse(500, -32603, 'Internal server error', { headers });
++                    const jsonOwnershipFailure = new Error('JSON response ownership changed');
++                    const ownsJson = () => this._streamMapping.get(jsonStreamId) === jsonStream && jsonIds.every((id, index) => this._requestToStreamMapping.get(id) === jsonStreamId && this._requestResponseMap.get(id) === jsonResponses[index]);
++                    const cleanupJson = () => {
++                        if (this._streamMapping.get(jsonStreamId) !== jsonStream) return;
++                        jsonStream.cleanup();
++                        for (const id of jsonIds) {
++                            if (this._requestToStreamMapping.get(id) === jsonStreamId) {
++                                this._requestResponseMap.delete(id);
++                                this._requestToStreamMapping.delete(id);
++                            }
++                        }
++                        this._resumableStreams.delete(jsonStreamId);
++                    };
++                    try {
++                        const serialized = JSON.stringify(jsonResponses.length === 1 ? jsonResponses[0] : jsonResponses);
++                        const response = new Response(serialized, { status: 200, headers });
++                        if (!ownsJson()) throw jsonOwnershipFailure;
++                        jsonResolve(response);
++                    }
++                    catch (error) {
++                        jsonResolve(jsonFailure);
++                        throw error;
++                    }
++                    finally {
++                        cleanupJson();
++                    }
++                    return;
+                 }
+                 else {
+                     // End the SSE stream

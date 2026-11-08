@@ -82,6 +82,8 @@
       }
     },
     "menu": {
+      "mcp-dependency-notices-error": "The MCP dependency notices could not be opened.",
+      "mcp-dependency-notices": "MCP dependency notices",
       "about": "About",
       "navigation": {
         "label": "Navigation",
@@ -594,6 +596,7 @@
             "fade-out-duration": "Fade out duration (ms)",
             "fade-scaling": {
               "label": "Fade scaling",
+              "equalPower": "Equal power",
               "linear": "Linear",
               "logarithmic": "Logarithmic"
             },
@@ -1343,7 +1346,11 @@
         "offset-help": "Positive values show lyrics later; negative values show them earlier.",
         "romanization-size": "Romanization size",
         "enhanced-lrc": "Export real word timing in enhanced LRC",
-        "enhanced-lrc-help": "Use source word timestamps when available; other lines retain line timing."
+        "enhanced-lrc-help": "Use source word timestamps when available; other lines retain line timing.",
+        "show-export": {
+          "label": "Show lyrics export button",
+          "tooltip": "Show or hide the export button and its status in the lyrics picker."
+        }
       }
     },
     "taskbar-mediacontrol": {
@@ -1492,6 +1499,7 @@
         "button": "Block {{name}}"
       },
       "menu": {
+        "allow-intentional-previous": "Allow an intentionally revisited song to play once",
         "add": {
           "label": "Add blocked artist…",
           "prompt-title": "Block artist",
@@ -1508,8 +1516,16 @@
       }
     },
     "skip-live-songs": {
-      "name": "Skip live recordings",
-      "description": "Skip explicitly marked live recordings. Ordinary city, radio and studio titles are retained."
+      "name": "Skip non-studio recordings",
+      "description": "Skip selected, explicitly marked live, acoustic, demo, session or venue recordings. Ordinary song titles are retained.",
+      "menu": {
+        "live": "Live, concert, festival and tour recordings",
+        "acoustic": "Acoustic and unplugged versions",
+        "demo": "Demo and rehearsal recordings",
+        "session": "Radio, BBC and broadcast sessions",
+        "venue": "Recordings with a performance location",
+        "unsupported": "Recording categories contain unsupported data; stored preferences are preserved."
+      }
     },
     "auto-acknowledge": {
       "name": "Auto-acknowledge content warnings",

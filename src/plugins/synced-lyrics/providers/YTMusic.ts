@@ -68,7 +68,7 @@ export class YTMusic implements LyricProvider {
         timeInMs: parseInt(it.cueRange.startTimeMilliseconds),
         duration: parseInt(it.cueRange.endTimeMilliseconds) -
           parseInt(it.cueRange.startTimeMilliseconds),
-        text: it.lyricLine.trim() === '♪' ? '' : it.lyricLine.trim(),
+        text: it.lyricLine.trim() === '♪' ? '' : it.lyricLine,
         status: 'upcoming' as const,
       }))
       : undefined;

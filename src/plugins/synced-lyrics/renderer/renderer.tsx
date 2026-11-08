@@ -41,12 +41,14 @@ export const startLyricsEffects = () =>
       // Saved effect names remain readable; emphasis never changes glyph metrics.
       const fancy = config()?.lineEffect === 'fancy';
       const styles = {
-        '--lyrics-font-size': fancy ? '3rem' : 'clamp(1.4rem, 1.1vmax, 3rem)',
+        '--lyrics-font-size': fancy
+          ? 'clamp(2.4rem, 3vw, 3rem)'
+          : 'clamp(1.4rem, 1.1vmax, 3rem)',
         '--lyrics-line-height': fancy
           ? '1.333'
           : 'var(--ytmusic-body-line-height)',
         '--lyrics-width': config()?.lineEffect === 'scale' ? '83%' : '100%',
-        '--lyrics-padding': fancy ? '2rem' : '0',
+        '--lyrics-padding': fancy ? '16px' : '0',
         '--lyrics-romanization-ratio': String(
           romanizationRatio(config()?.romanizationSizePercent),
         ),
@@ -84,6 +86,7 @@ type LyricsRendererChild =
 const lyricsPicker: LyricsRendererChild = { kind: 'LyricsPicker' };
 
 export const [currentTime, setCurrentTime] = createSignal<number>(-1);
+export const [isPlaying, setIsPlaying] = createSignal(false);
 export const LyricsRenderer = () => {
   const [scroller, setScroller] = createSignal<VirtualizerHandle>();
   const [stickyRef, setStickRef] = createSignal<HTMLElement | null>(null);
@@ -117,33 +120,87 @@ export const LyricsRenderer = () => {
 
   const tab = document.querySelector<HTMLElement>(selectors.body.tabRenderer)!;
 
-  let mouseCoord = 0;
-  const mousemoveListener = (e: Event) => {
-    if ('clientY' in e) {
-      mouseCoord = (e as MouseEvent).clientY;
-    }
-
-    const { top } = tab.getBoundingClientRect();
-    const height = stickyRef()?.clientHeight ?? 0;
+  let pointer: { x: number; y: number } | null = null;
+  let keyboardMode = true;
+  let windowActive = true;
+  const updatePicker = (
+    focusTarget: EventTarget | null = document.activeElement,
+  ) => {
+    const picker = stickyRef();
+    if (!picker) return;
+    const { top, left, right, bottom } = tab.getBoundingClientRect();
+    const height = picker.offsetHeight;
     const scrollOffset = scroller()?.scrollOffset ?? -1;
-
     const isInView = scrollOffset <= height;
-    const isMouseOver = mouseCoord - top - 5 <= height;
-
-    const showPicker = isInView || isMouseOver;
-
-    if (showPicker) {
-      // picker visible
-      stickyRef()?.style.setProperty('--lyrics-picker-top', '0');
-    } else {
-      // picker hidden
-      stickyRef()?.style.setProperty('--lyrics-picker-top', `-${height}px`);
-    }
+    // Use the reveal region, rather than the moving picker's bounds, so hiding
+    // it never removes the target needed to reveal it again.
+    const isPointerOver =
+      pointer !== null &&
+      pointer.x >= left &&
+      pointer.x < right &&
+      pointer.y >= top &&
+      pointer.y < Math.min(top + height + 5, bottom);
+    const hasKeyboardFocus =
+      keyboardMode &&
+      focusTarget instanceof Node &&
+      picker.contains(focusTarget);
+    const showPicker =
+      windowActive &&
+      !document.hidden &&
+      (isInView || isPointerOver || hasKeyboardFocus);
+    picker.style.setProperty(
+      '--lyrics-picker-top',
+      showPicker ? '0' : `-${height}px`,
+    );
+  };
+  const pointerMove = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') return;
+    pointer = { x: event.clientX, y: event.clientY };
+    updatePicker();
+  };
+  const pointerLeave = () => {
+    pointer = null;
+    updatePicker();
+  };
+  const pointerDown = (event: PointerEvent) => {
+    // A mouse/touch click may focus a button, but must not latch hover open.
+    keyboardMode = false;
+    if (event.pointerType === 'touch') pointer = null;
+    updatePicker();
+  };
+  const keyDown = (event: KeyboardEvent) => {
+    if (['Shift', 'Control', 'Alt', 'Meta'].includes(event.key)) return;
+    keyboardMode = true;
+    updatePicker();
+  };
+  const focusChange = (event: FocusEvent) => {
+    updatePicker(
+      event.type === 'focusout' ? event.relatedTarget : event.target,
+    );
+  };
+  const windowBlur = () => {
+    windowActive = false;
+    pointerLeave();
+  };
+  const windowFocus = () => {
+    windowActive = true;
+    updatePicker();
   };
 
   onMount(() => {
-    tab.addEventListener('mousemove', mousemoveListener);
-    const visibility = () => setPageVisible(!document.hidden);
+    tab.addEventListener('pointermove', pointerMove);
+    tab.addEventListener('pointerleave', pointerLeave);
+    document.addEventListener('pointerdown', pointerDown, true);
+    document.addEventListener('keydown', keyDown, true);
+    tab.addEventListener('focusin', focusChange);
+    tab.addEventListener('focusout', focusChange);
+    window.addEventListener('blur', windowBlur);
+    window.addEventListener('focus', windowFocus);
+    const visibility = () => {
+      setPageVisible(!document.hidden);
+      if (document.hidden) pointer = null;
+      updatePicker();
+    };
     const reduce = () => setReducedMotion(preference.matches);
     document.addEventListener('visibilitychange', visibility);
     preference.addEventListener('change', reduce);
@@ -151,13 +208,21 @@ export const LyricsRenderer = () => {
     for (const event of ['wheel', 'touchstart', 'pointerdown', 'keydown'])
       tab.addEventListener(event, interrupt, { passive: true });
     const resize = new ResizeObserver(() => {
+      updatePicker();
       if (isVisible() && !document.hidden && currentIndex() >= 0)
         center(currentIndex() + 1, true);
     });
     resize.observe(tab);
 
     onCleanup(() => {
-      tab.removeEventListener('mousemove', mousemoveListener);
+      tab.removeEventListener('pointermove', pointerMove);
+      tab.removeEventListener('pointerleave', pointerLeave);
+      document.removeEventListener('pointerdown', pointerDown, true);
+      document.removeEventListener('keydown', keyDown, true);
+      tab.removeEventListener('focusin', focusChange);
+      tab.removeEventListener('focusout', focusChange);
+      window.removeEventListener('blur', windowBlur);
+      window.removeEventListener('focus', windowFocus);
       document.removeEventListener('visibilitychange', visibility);
       preference.removeEventListener('change', reduce);
       for (const event of ['wheel', 'touchstart', 'pointerdown', 'keydown'])
@@ -169,11 +234,13 @@ export const LyricsRenderer = () => {
   createEffect(() => {
     if (!isVisible() || !scroller()) return;
     const vList = tab.querySelector<HTMLElement>('.synced-lyrics-vlist');
-    vList?.addEventListener('scroll', mousemoveListener);
-    vList?.addEventListener('scrollend', mousemoveListener);
+    const scroll = () => updatePicker();
+    vList?.addEventListener('scroll', scroll);
+    vList?.addEventListener('scrollend', scroll);
+    updatePicker();
     onCleanup(() => {
-      vList?.removeEventListener('scroll', mousemoveListener);
-      vList?.removeEventListener('scrollend', mousemoveListener);
+      vList?.removeEventListener('scroll', scroll);
+      vList?.removeEventListener('scrollend', scroll);
     });
   });
 

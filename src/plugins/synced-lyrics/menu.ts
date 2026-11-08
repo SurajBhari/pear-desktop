@@ -13,6 +13,78 @@ export const menu = async (
   ctx: MenuContext<SyncedLyricsPluginConfig>,
 ): Promise<MenuItemConstructorOptions[]> => {
   const config = await ctx.getConfig();
+  let confirmedExport = config.enableDownload !== false;
+  let requestedExport = confirmedExport;
+  let requestId = 0;
+  let pendingWrite: Promise<void> = Promise.resolve();
+
+  const updateExportVisibility = (item?: { checked?: boolean }) => {
+    const enabled =
+      typeof item?.checked === 'boolean' ? item.checked : !requestedExport;
+    const thisRequest = ++requestId;
+    requestedExport = enabled;
+
+    const write = async (): Promise<boolean> => {
+      try {
+        await ctx.setConfig({ enableDownload: enabled });
+        confirmedExport = enabled;
+        if (thisRequest === requestId) {
+          requestedExport = enabled;
+          if (item) item.checked = enabled;
+        }
+      } catch (writeError) {
+        let persisted = confirmedExport;
+        let readError: unknown;
+        try {
+          persisted = (await ctx.getConfig()).enableDownload !== false;
+          confirmedExport = persisted;
+        } catch (error) {
+          readError = error;
+        }
+
+        if (thisRequest === requestId) {
+          requestedExport = persisted;
+          if (item) item.checked = persisted;
+        }
+
+        try {
+          await ctx.refresh();
+        } catch (error) {
+          console.error(
+            '[synced-lyrics] Failed to refresh menu after export preference rejection',
+            error,
+          );
+        }
+        console.error(
+          '[synced-lyrics] Failed to save export visibility preference',
+          writeError,
+        );
+        if (readError !== undefined)
+          console.error(
+            '[synced-lyrics] Failed to read export visibility preference after rejection',
+            readError,
+          );
+        return false;
+      }
+
+      try {
+        await ctx.refresh();
+      } catch (error) {
+        console.error(
+          '[synced-lyrics] Failed to refresh menu after saving export preference',
+          error,
+        );
+      }
+      return true;
+    };
+
+    const operation = pendingWrite.then(write, write);
+    pendingWrite = operation.then(
+      () => {},
+      () => {},
+    );
+    return operation;
+  };
 
   return [
     {
@@ -69,6 +141,13 @@ export const menu = async (
         checked: (config.romanizationSizePercent ?? 70) === size,
         click: () => ctx.setConfig({ romanizationSizePercent: size }),
       })),
+    },
+    {
+      label: t('plugins.synced-lyrics.tools.show-export.label'),
+      toolTip: t('plugins.synced-lyrics.tools.show-export.tooltip'),
+      type: 'checkbox',
+      checked: config.enableDownload !== false,
+      click: updateExportVisibility,
     },
     {
       label: t('plugins.synced-lyrics.tools.enhanced-lrc'),
@@ -183,29 +262,6 @@ export const menu = async (
           },
         },
       ],
-    },
-    {
-      label: t('plugins.synced-lyrics.menu.default-text-string.label'),
-      toolTip: t('plugins.synced-lyrics.menu.default-text-string.tooltip'),
-      type: 'submenu',
-      submenu: [
-        { label: '♪', value: '♪' },
-        { label: '" "', value: ' ' },
-        { label: '...', value: ['.', '..', '...'] },
-        { label: '•••', value: ['•', '••', '•••'] },
-        { label: '———', value: '———' },
-      ].map(({ label, value }) => ({
-        label,
-        type: 'radio',
-        checked:
-          typeof value === 'string'
-            ? config.defaultTextString === value
-            : JSON.stringify(config.defaultTextString) ===
-              JSON.stringify(value),
-        click() {
-          ctx.setConfig({ defaultTextString: value });
-        },
-      })),
     },
     {
       label: t('plugins.synced-lyrics.menu.romanization.label'),

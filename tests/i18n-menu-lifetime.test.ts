@@ -16,6 +16,15 @@ test('actual menu lists every static label without loading catalogue resources',
   try {
     await f.setApplicationMenu(f.window);
     const items = languageItems(f.state.menus.at(-1));
+    const notices = f.state.menus
+      .at(-1)
+      .find((item: any) => item.label === f.engine.t('main.menu.about'))
+      .submenu.find(
+        (item: any) =>
+          item.label === f.engine.t('main.menu.mcp-dependency-notices'),
+      );
+    expect(notices.click).toEqual(expect.any(Function));
+    expect(f.state.nativeWindowAttempts).toBe(0);
     expect(items).toHaveLength(67);
     expect(
       items.filter((item: any) => item.label === 'Unknown (Unknown)'),

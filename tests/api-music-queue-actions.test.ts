@@ -1,3 +1,4 @@
+import { rendererMusicActionsOwnerSource } from './helpers/playlist-provider-source';
 import { EventEmitter } from 'node:events';
 import { test, expect } from '@playwright/test';
 import { musicHttpFixture } from './helpers/api-music-http';
@@ -263,11 +264,7 @@ test.beforeAll(async () => {
   const owned = await mkdtemp(path.join(tmpdir(), 'pear-q4-actor-'));
   try {
     const core = await readFile(path.join(root, 'src/renderer.ts'), 'utf8');
-    const init = core.slice(
-      core.indexOf('async function onApiLoaded() {') +
-        'async function onApiLoaded() {'.length,
-      core.indexOf('  // Workaround for macOS traffic lights'),
-    );
+    const init = rendererMusicActionsOwnerSource(core);
     const entry = path.join(owned, 'entry.ts');
     await writeFile(
       entry,

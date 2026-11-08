@@ -2,7 +2,13 @@ import { t } from '@/i18n';
 import { createPlaybackFilter } from '@/plugins/utils/renderer/playback-filter';
 import { createPlugin } from '@/utils';
 
-import { isLiveTitle } from './patterns';
+import {
+  resolveRecordingCategories,
+  type RecordingCategories,
+  type SkipLiveSongsConfig,
+} from './config';
+import { onMenu } from './menu';
+import { isNonStudioTitle } from './patterns';
 
 import type { RendererContext } from '@/types/contexts';
 import type { MusicPlayer } from '@/types/music-player';
@@ -10,6 +16,11 @@ import type { MusicPlayer } from '@/types/music-player';
 let active = false;
 let ready = false;
 let enabled = false;
+let categories: RecordingCategories | null = null;
+const applyConfig = (config: SkipLiveSongsConfig) => {
+  enabled = config.enabled === true;
+  categories = resolveRecordingCategories(config.categories);
+};
 let generation = 0;
 let configRevision = 0;
 let filter: ReturnType<typeof createPlaybackFilter> | undefined;
@@ -17,6 +28,7 @@ const stop = () => {
   active = false;
   ready = false;
   enabled = false;
+  categories = null;
   generation++;
   configRevision++;
   filter?.stop();
@@ -28,9 +40,11 @@ export default createPlugin({
   name: () => t('plugins.skip-live-songs.name'),
   description: () => t('plugins.skip-live-songs.description'),
   restartNeeded: false,
-  config: { enabled: false },
+  config: { enabled: false } as SkipLiveSongsConfig,
+  menu: onMenu,
+  menuWhenDisabled: true,
   renderer: {
-    async start(context: RendererContext<{ enabled: boolean }>) {
+    async start(context: RendererContext<SkipLiveSongsConfig>) {
       stop();
       active = true;
       const epoch = generation;
@@ -40,12 +54,14 @@ export default createPlugin({
           context,
           (track) =>
             enabled &&
-            (isLiveTitle(track.title) ||
-              isLiveTitle(track.alternativeTitle || '')),
+            categories !== null &&
+            (isNonStudioTitle(track.title, categories) ||
+              isNonStudioTitle(track.alternativeTitle, categories)),
+          { kind: 'live' },
         );
         const config = await context.getConfig();
         if (!active || generation !== epoch) return;
-        if (configRevision === revision) enabled = config.enabled;
+        if (configRevision === revision) applyConfig(config);
         ready = true;
       } catch (error) {
         if (generation === epoch) stop();
@@ -56,9 +72,9 @@ export default createPlugin({
       if (!ready) return;
       filter?.attach(api);
     },
-    onConfigChange(config: { enabled: boolean }) {
+    onConfigChange(config: SkipLiveSongsConfig) {
       configRevision++;
-      enabled = config.enabled;
+      applyConfig(config);
       filter?.refresh();
     },
     stop,

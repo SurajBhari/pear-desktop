@@ -1,0 +1,28 @@
+{
+  "format": 1,
+  "name": "body-parser",
+  "version": "2.4.0",
+  "qualification": "REGISTRY_ARCHIVE_INTEGRITY_AND_ORIGINAL_NOTICE_BYTES_VERIFIED_SOURCE_ONLY",
+  "registry": "https://registry.npmjs.org",
+  "publishedUTC": "2026-10-22T11:39:38.614Z",
+  "archiveUrl": "https://registry.npmjs.org/body-parser/-/body-parser-2.4.0.tgz",
+  "archiveIntegrity": "sha512-Ifk1KcLrxaGt1occQagQNFNNOqRt1LFuehEnHHzB8Z6cRgIxRU1TBaiIsUiCdA+gy5PL7Y1IX31DNKkRmxtXjQ==",
+  "archiveSha1": "337a76249270f83e450ad385a9606ca3b4a75c06",
+  "archiveSha256": "3f6e22dc9710a8bd5942fee8dfbd4632b54980cc2f33854f1ec1e314b17b2357",
+  "packageJsonSha256": "9410a56eb52cfe53ec48f013c872d4d336bb1cad66ea166bf3d97d2807bf542a",
+  "originalNoticePath": "package/LICENSE",
+  "noticeSha256": "23d466b1b134b415b66fa50c6526b4cf3e7b9258554da88d3abb371721e7ce68",
+  "noticeBytes": 1172,
+  "licenseLabel": {
+    "registry_expression": "MIT",
+    "package_json_literal": "MIT",
+    "validation": "SOURCE_ONLY_NO_LICENSE_EXPRESSION_AUDIT"
+  },
+  "previousPublishedBase": "b7b868da9f94bb2b3718749464a7ff8f0e50045d",
+  "previousBindingSha256": "aedb3be8b9b10cce2ee3525ef928665365cfae23f59fecc6007b592da213b58f",
+  "scope": "Only the body-parser source identity is replaced; the other 93 current source identities, notice bytes and qualification labels are preserved.",
+  "limits": [
+    "Registry integrity and original source bytes only; no application-wide legal acceptance.",
+    "Identical LICENSE bytes do not reuse the old version source identity."
+  ]
+}

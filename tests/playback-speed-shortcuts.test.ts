@@ -706,6 +706,94 @@ test('speed step prompt bounds valid values and leaves unrelated settings intact
   }
 });
 
+for (const transition of ['navigation', 'replacement-frame']) {
+  for (const action of [0, 1, 2]) {
+    test(`speed existing menu action ${action} remains usable after ${transition}`, async () => {
+      const x = await speedMenuFixture();
+      try {
+        await x.f.source.playbackSpeed.backend.start({ ...x.context });
+        const menu = await x.f.source.playbackSpeed.menu(x.context);
+        x.f.contents.emit('did-start-navigation', {}, '', false, true);
+        if (transition === 'replacement-frame') x.f.contents.mainFrame = {};
+        x.f.contents.emit('did-navigate');
+        x.f.state.prompt = async () =>
+          action === 1 ? [{ value: 'speedUp', accelerator: 'F7' }] : '0.2';
+        await menu[action].click({ checked: false });
+        expect(x.writes).toEqual([
+          action === 0
+            ? { preservesPitch: false }
+            : action === 1
+              ? {
+                  globalShortcuts: {
+                    speedUp: 'F7',
+                    speedDown: 'F9',
+                    savedUnknown: 'F10',
+                  },
+                }
+              : { step: 0.2 },
+        ]);
+      } finally {
+        await x.f.close();
+      }
+    });
+  }
+}
+
+for (const action of [1, 2]) {
+  test(`speed action ${action} cannot cross navigation during its initial config read`, async () => {
+    const x = await speedMenuFixture();
+    try {
+      await x.f.source.playbackSpeed.backend.start({ ...x.context });
+      const menu = await x.f.source.playbackSpeed.menu(x.context);
+      let resolve!: (value: any) => void;
+      x.setReader(() => new Promise((done) => (resolve = done)));
+      const pending = menu[action].click();
+      expect(typeof resolve).toBe('function');
+      x.f.contents.emit('did-start-navigation', {}, '', false, true);
+      resolve(x.config);
+      await pending;
+      expect(x.calls).toEqual([]);
+      expect(x.writes).toEqual([]);
+    } finally {
+      await x.f.close();
+    }
+  });
+}
+
+test('speed old menu cannot edit a restarted backend lifetime', async () => {
+  const x = await speedMenuFixture();
+  try {
+    await x.f.source.playbackSpeed.backend.start({ ...x.context });
+    const menu = await x.f.source.playbackSpeed.menu(x.context);
+    x.f.source.playbackSpeed.backend.stop();
+    await x.f.source.playbackSpeed.backend.start({ ...x.context });
+    await menu[0].click({ checked: false });
+    expect(x.writes).toEqual([]);
+  } finally {
+    await x.f.close();
+  }
+});
+
+test('speed held step result cannot cross navigation after a fresh click', async () => {
+  const x = await speedMenuFixture();
+  try {
+    await x.f.source.playbackSpeed.backend.start({ ...x.context });
+    const menu = await x.f.source.playbackSpeed.menu(x.context);
+    let resolve!: (value: any) => void;
+    x.f.state.prompt = () => new Promise((done) => (resolve = done));
+    const pending = menu[2].click();
+    for (let i = 0; i < 100 && !resolve; i++)
+      await new Promise((done) => setTimeout(done, 1));
+    expect(typeof resolve).toBe('function');
+    x.f.contents.emit('did-start-navigation', {}, '', false, true);
+    resolve('0.2');
+    await pending;
+    expect(x.writes).toEqual([]);
+  } finally {
+    await x.f.close();
+  }
+});
+
 for (const stage of ['prompt', 'latestConfig']) {
   for (const retire of ['stop', 'navigation', 'frame']) {
     test(`speed held ${stage} after ${retire} cannot save bindings`, async () => {

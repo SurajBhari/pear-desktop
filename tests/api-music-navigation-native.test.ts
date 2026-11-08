@@ -516,6 +516,7 @@ test('N1 actual native prepared navigation six positive recipes and immutable re
         operationId: lostPrepared.operationId,
       });
     const uncertainty = {
+      operationId: lostPrepared.operationId,
       lostResult,
       statusBefore,
       replayBefore,
@@ -564,11 +565,16 @@ test('N1 actual native prepared navigation six positive recipes and immutable re
     if (row.name !== 'current-radio')
       expect(row.afterExecute.identity).toBe(row.before.identity);
   }
-  expect(proof.uncertainty.lostResult).toBe('timeout');
-  expect(proof.uncertainty.statusBefore).toMatchObject({
+  const uncertainReceipt = {
+    operationId: proof.uncertainty.operationId,
     status: 'uncertain',
     error: 'outcome_unknown',
-  });
+  };
+  // The broker timer can publish uncertainty before the caller deadline fires.
+  expect(['timeout', uncertainReceipt]).toContainEqual(
+    proof.uncertainty.lostResult,
+  );
+  expect(proof.uncertainty.statusBefore).toEqual(uncertainReceipt);
   expect(proof.uncertainty.statusAfter).toEqual(proof.uncertainty.statusBefore);
   expect(proof.uncertainty.replayBefore).toEqual(
     proof.uncertainty.statusBefore,

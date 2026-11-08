@@ -62,6 +62,8 @@ export interface PluginDef<
   ) =>
     | Promise<Electron.MenuItemConstructorOptions[]>
     | Electron.MenuItemConstructorOptions[];
+  /** Keep this configuration menu available without starting the plugin. Exact true opts in. */
+  menuWhenDisabled?: boolean;
   stylesheets?: string[];
   restartNeeded?: boolean;
 

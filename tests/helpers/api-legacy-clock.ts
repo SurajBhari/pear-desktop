@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { build, normalizePath } from 'vite';
+import { headlessApiMenuBoundary } from './api-headless-menu-boundary';
 const root = path.resolve(import.meta.dirname, '../..'),
   requireRoot = createRequire(path.join(root, 'package.json'));
 /** Actual broker/controller and Electron IPC; only native getters and service responses are synthetic. */
@@ -59,6 +60,7 @@ export async function legacyClockNative<T>(task: () => Promise<T>): Promise<T> {
       logLevel: 'silent' as const,
       resolve: { alias: {} },
       plugins: [
+        headlessApiMenuBoundary(root),
         {
           name: 'native-app-boundaries',
           enforce: 'pre' as const,

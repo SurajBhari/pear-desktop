@@ -7,6 +7,7 @@ import { EventEmitter, once } from 'node:events';
 
 import { expect, test } from '@playwright/test';
 import { Window } from 'happy-dom';
+import { headlessApiMenuBoundary } from './helpers/api-headless-menu-boundary';
 
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
@@ -94,6 +95,7 @@ ${await registeredVolumeHandler()};`,
     input: entry,
     platform: 'node',
     plugins: [
+      headlessApiMenuBoundary(root),
       {
         name: 'native-config-translation-boundaries',
         async resolveId(id: string) {
@@ -134,7 +136,7 @@ ${await registeredVolumeHandler()};`,
     ],
   });
   const output = path.join(directory, 'actual-source.cjs');
-  await bundle.write({ file: output, format: 'cjs' });
+  await bundle.write({ file: output, format: 'cjs', codeSplitting: false });
   await bundle.close();
   source = requireRoot(output);
   Object.assign(dom, {

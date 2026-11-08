@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
-import { join, relative, resolve, isAbsolute, sep } from 'node:path';
+import { join } from 'node:path';
 
 import { Mutex } from 'async-mutex';
 import { BG, type BgConfig } from 'bgutils-js';
@@ -44,6 +44,7 @@ import {
   cropMaxWidth,
   clearErrorFeedback,
   getFolder,
+  getLibraryRoot,
   sendErrorFeedback,
   sendFeedback as sendFeedback_,
   setBadge,
@@ -58,13 +59,14 @@ import {
 } from '../audio';
 import {
   checkDuplicate,
+  primaryOutputFilename,
   publishCompleted,
   hasVerifiedTrack,
   scanLibrary,
   type CompletedInput,
   type LibraryReport,
 } from '../library';
-import { downloadSelectedAudio } from '../transfer';
+import { AudioTransferError, downloadSelectedAudio } from '../transfer';
 import { DefaultPresetList, type Preset } from '../types';
 
 import type { DownloaderPluginConfig } from '../index';
@@ -310,9 +312,10 @@ const initializeDownloader = async (
         previousDocument?.configurable === false
       )
         return;
+      let window: import('happy-dom').Window | undefined;
       try {
         const [width, height] = targetWindow.getSize();
-        const window = new (await import('happy-dom')).Window({
+        window = new (await import('happy-dom')).Window({
           width,
           height,
           console,
@@ -360,12 +363,18 @@ const initializeDownloader = async (
         // A missing PoToken stays optional; backend retirement is terminal.
         assertCurrentBinding(owner);
       } finally {
-        if (previousWindow)
-          Object.defineProperty(globalThis, 'window', previousWindow);
-        else Reflect.deleteProperty(globalThis, 'window');
-        if (previousDocument)
-          Object.defineProperty(globalThis, 'document', previousDocument);
-        else Reflect.deleteProperty(globalThis, 'document');
+        try {
+          await window?.happyDOM.close();
+        } catch {
+          console.warn('Could not close downloader temporary DOM');
+        } finally {
+          if (previousWindow)
+            Object.defineProperty(globalThis, 'window', previousWindow);
+          else Reflect.deleteProperty(globalThis, 'window');
+          if (previousDocument)
+            Object.defineProperty(globalThis, 'document', previousDocument);
+          else Reflect.deleteProperty(globalThis, 'document');
+        }
       }
     });
   }
@@ -569,11 +578,13 @@ export const openDownloaderSettings = () => {
 
 const resolvePreset = (selected: string | undefined): Preset => {
   const name = selected ?? 'mp3 (256kbps)';
-  if (name === 'Custom')
-    return config.customPresetSetting ?? DefaultPresetList['Custom'];
-  return Object.hasOwn(DefaultPresetList, name)
-    ? DefaultPresetList[name]
-    : DefaultPresetList['mp3 (256kbps)'];
+  const preset =
+    name === 'Custom'
+      ? (config.customPresetSetting ?? DefaultPresetList['mp3 (256kbps)'])
+      : Object.hasOwn(DefaultPresetList, name)
+        ? DefaultPresetList[name]
+        : DefaultPresetList['mp3 (256kbps)'];
+  return { ...preset, ffmpegArgs: [...preset.ffmpegArgs] };
 };
 
 export async function downloadSong(
@@ -756,13 +767,11 @@ async function downloadSongUnsafe(
       );
   }
 
+  const dir = getFolder(playlistFolder || config.downloadFolder);
+  const libraryRoot = getLibraryRoot(getFolder(config.downloadFolder), dir);
   if (
     config.duplicatePolicy === 'skip-any' &&
-    (await hasVerifiedTrack(
-      getFolder(playlistFolder || config.downloadFolder),
-      id,
-      () => assertCurrentBinding(owner),
-    ))
+    (await hasVerifiedTrack(libraryRoot, id, () => assertCurrentBinding(owner)))
   ) {
     sendFeedback('Already downloaded (verified track)', -1);
     return { status: 'skipped' as const };
@@ -786,7 +795,6 @@ async function downloadSongUnsafe(
 
   metadata.trackId = trackId;
 
-  const dir = getFolder(playlistFolder || config.downloadFolder);
   const name = `${metadata.artist ? `${metadata.artist} - ` : ''}${
     metadata.title
   }`;
@@ -864,18 +872,16 @@ async function downloadSongUnsafe(
   if (!/^[\w]{1,12}$/.test(targetFileExtension))
     throw new Error('Invalid output extension');
   const policy = config.duplicatePolicy ?? 'legacy';
-  if (policy === 'legacy' && config.skipExisting && existsSync(filePath)) {
+  if (
+    policy === 'legacy' &&
+    config.skipExisting &&
+    (existsSync(filePath) ||
+      existsSync(join(dir, primaryOutputFilename(filename))))
+  ) {
     sendFeedback(null, -1);
     return;
   }
 
-  const root = getFolder(config.downloadFolder);
-  // Explicit alternate folders outside the configured library own their index.
-  const within = relative(resolve(root), resolve(dir));
-  const libraryRoot =
-    within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)
-      ? dir
-      : root;
   const completed: CompletedInput = {
     videoId: metadata.videoId,
     source: selected,
@@ -945,7 +951,7 @@ async function downloadSongUnsafe(
     mkdirSync(dir);
   }
 
-  let fileBuffer = await iterableStreamToProcessedUint8Array(
+  let fileBuffer: Uint8Array | null = await iterableStreamToProcessedUint8Array(
     iterableStream,
     targetFileExtension,
     metadata,
@@ -1011,20 +1017,26 @@ async function downloadChunks(
 ) {
   const chunks = [];
   let downloaded = 0;
-  for await (const chunk of stream) {
-    downloaded += chunk.length;
-    chunks.push(chunk);
-    const ratio = downloaded / contentLength;
-    const progress = Math.floor(ratio * 100);
-    sendFeedback(
-      t('plugins.downloader.backend.feedback.download-progress', {
-        percent: progress,
-      }),
-      ratio,
-    );
-    // 15% for download, 85% for conversion
-    // This is a very rough estimate, trying to make the progress bar look nice
-    increasePlaylistProgress(ratio * 0.15);
+  try {
+    for await (const chunk of stream) {
+      downloaded += chunk.length;
+      chunks.push(chunk);
+      const ratio = downloaded / contentLength;
+      const progress = Math.floor(ratio * 100);
+      sendFeedback(
+        t('plugins.downloader.backend.feedback.download-progress', {
+          percent: progress,
+        }),
+        ratio,
+      );
+      // 15% for download, 85% for conversion
+      // This is a very rough estimate, trying to make the progress bar look nice
+      increasePlaylistProgress(ratio * 0.15);
+    }
+  } catch (error) {
+    throw error instanceof AudioTransferError
+      ? error
+      : new AudioTransferError('failed', error);
   }
   return chunks;
 }
@@ -1038,48 +1050,48 @@ async function iterableStreamToProcessedUint8Array(
   sendFeedback: (str: string, value?: number) => void,
   increasePlaylistProgress: (value: number) => void = () => {},
   owner: DownloaderBinding,
-): Promise<Uint8Array | null> {
+): Promise<Uint8Array> {
   sendFeedback(t('plugins.downloader.backend.feedback.loading'), 2); // Indefinite progress bar after download
 
   const safeVideoName = randomBytes(32).toString('hex');
+  const safeVideoNameWithExtension = `${safeVideoName}.${extension}`;
 
   return await ffmpegMutex.runExclusive(async () => {
     try {
       assertCurrentBinding(owner);
       const ffmpegInstance = await ffmpeg.get();
-      if (!ffmpegInstance.isLoaded()) {
-        await ffmpegInstance.load();
-      }
-
-      sendFeedback(t('plugins.downloader.backend.feedback.preparing-file'));
-      ffmpegInstance.FS(
-        'writeFile',
-        safeVideoName,
-        Buffer.concat(
-          await downloadChunks(
-            stream,
-            contentLength,
-            sendFeedback,
-            increasePlaylistProgress,
-          ),
-        ),
-      );
-
-      sendFeedback(t('plugins.downloader.backend.feedback.converting'));
-
-      ffmpegInstance.setProgress(({ ratio }) => {
-        sendFeedback(
-          t('plugins.downloader.backend.feedback.conversion-progress', {
-            percent: Math.floor(ratio * 100),
-          }),
-          ratio,
-        );
-        const conversionProgress = ratio * 0.85;
-        increasePlaylistProgress(0.15 + conversionProgress);
-      });
-
-      const safeVideoNameWithExtension = `${safeVideoName}.${extension}`;
       try {
+        if (!ffmpegInstance.isLoaded()) {
+          await ffmpegInstance.load();
+        }
+
+        sendFeedback(t('plugins.downloader.backend.feedback.preparing-file'));
+        ffmpegInstance.FS(
+          'writeFile',
+          safeVideoName,
+          Buffer.concat(
+            await downloadChunks(
+              stream,
+              contentLength,
+              sendFeedback,
+              increasePlaylistProgress,
+            ),
+          ),
+        );
+
+        sendFeedback(t('plugins.downloader.backend.feedback.converting'));
+
+        ffmpegInstance.setProgress(({ ratio }) => {
+          sendFeedback(
+            t('plugins.downloader.backend.feedback.conversion-progress', {
+              percent: Math.floor(ratio * 100),
+            }),
+            ratio,
+          );
+          const conversionProgress = ratio * 0.85;
+          increasePlaylistProgress(0.15 + conversionProgress);
+        });
+
         await ffmpegInstance.run(
           '-i',
           safeVideoName,
@@ -1087,21 +1099,30 @@ async function iterableStreamToProcessedUint8Array(
           ...getFFmpegMetadataArgs(metadata),
           safeVideoNameWithExtension,
         );
-      } finally {
-        ffmpegInstance.FS('unlink', safeVideoName);
-      }
 
-      sendFeedback(t('plugins.downloader.backend.feedback.saving'));
+        sendFeedback(t('plugins.downloader.backend.feedback.saving'));
 
-      try {
         return ffmpegInstance.FS('readFile', safeVideoNameWithExtension);
       } finally {
-        ffmpegInstance.FS('unlink', safeVideoNameWithExtension);
+        for (const ownedFile of [safeVideoName, safeVideoNameWithExtension]) {
+          try {
+            if (
+              ffmpegInstance.isLoaded() &&
+              ffmpegInstance.FS('readdir', '/').includes(ownedFile)
+            )
+              ffmpegInstance.FS('unlink', ownedFile);
+          } catch (cleanupError) {
+            console.warn(
+              'Could not clean downloader processing file',
+              cleanupError,
+            );
+          }
+        }
       }
     } catch (error: unknown) {
-      if (isCurrentBinding(owner)) sendError(error as Error, safeVideoName);
+      assertCurrentBinding(owner);
+      throw error;
     }
-    return null;
   });
 }
 

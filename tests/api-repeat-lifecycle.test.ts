@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { EventEmitter, once } from 'node:events';
 import { test, expect } from '@playwright/test';
 import { PropertySymbol, Window } from 'happy-dom';
+import { headlessApiMenuBoundary } from './helpers/api-headless-menu-boundary';
 
 const root = path.resolve(import.meta.dirname, '..');
 const requireRoot = createRequire(path.join(root, 'package.json'));
@@ -88,6 +89,7 @@ async function fixture({
     input: entry,
     platform: 'node',
     plugins: [
+      headlessApiMenuBoundary(root),
       {
         name: 'controlled-native-config-translation-boundaries',
         async resolveId(id: string) {
@@ -128,7 +130,7 @@ async function fixture({
     ],
   });
   const output = path.join(directory, 'actual-source.cjs');
-  await build.write({ file: output, format: 'cjs' });
+  await build.write({ file: output, format: 'cjs', codeSplitting: false });
   await build.close();
   source = requireRoot(output);
   let installed = false;

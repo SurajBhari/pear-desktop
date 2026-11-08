@@ -1,6 +1,9 @@
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
+
 import { test, expect } from '@playwright/test';
+
+import type { LyricResult } from '../src/plugins/synced-lyrics/types';
 
 async function fixture(page: import('@playwright/test').Page, direct = false) {
   await page.setContent('<ytmusic-app></ytmusic-app>');
@@ -25,7 +28,7 @@ const network={async fetch(endpoint,body){if(this!==network)throw Error('Network
 document.querySelector('ytmusic-app').networkManager=network;
 window.fetch=async(endpoint,options)=>{state.proxy.push([endpoint,options]);return {ok:true,json:async()=>browse};};
 ${source}
-window.lyricsFixture={state,network,search:()=>new YTMusic().search({videoId:'OwnedSong01',title:'Owned Song',artist:'Owned Artist'})};
+window.lyricsFixture={state,network,browse,search:()=>new YTMusic().search({videoId:'OwnedSong01',title:'Owned Song',artist:'Owned Artist'})};
 `,
   });
 }
@@ -74,6 +77,74 @@ test('enabled direct mode uses the current app network manager for browse and se
   ]);
   expect(output.proxy).toEqual([]);
 });
+
+for (const direct of [false, true]) {
+  test(`timed ${direct ? 'direct' : 'proxy'} lyrics preserve Unicode whitespace and normalize only a music-note gap`, async ({
+    page,
+  }) => {
+    await fixture(page, direct);
+    const lines = await page.evaluate(async () => {
+      const f = (
+        window as unknown as {
+          lyricsFixture: {
+            browse: { contents: unknown };
+            search(): Promise<LyricResult>;
+          };
+        }
+      ).lyricsFixture;
+      f.browse.contents = {
+        elementRenderer: {
+          newElement: {
+            type: {
+              componentType: {
+                model: {
+                  timedLyricsModel: {
+                    lyricsData: {
+                      timedLyricsData: [
+                        {
+                          lyricLine: '  東京\t ',
+                          cueRange: {
+                            startTimeMilliseconds: '0',
+                            endTimeMilliseconds: '1000',
+                          },
+                        },
+                        {
+                          lyricLine: '\t👩🏽‍🚀 е́  世界\u00a0',
+                          cueRange: {
+                            startTimeMilliseconds: '1000',
+                            endTimeMilliseconds: '2000',
+                          },
+                        },
+                        {
+                          lyricLine: ' \t♪ \u00a0',
+                          cueRange: {
+                            startTimeMilliseconds: '2000',
+                            endTimeMilliseconds: '4000',
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      };
+      return (await f.search()).lines;
+    });
+    expect(lines?.map((line) => line.text)).toEqual([
+      '  東京\t ',
+      '\t👩🏽‍🚀 е́  世界\u00a0',
+      '',
+    ]);
+    expect(lines?.map((line) => [line.timeInMs, line.duration])).toEqual([
+      [0, 1000],
+      [1000, 1000],
+      [2000, 2000],
+    ]);
+  });
+}
 
 for (const kind of ['app', 'network', 'mode'] as const) {
   test(`pending direct browse cannot publish after ${kind} replacement`, async ({

@@ -144,10 +144,8 @@ export const fetchLyrics = (info: SongInfo) => {
         error: null,
       };
     }
-    setLyricsStore(
-      'lyrics',
-      () => JSON.parse(JSON.stringify(previous.data)) as LyricsStore['lyrics'],
-    );
+    // Preserve open-ended cue durations and isolate nested word edits from cache.
+    setLyricsStore('lyrics', () => structuredClone(previous.data));
     if (changed)
       search(ProviderNames.YTMusic, info, previous).catch(console.error);
     return;

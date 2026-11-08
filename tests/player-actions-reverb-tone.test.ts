@@ -128,7 +128,9 @@ test('wet filters share the EQ master route and teardown preserves the EQ insert
     expect(graph.audioGraph.masterInput.connections).toEqual(
       new Set([eqInput]),
     );
-    expect(eqOutput.connections).toEqual(new Set([graph.audioGraph.musicGate]));
+    expect(eqOutput.connections).toEqual(
+      new Set([graph.audioGraph.outputInput]),
+    );
     expect(graph.audioSource.connections).toEqual(
       new Set([graph.audioGraph.dryInput, graph.unrelated]),
     );
@@ -318,7 +320,9 @@ test('worklet connection failure retires both wet filters without releasing the 
     expect(graph.audioGraph.masterInput.connections).toEqual(
       new Set([eqInput]),
     );
-    expect(eqOutput.connections).toEqual(new Set([graph.audioGraph.musicGate]));
+    expect(eqOutput.connections).toEqual(
+      new Set([graph.audioGraph.outputInput]),
+    );
     releaseEq();
   } finally {
     await f.close();
