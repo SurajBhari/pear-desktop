@@ -156,6 +156,7 @@ export default createPlugin({
 
       const config = await getConfig();
       this.config = config;
+      const [videoVisible, setVideoVisible] = createSignal(!config.hideVideo);
 
       const moveVolumeHud = (await window.mainConfig.plugins.isEnabled(
         'precise-volume',
@@ -175,14 +176,10 @@ export default createPlugin({
         () => (
           <Show when={showButton()}>
             <VideoSwitchButton
-              onChange={(e) => {
-                const target = e.target as HTMLInputElement;
-
-                setVideoState(target.checked);
-              }}
-              onClick={(e) => e.stopPropagation()}
+              onVideoToggle={(showVideo) => setVideoState(showVideo)}
               songButtonText={t('plugins.video-toggle.templates.button-song')}
               videoButtonText={t('plugins.video-toggle.templates.button-video')}
+              videoVisible={videoVisible()}
             />
           </Show>
         ),
@@ -199,15 +196,11 @@ export default createPlugin({
       };
 
       const setVideoState = (showVideo: boolean) => {
+        setVideoVisible(showVideo);
         if (this.config) {
           this.config.hideVideo = !showVideo;
         }
         window.mainConfig.plugins.setOptions('video-toggle', this.config);
-
-        const checkbox = document.querySelector<HTMLInputElement>(
-          '.video-switch-button-checkbox',
-        ); // custom mode
-        if (checkbox) checkbox.checked = !this.config?.hideVideo;
 
         if (player) {
           player.style.margin = showVideo ? '' : 'auto 0px';
@@ -275,7 +268,10 @@ export default createPlugin({
             for (const mutation of mutations) {
               if (mutation.target instanceof HTMLElement) {
                 const target = mutation.target;
-                if (target.getAttribute('playback-mode') !== 'ATV_PREFERRED') {
+                if (
+                  this.config?.hideVideo &&
+                  target.getAttribute('playback-mode') !== 'ATV_PREFERRED'
+                ) {
                   playbackModeObserver.disconnect();
                   target.setAttribute('playback-mode', 'ATV_PREFERRED');
                 }

@@ -900,6 +900,13 @@
         "visualizer-type": "Vizualizáció típus"
       },
       "name": "Vizualizáció"
+    },
+    "adblocker": {
+      "description": "Alapértelmezetten minden hirdetés és nyomkövetés blokkolása",
+      "menu": {
+        "blocker": "Blokkolási módszer"
+      },
+      "name": "Reklámblokkoló"
     }
   }
 }

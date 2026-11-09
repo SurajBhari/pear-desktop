@@ -52,13 +52,23 @@ jobs:
         with:
           reviewdog_version: latest
 
-      - name: Run oxlint with reviewdog
+      # Full type-aware lint and TypeScript checks run against PR dependencies in
+      # the read-only pull_request source-checks job. This privileged annotator
+      # keeps trusted base tools/config and reports syntax/style only.
+      - name: Run syntax and style annotations with reviewdog
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
 
-          pnpm exec oxlint src --type-aware --format=checkstyle |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const config = JSON.parse(readFileSync('.oxlintrc.json', 'utf8'));
+          config.options = { ...config.options, typeAware: false };
+          writeFileSync('.reviewdog-oxlint.json', JSON.stringify(config));
+          NODE
+
+          pnpm exec oxlint src --config .reviewdog-oxlint.json --format=checkstyle |
             reviewdog \
               -f=checkstyle \
               -name=oxlint \

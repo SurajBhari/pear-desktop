@@ -985,6 +985,13 @@
         "visualizer-type": "Tipo de visualizador"
       },
       "name": "Visualizador"
+    },
+    "adblocker": {
+      "description": "Bloquear anúncios e monitorização",
+      "menu": {
+        "blocker": "Bloqueador"
+      },
+      "name": "Bloqueador de anúncios"
     }
   }
 }

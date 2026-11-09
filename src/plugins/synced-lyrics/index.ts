@@ -22,11 +22,16 @@ export default createPlugin<
   config: {
     enabled: false,
     preciseTiming: true,
+    useYTMLyricsWithoutProxy: false,
     showLyricsEvenIfInexact: true,
     showTimeCodes: false,
     defaultTextString: '♪',
     lineEffect: 'fancy',
     romanization: true,
+    timingOffsetMs: 0,
+    romanizationSizePercent: 70,
+    enhancedLrc: false,
+    enableDownload: true,
   },
 
   menu,

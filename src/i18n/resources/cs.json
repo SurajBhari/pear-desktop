@@ -938,6 +938,13 @@
         "visualizer-type": "Typ vizualizéru"
       },
       "name": "Vizualizér"
+    },
+    "adblocker": {
+      "description": "Blokuje všechny reklamy a sledování ihned od začátku",
+      "menu": {
+        "blocker": "Blokátor"
+      },
+      "name": "Blokátor reklam"
     }
   }
 }

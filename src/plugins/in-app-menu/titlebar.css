@@ -86,9 +86,10 @@ html {
   scrollbar-color: unset;
 }
 
-/* fixes scrollbar lagging behind in large playlists */
-ytmusic-browse-response .ytmusic-responsive-list-item-renderer {
-  will-change: transform;
+/* Limit offscreen layout to rows, not their scoped descendants (#4671). */
+ytmusic-browse-response ytmusic-responsive-list-item-renderer {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 48px;
 }
 
 /* fix fullscreen style */

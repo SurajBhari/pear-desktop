@@ -3,7 +3,7 @@ import { allPlugins } from 'virtual:plugins';
 
 import * as config from '@/config';
 import { t } from '@/i18n';
-import { setApplicationMenu } from '@/menu';
+import { refreshMenu } from '@/menu';
 import { LoggerPrefix } from '@/utils';
 
 import type { MenuContext } from '@/types/contexts';
@@ -21,20 +21,18 @@ const createContext = (
       config.get(`plugins.${id}`) ?? {},
     ) as PluginConfig,
   setConfig: async (newConfig) => {
-    config.setPartial(
-      `plugins.${id}`,
-      newConfig,
-      (await allPlugins())[id].config,
-    );
+    const plugin = (await allPlugins())[id];
+    if (
+      plugin.menuWhenDisabled === true &&
+      (win.isDestroyed() || win.webContents.isDestroyed())
+    )
+      return;
+    config.setPartial(`plugins.${id}`, newConfig, plugin.config);
   },
   window: win,
-  refresh: async () => {
-    await setApplicationMenu(win);
-
-    if (await config.plugins.isEnabled('in-app-menu')) {
-      win.webContents.send('refresh-in-app-menu');
-    }
-  },
+  // in-app-menu requires restart, so the shared refresh notifies the renderer
+  // loaded at launch and fences that send to the current full menu publication.
+  refresh: () => refreshMenu(win),
 });
 
 export const forceLoadMenuPlugin = async (id: string, win: BrowserWindow) => {
@@ -48,9 +46,13 @@ export const forceLoadMenuPlugin = async (id: string, win: BrowserWindow) => {
       if (result.length > 0) {
         menuTemplateMap[id] = result;
       } else {
+        if (plugin.menuWhenDisabled === true) delete menuTemplateMap[id];
         return;
       }
-    } else return;
+    } else {
+      if (plugin.menuWhenDisabled === true) delete menuTemplateMap[id];
+      return;
+    }
 
     console.log(
       LoggerPrefix,
@@ -76,7 +78,7 @@ export const loadAllMenuPlugins = async (win: BrowserWindow) => {
       pluginConfigs[pluginId] ?? {},
     );
 
-    if (config.enabled) {
+    if (config.enabled || pluginDef.menuWhenDisabled === true) {
       await forceLoadMenuPlugin(pluginId, win);
     }
   }

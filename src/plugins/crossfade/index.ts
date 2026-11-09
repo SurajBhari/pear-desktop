@@ -1,24 +1,24 @@
+// Crossfade originated in upstream #4701 by sivoleck (Clovis), head 762f98abcd8fc9174b09d4cdb1ef29502a5c8856.
 import prompt from 'custom-electron-prompt';
-import { Howl } from 'howler';
 import { Innertube } from '\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js';
 
 import { t } from '@/i18n';
 import { getNetFetchAsFetch } from '@/plugins/utils/main';
 import promptOptions from '@/providers/prompt-options';
+import { getCurrentAudioGraph } from '@/providers/renderer-audio';
 import { createPlugin } from '@/utils';
 
-import { VolumeFader } from './fader';
+import {
+  crossfadeDefaults,
+  parseCrossfadeMenu,
+  type CrossfadePluginConfig,
+} from './config';
+import { createCrossfadeController } from './controller';
+import { selectCrossfadeAudioFormat, type StreamResult } from './stream';
 
 import type { RendererContext } from '@/types/contexts';
 import type { BrowserWindow } from 'electron';
-
-export type CrossfadePluginConfig = {
-  enabled: boolean;
-  fadeInDuration: number;
-  fadeOutDuration: number;
-  secondsBeforeEnd: number;
-  fadeScaling: 'linear' | 'logarithmic' | number;
-};
+export type { CrossfadePluginConfig } from './config';
 
 export default createPlugin<
   unknown,
@@ -26,40 +26,15 @@ export default createPlugin<
   {
     config?: CrossfadePluginConfig;
     ipc?: RendererContext<CrossfadePluginConfig>['ipc'];
+    dispose?: () => void;
+    controller?: ReturnType<typeof createCrossfadeController>;
   },
   CrossfadePluginConfig
 >({
   name: () => t('plugins.crossfade.name'),
   description: () => t('plugins.crossfade.description'),
   restartNeeded: true,
-  config: {
-    enabled: false,
-    /**
-     * The duration of the fade in and fade out in milliseconds.
-     *
-     * @default 1500ms
-     */
-    fadeInDuration: 1500,
-    /**
-     * The duration of the fade in and fade out in milliseconds.
-     *
-     * @default 5000ms
-     */
-    fadeOutDuration: 5000,
-    /**
-     * The duration of the fade in and fade out in seconds.
-     *
-     * @default 10s
-     */
-    secondsBeforeEnd: 10,
-    /**
-     * The scaling algorithm to use for the fade.
-     * (or a positive number in dB)
-     *
-     * @default 'linear'
-     */
-    fadeScaling: 'linear',
-  },
+  config: crossfadeDefaults,
   menu({ window, getConfig, setConfig }) {
     const promptCrossfadeValues = async (
       win: BrowserWindow,
@@ -113,6 +88,9 @@ export default createPlugin<
                 linear: t(
                   'plugins.crossfade.prompt.options.multi-input.fade-scaling.linear',
                 ),
+                equalPower: t(
+                  'plugins.crossfade.prompt.options.multi-input.fade-scaling.equalPower',
+                ),
                 logarithmic: t(
                   'plugins.crossfade.prompt.options.multi-input.fade-scaling.logarithmic',
                 ),
@@ -131,21 +109,7 @@ export default createPlugin<
         return undefined;
       }
 
-      let fadeScaling: 'linear' | 'logarithmic' | number;
-      if (res[3] === 'linear' || res[3] === 'logarithmic') {
-        fadeScaling = res[3];
-      } else if (isFinite(Number(res[3]))) {
-        fadeScaling = Number(res[3]);
-      } else {
-        fadeScaling = options.fadeScaling;
-      }
-
-      return {
-        fadeInDuration: Number(res[0]),
-        fadeOutDuration: Number(res[1]),
-        secondsBeforeEnd: Number(res[2]),
-        fadeScaling,
-      };
+      return parseCrossfadeMenu(res);
     };
 
     return [
@@ -170,8 +134,32 @@ export default createPlugin<
     });
 
     ipc.handle('audio-url', async (videoID: string) => {
-      const info = await yt.getBasicInfo(videoID);
-      return info.streaming_data?.formats[0].decipher(yt.session.player);
+      try {
+        if (!/^[\w-]{11}$/.test(videoID)) return null;
+        const info = await yt.getBasicInfo(videoID);
+        if (
+          info.basic_info.id !== videoID ||
+          info.basic_info.is_live === true ||
+          info.basic_info.is_live_content === true
+        )
+          return null;
+        const format = selectCrossfadeAudioFormat(
+          info.streaming_data?.adaptive_formats ?? [],
+        );
+        if (!format) return null;
+        try {
+          const url = await format.decipher(yt.session.player);
+          return {
+            url,
+            mimeType: format.mime_type,
+            contentLength: format.content_length!,
+          } satisfies StreamResult;
+        } catch {
+          return null;
+        }
+      } catch {
+        return null;
+      }
     });
   },
 
@@ -180,142 +168,77 @@ export default createPlugin<
       this.config = await getConfig();
       this.ipc = ipc;
     },
+    stop() {
+      const dispose = this.dispose;
+      this.dispose = undefined;
+      this.controller = undefined;
+      dispose?.();
+    },
     onConfigChange(newConfig) {
       this.config = newConfig;
+      this.controller?.configure(newConfig);
     },
-    onPlayerApiReady() {
-      let transitionAudio: Howl; // Howler audio used to fade out the current music
-      let firstVideo = true;
-      let waitForTransition: Promise<unknown>;
-
-      const getStreamURL = async (videoID: string): Promise<string> =>
-        this.ipc?.invoke('audio-url', videoID) as Promise<string>;
-
-      const getVideoIDFromURL = (url: string) =>
-        new URLSearchParams(url.split('?')?.at(-1)).get('v');
-
-      const isReadyToCrossfade = () =>
-        transitionAudio && transitionAudio.state() === 'loaded';
-
-      const watchVideoIDChanges = (cb: (id: string) => void) => {
-        window.navigation.addEventListener('navigate', (event) => {
-          const currentVideoID = getVideoIDFromURL(
-            (event.currentTarget as Navigation).currentEntry?.url ?? '',
-          );
-          const nextVideoID = getVideoIDFromURL(event.destination.url ?? '');
-
-          if (
-            nextVideoID &&
-            currentVideoID &&
-            (firstVideo || nextVideoID !== currentVideoID)
-          ) {
-            if (isReadyToCrossfade()) {
-              crossfade(() => {
-                cb(nextVideoID);
-              });
-            } else {
-              cb(nextVideoID);
-              firstVideo = false;
-            }
-          }
-        });
+    onPlayerApiReady(api) {
+      const previousDispose = this.dispose;
+      let stopped = false;
+      let controller: ReturnType<typeof createCrossfadeController> | undefined;
+      let releaseSpeed: (() => void) | undefined;
+      const status = document.createElement('div');
+      status.setAttribute('role', 'status');
+      status.style.cssText =
+        'padding:8px 16px;background:#282828;color:#fff;font:13px system-ui';
+      const dispose = () => {
+        if (stopped) return;
+        stopped = true;
+        controller?.dispose();
+        status.remove();
+        const release = releaseSpeed;
+        releaseSpeed = undefined;
+        release?.();
       };
-
-      const createAudioForCrossfade = (url: string) => {
-        if (transitionAudio) {
-          transitionAudio.unload();
-        }
-
-        transitionAudio = new Howl({
-          src: url,
-          html5: true,
-          volume: 0,
-        });
-        syncVideoWithTransitionAudio();
-      };
-
-      const syncVideoWithTransitionAudio = () => {
-        const video = document.querySelector('video')!;
-
-        const videoFader = new VolumeFader(video, {
-          fadeScaling: this.config?.fadeScaling,
-          fadeDuration: this.config?.fadeInDuration,
-        });
-
-        transitionAudio.play();
-        transitionAudio.seek(video.currentTime);
-
-        video.addEventListener('seeking', () => {
-          transitionAudio.seek(video.currentTime);
-        });
-
-        video.addEventListener('pause', () => {
-          transitionAudio.pause();
-        });
-
-        video.addEventListener('play', () => {
-          transitionAudio.play();
-          transitionAudio.seek(video.currentTime);
-
-          // Fade in
-          const videoVolume = video.volume;
-          video.volume = 0;
-          videoFader.fadeTo(videoVolume);
-        });
-
-        // Exit just before the end for the transition
-        const transitionBeforeEnd = () => {
-          if (
-            video.currentTime >=
-              video.duration - (this.config?.secondsBeforeEnd ?? 0) &&
-            isReadyToCrossfade()
-          ) {
-            video.removeEventListener('timeupdate', transitionBeforeEnd);
-
-            // Go to next video - XXX: does not support "repeat 1" mode
-            document.querySelector<HTMLButtonElement>('.next-button')?.click();
-          }
-        };
-
-        video.addEventListener('timeupdate', transitionBeforeEnd);
-      };
-
-      const crossfade = (cb: () => void) => {
-        if (!isReadyToCrossfade()) {
-          cb();
-          return;
-        }
-
-        let resolveTransition: () => void;
-        waitForTransition = new Promise<void>((resolve) => {
-          resolveTransition = resolve;
-        });
-
-        const video = document.querySelector('video')!;
-
-        const fader = new VolumeFader(transitionAudio._sounds[0]._node, {
-          initialVolume: video.volume,
-          fadeScaling: this.config?.fadeScaling,
-          fadeDuration: this.config?.fadeOutDuration,
-        });
-
-        // Fade out the music
-        video.volume = 0;
-        fader.fadeOut(() => {
-          resolveTransition();
-          cb();
-        });
-      };
-
-      watchVideoIDChanges(async (videoID) => {
-        await waitForTransition;
-        const url = await getStreamURL(videoID);
-        if (!url) {
-          return;
-        }
-
-        createAudioForCrossfade(url);
+      this.dispose = dispose;
+      previousDispose?.();
+      if (stopped || this.dispose !== dispose) return;
+      const main = document.querySelector('video');
+      const graph = getCurrentAudioGraph();
+      if (!api || !main || !graph || !this.config) return;
+      controller = createCrossfadeController({
+        api,
+        main,
+        graph,
+        config: this.config,
+        requestAudio: (videoId) =>
+          this.ipc!.invoke(
+            'audio-url',
+            videoId,
+          ) as Promise<StreamResult | null>,
+        onUnavailable: () => {
+          if (stopped) return;
+          status.textContent = t('plugins.crossfade.route-unavailable');
+          if (!status.isConnected) document.body.append(status);
+        },
       });
+      this.controller = controller;
+      try {
+        const release = this.ipc?.subscribe?.(
+          'peard:playback-speed-step',
+          (...args: unknown[]) => {
+            if (
+              !stopped &&
+              releaseSpeed &&
+              args.length === 1 &&
+              (args[0] === 1 || args[0] === -1)
+            )
+              controller?.cancel();
+          },
+        );
+        if (typeof release === 'function') {
+          if (stopped) release();
+          else releaseSpeed = release;
+        }
+      } catch {
+        /* Unsupported subscriptions never grant ownership. */
+      }
     },
   },
 });

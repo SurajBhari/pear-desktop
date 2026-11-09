@@ -992,6 +992,13 @@
         "visualizer-type": "Visualisierertyp"
       },
       "name": "Visualisierer"
+    },
+    "adblocker": {
+      "description": "Blockiere jegliche Werbung und Tracker",
+      "menu": {
+        "blocker": "Abfangmethode"
+      },
+      "name": "Werbeblocker"
     }
   }
 }

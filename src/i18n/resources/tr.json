@@ -997,6 +997,13 @@
         "visualizer-type": "Görselleştirici Tipi"
       },
       "name": "Görselleştirici"
+    },
+    "adblocker": {
+      "description": "Tüm reklamları ve izleyicileri engelle",
+      "menu": {
+        "blocker": "Engelleyici"
+      },
+      "name": "Reklam Engelleyici"
     }
   }
 }

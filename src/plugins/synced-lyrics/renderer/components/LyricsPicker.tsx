@@ -8,20 +8,19 @@ import { IconStar } from '@mdui/icons/star.js';
 import { IconWarning } from '@mdui/icons/warning.js';
 import {
   createEffect,
-  createMemo,
   createSignal,
   For,
   Index,
   Match,
   onCleanup,
   onMount,
-  runWithOwner,
   type Setter,
   Show,
   Switch,
 } from 'solid-js';
 import * as z from 'zod';
 
+import { t } from '@/i18n';
 import { LitElementWrapper } from '@/solit';
 
 import {
@@ -31,8 +30,7 @@ import {
   ProviderNameSchema,
   type ProviderState,
 } from '../../providers';
-import { _ytAPI } from '../index';
-import { reactiveOwner } from '../reactive-root';
+import { _ytAPI, exportCurrentLyrics } from '../index';
 import { config } from '../renderer';
 import { currentLyrics, lyricsStore, setLyricsStore } from '../store';
 
@@ -42,9 +40,7 @@ const LocalStorageSchema = z.object({
   provider: ProviderNameSchema,
 });
 
-export const providerIdx = runWithOwner(reactiveOwner, () =>
-  createMemo(() => providerNames.indexOf(lyricsStore.provider)),
-)!;
+export const providerIdx = () => providerNames.indexOf(lyricsStore.provider);
 
 const shouldSwitchProvider = (providerData: ProviderState) => {
   if (providerData.state === 'error') return true;
@@ -81,10 +77,28 @@ const pickBestProvider = () => {
 
 const [hasManuallySwitchedProvider, setHasManuallySwitchedProvider] =
   createSignal(false);
+export const resetLyricsPickerSelection = () =>
+  setHasManuallySwitchedProvider(false);
 
 export const LyricsPicker = (props: {
   setStickRef: Setter<HTMLElement | null>;
 }) => {
+  const [exporting, setExporting] = createSignal(false);
+  const [exportStatus, setExportStatus] = createSignal('');
+  let mounted = true;
+  onCleanup(() => {
+    mounted = false;
+  });
+  const exportLyrics = async () => {
+    if (exporting()) return;
+    setExporting(true);
+    setExportStatus('');
+    const status = await exportCurrentLyrics();
+    if (!mounted) return;
+    setExporting(false);
+    if (status !== 'cancelled')
+      setExportStatus(t(`plugins.synced-lyrics.tools.${status}`));
+  };
   const [videoId, setVideoId] = createSignal<string | null>(null);
   const [starredProvider, setStarredProvider] =
     createSignal<ProviderName | null>(null);
@@ -133,8 +147,12 @@ export const LyricsPicker = (props: {
 
   const videoDataChangeHandler = (
     name: string,
-    { videoId }: PlayerAPIEvents['videodatachange']['value'],
+    value: PlayerAPIEvents['videodatachange']['value'] | null | undefined,
   ) => {
+    const videoId =
+      typeof value?.videoId === 'string' && value.videoId
+        ? value.videoId
+        : null;
     setVideoId(videoId);
 
     if (name !== 'dataloaded') return;
@@ -143,8 +161,9 @@ export const LyricsPicker = (props: {
 
   // prettier-ignore
   {
-    onMount(() => _ytAPI?.addEventListener('videodatachange', videoDataChangeHandler));
-    onCleanup(() => _ytAPI?.removeEventListener('videodatachange', videoDataChangeHandler));
+    const api = _ytAPI;
+    onMount(() => api?.addEventListener('videodatachange', videoDataChangeHandler));
+    onCleanup(() => api?.removeEventListener('videodatachange', videoDataChangeHandler));
   }
 
   createEffect(() => {
@@ -210,7 +229,7 @@ export const LyricsPicker = (props: {
               <div
                 class="lyrics-picker-item"
                 style={{
-                  transform: `translateX(${providerIdx() * -100 - 5}%)`,
+                  transform: `translateX(${providerIdx() * -100}%)`,
                 }}
                 tabindex="-1"
               >
@@ -305,6 +324,24 @@ export const LyricsPicker = (props: {
           />
         </mdui-button-icon>
       </div>
+      <Show when={config()?.enableDownload !== false}>
+        <>
+          <button
+            aria-busy={exporting()}
+            aria-disabled={exporting()}
+            class="lyrics-export"
+            disabled={currentLyrics().state !== 'done' || !currentLyrics().data}
+            onClick={exportLyrics}
+            title={t('plugins.synced-lyrics.tools.export')}
+            type="button"
+          >
+            {t('plugins.synced-lyrics.tools.export')}
+          </button>
+          <span class="lyrics-export-status" role="status">
+            {exportStatus()}
+          </span>
+        </>
+      </Show>
     </div>
   );
 };

@@ -1,4 +1,10 @@
-import { createEffect, createMemo, createSignal, Show } from 'solid-js';
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+  Show,
+} from 'solid-js';
 
 import { config } from '../renderer';
 import {
@@ -24,12 +30,21 @@ export const PlainLyrics = (props: PlainLyricsProps) => {
   });
 
   createEffect(() => {
-    if (!config()?.romanization) return;
-
     const input = canonicalize(text());
-    romanize(input).then((result) => {
-      setRomanization(canonicalize(result));
+    const enabled = config()?.romanization;
+    let active = true;
+    onCleanup(() => {
+      active = false;
     });
+    if (!enabled) return;
+
+    romanize(input)
+      .then((result) => {
+        if (active) setRomanization(canonicalize(result));
+      })
+      .catch(() => {
+        if (active) setRomanization(input);
+      });
   });
 
   return (

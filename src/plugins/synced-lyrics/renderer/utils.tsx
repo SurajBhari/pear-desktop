@@ -2,15 +2,12 @@ import { romanize as romanizeThaiFrag } from '@dehoist/romanize-thai';
 import Sanscript from '@indic-transliteration/sanscript';
 import { sify, tify } from 'chinese-conv';
 import { romanize as esHangulRomanize } from 'es-hangul';
-import hanja from 'hanja';
+import { translate as translateHanja } from 'hanja/lib/translate.js';
 import Kuroshiro from 'kuroshiro';
 import KuromojiAnalyzer from 'kuroshiro-analyzer-kuromoji';
 import lazyVar from 'lazy-var';
-import { pinyin } from 'pinyin-pro';
 import { render } from 'solid-js/web';
 import { detect } from 'tinyld';
-
-import { waitForElement } from '@/utils/wait-for-element';
 
 import { LyricsRenderer, setIsVisible } from './renderer';
 
@@ -22,23 +19,71 @@ export const selectors = {
   },
 };
 
+let uiController = new AbortController();
+let uiActive = false;
+let container: HTMLDivElement | undefined;
+let disposeView: (() => void) | undefined;
+
+export const waitForLyricsElement = <T extends Element>(
+  selector: string,
+  signal: AbortSignal,
+): Promise<T | null> => {
+  if (signal.aborted) return Promise.resolve(null);
+  const existing = document.querySelector<T>(selector);
+  if (existing) return Promise.resolve(existing);
+  return new Promise((resolve) => {
+    const finish = (element: T | null) => {
+      observer.disconnect();
+      signal.removeEventListener('abort', abort);
+      resolve(element);
+    };
+    const abort = () => finish(null);
+    const observer = new MutationObserver(() => {
+      const element = document.querySelector<T>(selector);
+      if (element) finish(element);
+    });
+    signal.addEventListener('abort', abort, { once: true });
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+  });
+};
+
+export const disposeLyricsView = () => {
+  uiActive = false;
+  uiController.abort();
+  disposeView?.();
+  disposeView = undefined;
+  container?.remove();
+  container = undefined;
+  setIsVisible(false);
+};
+export const startLyricsView = () => {
+  disposeLyricsView();
+  uiController = new AbortController();
+  uiActive = true;
+};
+
 export const tabStates: Record<string, () => void> = {
   true: async () => {
+    if (!uiActive) return;
     setIsVisible(true);
-
-    let container = document.querySelector('#synced-lyrics-container');
-    if (container) return;
-
-    const tabRenderer = await waitForElement<HTMLElement>(
+    if (container?.isConnected) return;
+    const signal = uiController.signal;
+    const tabRenderer = await waitForLyricsElement<HTMLElement>(
       selectors.body.tabRenderer,
+      signal,
     );
-
+    if (!tabRenderer || signal.aborted || !uiActive || container?.isConnected)
+      return;
+    disposeView?.();
     container = Object.assign(document.createElement('div'), {
       id: 'synced-lyrics-container',
     });
 
     tabRenderer.appendChild(container);
-    render(() => <LyricsRenderer />, container);
+    disposeView = render(() => <LyricsRenderer />, container);
   },
   false: () => {
     setIsVisible(false);
@@ -185,9 +230,10 @@ export const romanizeJapanese = async (line: string) =>
   }) ?? line;
 
 export const romanizeHangul = (line: string) =>
-  esHangulRomanize(hanja.translate(line, 'SUBSTITUTION'));
+  esHangulRomanize(translateHanja(line, 'SUBSTITUTION'));
 
-export const romanizeChinese = (line: string) => {
+export const romanizeChinese = async (line: string) => {
+  const { pinyin } = await import('pinyin-pro');
   return line.replaceAll(/[\u4E00-\u9FFF]+/g, (match) => {
     return pinyin(match, { separator: ' ' });
   });
@@ -255,7 +301,7 @@ export const romanize = async (line: string) => {
   // fallback
   if (hasJapanese([line])) line = await romanizeJapanese(line);
   if (hasKorean([line])) line = romanizeHangul(line);
-  if (hasChinese([line])) line = romanizeChinese(line);
+  if (hasChinese([line])) line = await romanizeChinese(line);
   if (hasThai([line])) line = romanizeThai(line);
   if (hasBengali([line])) line = romanizeBengali(line);
   if (hasHindi([line])) line = romanizeHindi(line);

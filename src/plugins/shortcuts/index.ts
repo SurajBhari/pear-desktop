@@ -1,20 +1,35 @@
 import { t } from '@/i18n';
 import { createPlugin } from '@/utils';
 
-import { onMainLoad } from './main';
+import { backend } from './main';
 import { onMenu } from './menu';
 
 export type ShortcutMappingType = {
   previous: string;
   playPause: string;
   next: string;
+  seekForward: string;
+  seekBackward: string;
+  like: string;
+  dislike: string;
 };
 export type ShortcutsPluginConfig = {
   enabled: boolean;
   overrideMediaKeys: boolean;
+  focusWindowOnDoublePlayPause: boolean;
   global: ShortcutMappingType;
   local: ShortcutMappingType;
+  seekForwardSeconds: number;
+  seekBackwardSeconds: number;
+  podcastSeekForwardSeconds: number;
+  podcastSeekBackwardSeconds: number;
 };
+
+export type SeekSecondsKey =
+  | 'seekForwardSeconds'
+  | 'seekBackwardSeconds'
+  | 'podcastSeekForwardSeconds'
+  | 'podcastSeekBackwardSeconds';
 
 export default createPlugin({
   name: () => t('plugins.shortcuts.name'),
@@ -23,18 +38,31 @@ export default createPlugin({
   config: {
     enabled: false,
     overrideMediaKeys: false,
+    focusWindowOnDoublePlayPause: false,
     global: {
       previous: '',
       playPause: '',
       next: '',
+      seekForward: '',
+      seekBackward: '',
+      like: '',
+      dislike: '',
     },
     local: {
       previous: '',
       playPause: '',
       next: '',
+      seekForward: '',
+      seekBackward: '',
+      like: '',
+      dislike: '',
     },
+    seekForwardSeconds: 5,
+    seekBackwardSeconds: 5,
+    podcastSeekForwardSeconds: 10,
+    podcastSeekBackwardSeconds: 30,
   } as ShortcutsPluginConfig,
   menu: onMenu,
 
-  backend: onMainLoad,
+  backend,
 });

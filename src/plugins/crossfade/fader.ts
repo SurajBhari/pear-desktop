@@ -1,3 +1,4 @@
+import { envelopeValue } from './envelope';
 /**
  * VolumeFader
  * Sophisticated Media Volume Fading
@@ -63,7 +64,7 @@ interface VolumeFade {
 
 // Main class
 export class VolumeFader {
-  private readonly media: HTMLMediaElement;
+  private readonly media: Pick<HTMLMediaElement, 'volume'>;
   private readonly logger: VolumeLogger | null;
   private scale: {
     internalToVolume: (level: number) => number;
@@ -72,6 +73,8 @@ export class VolumeFader {
   private fadeDuration: number = 1000;
   private active: boolean = false;
   private fade: VolumeFade | undefined;
+  private frame: number | undefined;
+  private equalPower = false;
 
   /**
    * VolumeFader Constructor
@@ -81,9 +84,12 @@ export class VolumeFader {
    * @throws {TypeError} if options.initialVolume or options.fadeDuration are invalid
    *
    */
-  constructor(media: HTMLMediaElement, options: VolumeFaderOptions) {
-    // Passed media element of correct type?
-    if (media instanceof HTMLMediaElement) {
+  constructor(
+    media: Pick<HTMLMediaElement, 'volume'>,
+    options: VolumeFaderOptions,
+  ) {
+    // Native media or an owned AudioParam envelope target; never a user-volume proxy.
+    if (media && typeof media.volume === 'number') {
       // Save reference to media element
       this.media = media;
     } else {
@@ -93,6 +99,7 @@ export class VolumeFader {
 
     // Make sure options is an object
     options = options || {};
+    this.equalPower = options.fadeScaling === 'equalPower';
 
     // Log function passed?
     if (typeof options.logger === 'function') {
@@ -104,7 +111,10 @@ export class VolumeFader {
     }
 
     // Linear volume fading?
-    if (options.fadeScaling === 'linear') {
+    if (
+      options.fadeScaling === 'linear' ||
+      options.fadeScaling === 'equalPower'
+    ) {
       // Pass levels unchanged
       this.scale = {
         internalToVolume: (level: number) => level,
@@ -195,6 +205,8 @@ export class VolumeFader {
    * @return {Object} VolumeFader instance for chaining
    */
   start() {
+    if (this.frame !== undefined) window.cancelAnimationFrame(this.frame);
+    this.frame = undefined;
     // Set fader to be active
     this.active = true;
 
@@ -214,6 +226,9 @@ export class VolumeFader {
   stop() {
     // Set fader to be inactive
     this.active = false;
+    if (this.frame !== undefined) window.cancelAnimationFrame(this.frame);
+    this.frame = undefined;
+    this.fade = undefined;
 
     // Return instance for chaining
     return this;
@@ -227,9 +242,13 @@ export class VolumeFader {
    * @throws {TypeError} if fadeDuration is not a number greater than zero
    * @return {Object} VolumeFader instance for chaining
    */
+  cancelFade() {
+    this.stop();
+  }
+
   setFadeDuration(fadeDuration: number) {
     // If duration is a valid number > 0…
-    if (!Number.isNaN(fadeDuration) && fadeDuration > 0) {
+    if (Number.isFinite(fadeDuration) && fadeDuration > 0) {
       // Set fade duration
       this.fadeDuration = fadeDuration;
 
@@ -256,6 +275,7 @@ export class VolumeFader {
     // Validate volume and throw if invalid
     validateVolumeLevel(targetVolume);
 
+    this.cancelFade();
     // Define new fade
     this.fade = {
       // Volume start and end point on internal fading scale
@@ -309,14 +329,22 @@ export class VolumeFader {
           (this.fade.time.end - this.fade.time.start);
 
         // Compute current level on internal scale
-        const level =
-          (progress * (this.fade.volume.end - this.fade.volume.start)) + this.fade.volume.start;
+        const span = this.fade.volume.end - this.fade.volume.start;
+        const movement = progress * span;
+        const level = movement + this.fade.volume.start;
 
         // Map fade level to volume level and apply it to media element
-        this.media.volume = this.scale.internalToVolume(level);
+        this.media.volume = this.equalPower
+          ? envelopeValue(
+              this.fade.volume.start,
+              this.fade.volume.end,
+              progress,
+              'equalPower',
+            )
+          : this.scale.internalToVolume(level);
 
         // Schedule next update
-        window.requestAnimationFrame(this.updateVolume.bind(this));
+        this.frame = window.requestAnimationFrame(this.updateVolume.bind(this));
       } else {
         // Log end of fade
         this.logger?.('Fade to ' + String(this.fade.volume.end) + ' complete.');
@@ -327,11 +355,11 @@ export class VolumeFader {
         // Set fader to be inactive
         this.active = false;
 
-        // Done, call back (if callable)
-        if (typeof this.fade.callback === 'function') this.fade.callback();
-
-        // Clear fade
+        // Publish completion before a callback can install a successor fade.
+        const callback = this.fade.callback;
         this.fade = undefined;
+        this.frame = undefined;
+        callback?.();
       }
     }
   }
@@ -377,7 +405,8 @@ export class VolumeFader {
     input = Math.log10(input);
 
     // Scale minus something × 10 dB to 0…1 (clipping at 0)
-    return Math.max(1 + (input / dynamicRange), 0);
+    const normalized = input / dynamicRange;
+    return Math.max(1 + normalized, 0);
   }
 }
 

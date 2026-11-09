@@ -958,6 +958,13 @@
         "visualizer-type": "Uri ng Visualizer"
       },
       "name": "Taga-visualize"
+    },
+    "adblocker": {
+      "description": "I-block ang lahat ng ad at tracking",
+      "menu": {
+        "blocker": "Blocker"
+      },
+      "name": "Pag-block ng Ad"
     }
   }
 }

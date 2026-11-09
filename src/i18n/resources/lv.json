@@ -614,6 +614,13 @@
         "disconnected": "Mūzika Kopā atvienota",
         "host-failed": "Neizdevās uzsākt Mūziku Kopā"
       }
+    },
+    "adblocker": {
+      "description": "Bloķēt visas reklāmas un trekerus uzreiz pēc instalēšanas",
+      "menu": {
+        "blocker": "Bloķētājs"
+      },
+      "name": "Reklāmu bloķētājs"
     }
   }
 }

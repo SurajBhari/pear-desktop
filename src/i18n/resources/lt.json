@@ -985,6 +985,13 @@
         "visualizer-type": "Vizualizatoriaus tipas"
       },
       "name": "Vizualizatorius"
+    },
+    "adblocker": {
+      "description": "Blokuoti visas reklamas ir seklius",
+      "menu": {
+        "blocker": "Blokuotojas"
+      },
+      "name": "Reklamų blokuotojas"
     }
   }
 }

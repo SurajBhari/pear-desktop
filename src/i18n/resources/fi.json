@@ -767,6 +767,13 @@
           }
         }
       }
+    },
+    "adblocker": {
+      "description": "Estä kaikki mainokset ja seuranta",
+      "menu": {
+        "blocker": "Estäjät (blockerit)"
+      },
+      "name": "Mainos estäjä"
     }
   }
 }

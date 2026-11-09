@@ -45,5 +45,6 @@ export interface RendererContext<
     invoke: IpcRenderer['invoke'];
     on: (event: string, listener: CallableFunction) => void;
     removeAllListeners: (event: string) => void;
+    subscribe?: (event: string, listener: CallableFunction) => () => void;
   };
 }

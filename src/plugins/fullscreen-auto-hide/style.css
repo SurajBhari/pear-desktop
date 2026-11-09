@@ -1,0 +1,15 @@
+body.fullscreen-auto-hide--active ytmusic-player-bar {
+  transition: opacity 0.3s ease !important;
+}
+body.fullscreen-auto-hide--idle ytmusic-player-bar {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+body.fullscreen-auto-hide--idle {
+  cursor: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  body.fullscreen-auto-hide--active ytmusic-player-bar {
+    transition: none !important;
+  }
+}

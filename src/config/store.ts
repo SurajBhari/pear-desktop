@@ -1,9 +1,8 @@
-import { blockers } from '@/plugins/do-not-track/types';
 import { DefaultPresetList, type Preset } from '@/plugins/downloader/types';
 
+import { restoreAdblockerConfig } from './adblocker-migration';
 import { defaultConfig as defaults } from './defaults';
 
-import type { TrackerBlockerConfig } from '@/plugins/do-not-track';
 import type { SyncedLyricsPluginConfig } from '@/plugins/synced-lyrics/types';
 
 // HACK: electron-store is ESM, but rolldown has a bug that prevents it from being imported properly in CommonJS context, so we have to use require here
@@ -21,14 +20,7 @@ export type IStore = InstanceType<
 
 const migrations = {
   '>=3.12.0'(store: IStore) {
-    const blockerConfig = store.get('plugins.adblocker') as TrackerBlockerConfig;
-    if (blockerConfig) {
-      if (!Object.values(blockers).includes(blockerConfig.blocker)) {
-        blockerConfig.blocker = blockers.InPlayer;
-      }
-      store.set('plugins.do-not-track', blockerConfig);
-      store.delete('plugins.adblocker');
-    }
+    restoreAdblockerConfig(store);
   },
   '>=3.10.0'(store: IStore) {
     const lyricGeniusConfig = store.get('plugins.lyrics-genius') as
@@ -287,3 +279,6 @@ export const store = new Store({
   clearInvalidConfig: false,
   migrations,
 });
+
+// Also recover profiles that already ran upstream's migration at this version.
+restoreAdblockerConfig(store);

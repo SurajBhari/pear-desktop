@@ -997,6 +997,13 @@
         "visualizer-type": "Loại Sóng nhạc"
       },
       "name": "Sóng nhạc"
+    },
+    "adblocker": {
+      "description": "Chặn toàn bộ quảng cáo và trình theo dõi",
+      "menu": {
+        "blocker": "Trình chặn"
+      },
+      "name": "Chặn quảng cáo"
     }
   }
 }

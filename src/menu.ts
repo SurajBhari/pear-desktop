@@ -10,15 +10,17 @@ import {
 } from 'electron';
 import is from 'electron-is';
 import { satisfies } from 'semver';
-import { languageResources } from 'virtual:i18n';
+import { availableLanguages, languageLabels } from 'virtual:i18n';
 import { allPlugins } from 'virtual:plugins';
 
 import { APPLICATION_NAME, setLanguage, t } from '@/i18n';
+import { stripMusicFromShareUrl } from '@/utils/share-url';
 
 import * as config from './config';
 import { getAllMenuTemplate, loadAllMenuPlugins } from './loader/menu';
 import { restart } from './providers/app-controls';
 import { startingPages } from './providers/extracted-data';
+import { openMcpDependencyNotices } from './providers/mcp-notices';
 import promptOptions from './providers/prompt-options';
 
 import packageJson from '../package.json';
@@ -31,10 +33,10 @@ const inAppMenuActive = await config.plugins.isEnabled('in-app-menu');
 const pluginEnabledMenu = async (
   plugin: string,
   label = '',
-  description?: string ,
+  description?: string,
   isNew = false,
   hasSubmenu = false,
-  refreshMenu?: (() => void) ,
+  refreshMenu?: () => void,
 ): Promise<Electron.MenuItemConstructorOptions> => ({
   label: label || plugin,
   sublabel: isNew ? t('main.menu.plugins.new') : undefined,
@@ -54,9 +56,34 @@ const pluginEnabledMenu = async (
   },
 });
 
-export const refreshMenu = async (win: BrowserWindow) => {
-  await setApplicationMenu(win);
-  if (inAppMenuActive) {
+let applicationMenuWindow: BrowserWindow | undefined;
+let languageSelection = 0;
+let menuPublication = 0;
+const isMenuWindowAlive = (win: BrowserWindow) =>
+  !win.isDestroyed() && !win.webContents.isDestroyed();
+
+const ownMenuPublication = (win: BrowserWindow, isCurrent: () => boolean) => {
+  const generation = ++menuPublication;
+  return () =>
+    generation === menuPublication &&
+    isCurrent() &&
+    generation === menuPublication &&
+    isMenuWindowAlive(win) &&
+    generation === menuPublication;
+};
+
+export const refreshMenu = async (
+  win: BrowserWindow,
+  isCurrent: () => boolean = () => true,
+) => {
+  const ownsPublication = ownMenuPublication(win, isCurrent);
+  const published = await publishApplicationMenu(win, ownsPublication);
+  if (
+    published &&
+    ownsPublication() &&
+    applicationMenuWindow === win &&
+    inAppMenuActive
+  ) {
     win.webContents.send('refresh-in-app-menu');
   }
 };
@@ -79,7 +106,10 @@ export const mainMenuTemplate = async (
         ? satisfies(packageJson.version, plugin.addedVersion)
         : false;
 
-      if (!(await config.plugins.isEnabled(id))) {
+      if (
+        !(await config.plugins.isEnabled(id)) &&
+        plugin?.menuWhenDisabled !== true
+      ) {
         return [
           id,
           await pluginEnabledMenu(
@@ -147,9 +177,6 @@ export const mainMenuTemplate = async (
       }),
   );
 
-  const langResources = await languageResources();
-  const availableLanguages = Object.keys(langResources);
-
   return [
     {
       label: t('main.menu.plugins.label'),
@@ -172,6 +199,17 @@ export const mainMenuTemplate = async (
           checked: config.get('options.resumeOnStart'),
           click(item: MenuItem) {
             config.setMenuOption('options.resumeOnStart', item.checked);
+          },
+        },
+        {
+          label: t('main.menu.options.submenu.strip-music-from-shared-links'),
+          type: 'checkbox',
+          checked: config.get('options.stripMusicFromSharedLinks'),
+          click(item: MenuItem) {
+            config.setMenuOption(
+              'options.stripMusicFromSharedLinks',
+              item.checked,
+            );
           },
         },
         {
@@ -494,14 +532,30 @@ export const mainMenuTemplate = async (
             availableLanguages
               .map(
                 (lang): Electron.MenuItemConstructorOptions => ({
-                  label: `${langResources[lang].translation.language?.name ?? 'Unknown'} (${langResources[lang].translation.language?.['local-name'] ?? 'Unknown'})`,
+                  label: `${languageLabels[lang].name} (${languageLabels[lang].localName})`,
                   type: 'checkbox',
                   checked: (config.get('options.language') ?? 'en') === lang,
-                  click() {
+                  async click() {
+                    if (
+                      !isMenuWindowAlive(win) ||
+                      (applicationMenuWindow && applicationMenuWindow !== win)
+                    )
+                      return;
+                    const selection = ++languageSelection;
+                    const isCurrent = () =>
+                      selection === languageSelection &&
+                      !config.get('options.restartOnConfigChanges') &&
+                      isMenuWindowAlive(win) &&
+                      (!applicationMenuWindow ||
+                        applicationMenuWindow === win) &&
+                      config.get('options.language') === lang;
                     config.setMenuOption('options.language', lang);
-                    refreshMenu(win);
-                    setLanguage(lang);
-                    dialog.showMessageBox(win, {
+                    if (!isCurrent()) return;
+                    await setLanguage(lang, isCurrent);
+                    if (!isCurrent()) return;
+                    await refreshMenu(win, isCurrent);
+                    if (!isCurrent()) return;
+                    await dialog.showMessageBox(win, {
                       title: t(
                         'main.menu.options.submenu.language.dialog.title',
                       ),
@@ -676,7 +730,11 @@ export const mainMenuTemplate = async (
           label: t('main.menu.navigation.submenu.copy-current-url'),
           click() {
             const currentURL = win.webContents.getURL();
-            clipboard.writeText(currentURL);
+            clipboard.writeText(
+              config.get('options.stripMusicFromSharedLinks') === true
+                ? stripMusicFromShareUrl(currentURL)
+                : currentURL,
+            );
           },
         },
         {
@@ -691,11 +749,35 @@ export const mainMenuTemplate = async (
     },
     {
       label: t('main.menu.about'),
-      submenu: [{ role: 'about' }],
+      submenu: [
+        { role: 'about' },
+        {
+          label: t('main.menu.mcp-dependency-notices'),
+          async click() {
+            await openMcpDependencyNotices().catch((error: unknown) => {
+              console.error('Failed to open MCP dependency notices', error);
+              dialog.showErrorBox(
+                t('main.menu.mcp-dependency-notices'),
+                t('main.menu.mcp-dependency-notices-error'),
+              );
+            });
+          },
+        },
+      ],
     },
   ];
 };
-export const setApplicationMenu = async (win: Electron.BrowserWindow) => {
+export const setApplicationMenu = (
+  win: Electron.BrowserWindow,
+  isCurrent: () => boolean = () => true,
+) => publishApplicationMenu(win, ownMenuPublication(win, isCurrent));
+
+const publishApplicationMenu = async (
+  win: Electron.BrowserWindow,
+  ownsPublication: () => boolean,
+) => {
+  if (!ownsPublication()) return false;
+  applicationMenuWindow = win;
   const menuTemplate: MenuTemplate = [...(await mainMenuTemplate(win))];
   if (process.platform === 'darwin') {
     const { name } = app;
@@ -720,8 +802,11 @@ export const setApplicationMenu = async (win: Electron.BrowserWindow) => {
     });
   }
 
+  if (!ownsPublication() || applicationMenuWindow !== win) return false;
   const menu = Menu.buildFromTemplate(menuTemplate);
+  if (!ownsPublication() || applicationMenuWindow !== win) return false;
   Menu.setApplicationMenu(menu);
+  return ownsPublication() && applicationMenuWindow === win;
 };
 
 async function setProxy(item: Electron.MenuItem, win: BrowserWindow) {

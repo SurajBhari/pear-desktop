@@ -100,41 +100,41 @@ test('karaoke', () => {
     lines: [
       {
         duration: Infinity,
-        text: 'When the truth is found to be lies',
+        text: '  When  the  truth  is  found  to  be  lies',
         time: '00:00:00',
         timeInMs: 0,
         words: [
           {
             timeInMs: 40,
-            word: 'When',
+            word: '  When ',
           },
           {
             timeInMs: 160,
-            word: 'the',
+            word: ' the ',
           },
           {
             timeInMs: 820,
-            word: 'truth',
+            word: ' truth ',
           },
           {
             timeInMs: 1290,
-            word: 'is',
+            word: ' is ',
           },
           {
             timeInMs: 1630,
-            word: 'found',
+            word: ' found ',
           },
           {
             timeInMs: 3090,
-            word: 'to',
+            word: ' to ',
           },
           {
             timeInMs: 3370,
-            word: 'be',
+            word: ' be ',
           },
           {
             timeInMs: 5920,
-            word: 'lies',
+            word: ' lies',
           },
         ],
       },

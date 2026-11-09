@@ -997,6 +997,13 @@
         "visualizer-type": "Typ wizualizatora"
       },
       "name": "Wizualizator"
+    },
+    "adblocker": {
+      "description": "Blokuj wszystkie reklamy i śledzenie",
+      "menu": {
+        "blocker": "Metoda przechwytywania"
+      },
+      "name": "Blokowanie reklam"
     }
   }
 }

@@ -1,0 +1,224 @@
+--- upstream.user.js
++++ bypass.js
+@@ -1,3 +1,27 @@
++/* oxlint-disable */
++/*!
++MIT License
++
++Copyright (c) 2021 zerodytrash
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
++*/
+ // ==UserScript==
+ // @name            Simple YouTube Age Restriction Bypass
+ // @description     Watch age restricted videos on YouTube without login and without age verification 😎
+@@ -29,13 +53,13 @@
+     You can find the nicely readable source code at https://github.com/zerodytrash/Simple-YouTube-Age-Restriction-Bypass
+ */
+ 
+-(function iife(ranOnce) {
+-    // Trick to get around the sandbox restrictions in Greasemonkey (Firefox)
+-    // Inject code into the main window if criteria match
+-    if (this !== window && !ranOnce) {
+-        window.eval('(' + iife.toString() + ')(true);');
+-        return;
+-    }
++// prettier-ignore
++export function iife(ranOnce) {
++    // Pear Desktop invokes this function synchronously in Electron's main world.
++    // Its permanent global interceptors require restarting when the plugin is disabled.
++    const injectionKey = Symbol.for('pear-desktop.bypass-age-restrictions.injected');
++    if (window[injectionKey]) return;
++    window[injectionKey] = true;
+ 
+     // Script configuration variables
+     const UNLOCKABLE_PLAYABILITY_STATUSES = ['AGE_VERIFICATION_REQUIRED', 'AGE_CHECK_REQUIRED', 'CONTENT_CHECK_REQUIRED', 'LOGIN_REQUIRED'];
+@@ -87,8 +111,52 @@
+         BLURRED_THUMBNAIL_SQP_LENGTHS,
+     };
+ 
++    // Local security patch: neither proxy may receive Google session credentials.
++    const sensitiveProxyHeader = /^(authorization|cookie|cookie2|proxy-authorization|x-goog-.*|x-origin)$/i;
++    const proxyXhrState = new WeakMap();
++
++    function isProxyUrl(url) {
++        return [Config.ACCOUNT_PROXY_SERVER_HOST, Config.VIDEO_PROXY_SERVER_HOST]
++            .some((host) => host && url.origin === new URL(host).origin);
++    }
++
++    function sanitizeProxyOptions(options) {
++        const headers = new Headers(options.headers);
++        for (const name of Array.from(headers.keys())) {
++            if (sensitiveProxyHeader.test(name)) headers.delete(name);
++        }
++        options.headers = headers;
++        options.credentials = 'omit';
++    }
++
++    function restoreProxyXhr(xhr) {
++        const state = proxyXhrState.get(xhr);
++        if (!state) return;
++        xhr.setRequestHeader = state.setRequestHeader;
++        if (state.credentials) Object.defineProperty(xhr, 'withCredentials', state.credentials);
++        else delete xhr.withCredentials;
++        proxyXhrState.delete(xhr);
++    }
++
++    function sanitizeProxyXhr(xhr) {
++        const original = xhr.setRequestHeader;
++        proxyXhrState.set(xhr, {
++            setRequestHeader: original,
++            credentials: Object.getOwnPropertyDescriptor(xhr, 'withCredentials'),
++            nativeCredentials: nativeXMLHttpRequestCredentials.get.call(xhr),
++        });
++        xhr.setRequestHeader = function(name, value) {
++            if (!sensitiveProxyHeader.test(name)) return original.call(this, name, value);
++        };
++        Object.defineProperty(xhr, 'withCredentials', {
++            configurable: true,
++            set: () => {},
++            get: () => false,
++        });
++    }
++
+     function isGoogleVideoUrl(url) {
+-        return url.host.includes('.googlevideo.com');
++        return url.hostname.endsWith('.googlevideo.com');
+     }
+ 
+     function isGoogleVideoUnlockRequired(googleVideoUrl, lastProxiedGoogleVideoId) {
+@@ -101,6 +169,7 @@
+ 
+     const nativeJSONParse = window.JSON.parse;
+     const nativeXMLHttpRequestOpen = window.XMLHttpRequest.prototype.open;
++    const nativeXMLHttpRequestCredentials = Object.getOwnPropertyDescriptor(window.XMLHttpRequest.prototype, 'withCredentials');
+ 
+     const isDesktop = window.location.host !== 'm.youtube.com';
+     const isMusic = window.location.host === 'music.youtube.com';
+@@ -485,8 +554,24 @@
+ 
+         window.Request = new Proxy(window.Request, {
+             construct(target, args) {
+-                let [url, options] = args;
++                let [url, options = {}] = args;
++                options = { ...options };
+                 try {
++                    if (url instanceof target) {
++                        const request = Reflect.construct(target, args);
++                        const proxyOptions = { headers: request.headers, credentials: request.credentials };
++                        const modifiedUrl = onRequestCreate(request.url, proxyOptions);
++                        if (!modifiedUrl) return request;
++                        return Reflect.construct(target, [modifiedUrl, {
++                            method: request.method, headers: proxyOptions.headers,
++                            credentials: proxyOptions.credentials, body: request.body,
++                            mode: request.mode, cache: request.cache, redirect: request.redirect,
++                            referrer: request.referrer, referrerPolicy: request.referrerPolicy,
++                            integrity: request.integrity, keepalive: request.keepalive,
++                            signal: request.signal, duplex: 'half',
++                        }]);
++                    }
++                    if (url instanceof URL) url = url.href;
+                     if (typeof url === 'string') {
+                         if (url.indexOf('/') === 0) {
+                             url = window.location.origin + url;
+@@ -498,6 +583,7 @@
+                             if (modifiedUrl) {
+                                 args[0] = modifiedUrl;
+                             }
++                            args[1] = options;
+                         }
+                     }
+                 } catch (err) {
+@@ -511,6 +597,7 @@
+ 
+     function attach(onXhrOpenCalled) {
+         XMLHttpRequest.prototype.open = function(...args) {
++            const previousProxyState = proxyXhrState.get(this);
+             let [method, url] = args;
+             try {
+                 if (typeof url === 'string') {
+@@ -530,7 +617,17 @@
+                 error(err, `Failed to intercept XMLHttpRequest.open()`);
+             }
+ 
+-            nativeXMLHttpRequestOpen.apply(this, args);
++            const result = nativeXMLHttpRequestOpen.apply(this, args);
++            const currentProxyState = proxyXhrState.get(this);
++            if (currentProxyState) {
++                if (previousProxyState) currentProxyState.nativeCredentials = previousProxyState.nativeCredentials;
++                // Shadowing the JS accessor does not reset the browser's credential flag.
++                // Clear it after native open: a reused DONE XHR rejects setting it earlier.
++                nativeXMLHttpRequestCredentials.set.call(this, false);
++            } else if (previousProxyState) {
++                nativeXMLHttpRequestCredentials.set.call(this, previousProxyState.nativeCredentials);
++            }
++            return result;
+         };
+     }
+ 
+@@ -1189,13 +1286,10 @@
+      */
+     function handleXhrOpen(method, url, xhr) {
+         const url_obj = new URL(url);
+-        let proxyUrl = unlockGoogleVideo(url_obj);
++        restoreProxyXhr(xhr);
++        const proxyUrl = unlockGoogleVideo(url_obj) || (isProxyUrl(url_obj) ? url_obj : null);
+         if (proxyUrl) {
+-            // Exclude credentials from XMLHttpRequest
+-            Object.defineProperty(xhr, 'withCredentials', {
+-                set: () => {},
+-                get: () => false,
+-            });
++            sanitizeProxyXhr(xhr);
+             return proxyUrl.toString();
+         }
+ 
+@@ -1226,12 +1320,9 @@
+      */
+     function handleFetchRequest(url, requestOptions) {
+         const url_obj = new URL(url);
+-        const newGoogleVideoUrl = unlockGoogleVideo(url_obj);
++        const newGoogleVideoUrl = unlockGoogleVideo(url_obj) || (isProxyUrl(url_obj) ? url_obj : null);
+         if (newGoogleVideoUrl) {
+-            // Exclude credentials from Fetch Request
+-            if (requestOptions.credentials) {
+-                requestOptions.credentials = 'omit';
+-            }
++            sanitizeProxyOptions(requestOptions);
+             return newGoogleVideoUrl.toString();
+         }
+ 
+@@ -1314,6 +1405,11 @@
+         attach$2(processYtData);
+         attach(handleXhrOpen);
+         attach$1(handleFetchRequest);
++        // YouTube may call fetch directly instead of constructing Request first.
++        const nativeFetch = window.fetch;
++        window.fetch = async function(input, options) {
++            return nativeFetch.call(this, new window.Request(input, options));
++        };
+     } catch (err) {
+         error(err, 'Error while attaching data interceptors');
+     }
+@@ -1356,4 +1452,4 @@
+ 
+         return ytData;
+     }
+-})();
++}

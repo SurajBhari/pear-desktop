@@ -1,0 +1,131 @@
+name: Build release assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example v3.12.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'deruta74/pear-desktop'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            platform: mac
+          - os: ubuntu-24.04
+            platform: linux
+          - os: windows-latest
+            platform: win
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 11
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: 24.x
+      - name: Check tag and package version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: node -e "const p=require('./package.json');if(process.env.RELEASE_TAG !== 'v'+p.version || !/^v\d+\.\d+\.\d+$/.test(process.env.RELEASE_TAG))throw Error('Tag/version mismatch')"
+      - run: pnpm install --frozen-lockfile
+      - name: Install Linux packaging tools
+        if: matrix.platform == 'linux'
+        run: |
+          sudo snap install snapcraft --classic
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder rpm libarchive-tools
+          sudo flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y --system flathub org.freedesktop.Platform/x86_64/24.08 org.freedesktop.Sdk/x86_64/24.08 org.electronjs.Electron2.BaseApp/x86_64/24.08
+          sudo flatpak install -y --system flathub org.freedesktop.Platform/aarch64/24.08 org.freedesktop.Sdk/aarch64/24.08 org.electronjs.Electron2.BaseApp/aarch64/24.08
+      - run: pnpm build
+      - name: Prepare shared Linux packaging tools
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          # Older immutable release tags predate this helper.
+          if [ -f scripts/prepare-linux-tools.cjs ]; then
+            node scripts/prepare-linux-tools.cjs
+          else
+            echo "Legacy tag: packaging helper is not present"
+          fi
+      - name: Package every configured architecture
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: pnpm exec electron-builder --"$PLATFORM" -p never -c.snap.publish=github
+      - name: Flatten NSIS web output for tagged helpers
+        # Compatibility with signed tags whose helper only scans pack's root.
+        # Move only NSIS web's regular output files; never unpacked app files.
+        # A future tag with the updated helper also works after this move.
+        if: matrix.platform == 'win'
+        shell: bash
+        run: |
+          node - <<'JS'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const directory = path.join('pack', 'nsis-web');
+          if (fs.existsSync(directory)) for (const name of fs.readdirSync(directory)) {
+            const source = path.join(directory, name);
+            if (!fs.lstatSync(source).isFile()) continue;
+            const destination = path.join('pack', name);
+            if (fs.existsSync(destination)) throw new Error(`NSIS output collision: ${name}`);
+            fs.renameSync(source, destination);
+          }
+          JS
+      - name: Stage distributables only
+        run: node scripts/verify-release.cjs stage pack release-assets
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.platform }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 11
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: 24.x
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify coverage and updater hashes
+        run: node scripts/verify-release.cjs verify release-assets
+      - name: Upload validated files to existing draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          test "$(gh release view "$RELEASE_TAG" -R deruta74/pear-desktop --json isDraft --jq .isDraft)" = true
+          gh release upload "$RELEASE_TAG" release-assets/* -R deruta74/pear-desktop --clobber

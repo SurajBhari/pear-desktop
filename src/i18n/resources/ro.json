@@ -966,6 +966,13 @@
         "visualizer-type": "Tip de vizualizator"
       },
       "name": "Vizualizator"
+    },
+    "adblocker": {
+      "description": "Blocheaza toate reclamele si trackers",
+      "menu": {
+        "blocker": "Blocator"
+      },
+      "name": "Blocator de reclame"
     }
   }
 }

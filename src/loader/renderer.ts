@@ -7,7 +7,9 @@ import { LoggerPrefix, startPlugin, stopPlugin } from '@/utils';
 import type { RendererContext } from '@/types/contexts';
 import type { PluginConfig, PluginDef } from '@/types/plugins';
 
-const unregisterStyleMap: Record<string, (() => void)[]> = {};
+const pluginStyleMap: Record<string, CSSStyleSheet[]> = {};
+const pendingOperations = new Map<string, Promise<void>>();
+let pendingRegistration: Promise<void> = Promise.resolve();
 const loadedPluginMap: Record<
   string,
   PluginDef<unknown, unknown, unknown>
@@ -33,29 +35,50 @@ export const createContext = <Config extends PluginConfig>(
         listener(...args);
       });
     },
+    subscribe: (event: string, listener: CallableFunction) =>
+      window.ipcRenderer.subscribe(event, (...args: unknown[]) => {
+        // oxlint-disable-next-line typescript/no-unsafe-call
+        listener(...args);
+      }),
     removeAllListeners: (event: string) => {
       window.ipcRenderer.removeAllListeners(event);
     },
   },
 });
 
-export const forceUnloadRendererPlugin = async (id: string) => {
-  unregisterStyleMap[id]?.forEach((unregister) => unregister());
+// Keep enable/disable operations in request order, even when lifecycle hooks await.
+const queuePluginOperation = (id: string, operation: () => Promise<void>) => {
+  const pending = (pendingOperations.get(id) ?? Promise.resolve())
+    .catch(() => {})
+    .then(operation);
+  pendingOperations.set(id, pending);
+  return pending.finally(() => {
+    if (pendingOperations.get(id) === pending) pendingOperations.delete(id);
+  });
+};
 
-  delete unregisterStyleMap[id];
-  delete loadedPluginMap[id];
-
-  const plugin = (await rendererPlugins())[id];
+const unloadRendererPlugin = async (id: string) => {
+  const plugin = loadedPluginMap[id];
   if (!plugin) return;
 
   const hasStopped = await stopPlugin(id, plugin, {
     ctx: 'renderer',
     context: createContext(id),
   });
-  if (plugin?.stylesheets) {
-    document.querySelector(`style#plugin-${id}`)?.remove();
-  }
-  if (hasStopped || (hasStopped === null && plugin?.renderer)) {
+  // Function renderers have no stop hook; retain their existing unload behavior.
+  if (
+    hasStopped !== false ||
+    typeof plugin.renderer === 'function' ||
+    !plugin.renderer
+  ) {
+    const stylesheets = pluginStyleMap[id];
+    if (stylesheets) {
+      document.adoptedStyleSheets = document.adoptedStyleSheets.filter(
+        (style) => !stylesheets.includes(style),
+      );
+    }
+    delete pluginStyleMap[id];
+    delete loadedPluginMap[id];
     console.log(
       LoggerPrefix,
       t('common.console.plugins.unloaded', { pluginName: id }),
@@ -68,7 +91,8 @@ export const forceUnloadRendererPlugin = async (id: string) => {
   }
 };
 
-export const forceLoadRendererPlugin = async (id: string) => {
+const loadRendererPlugin = async (id: string) => {
+  if (loadedPluginMap[id]) return;
   const plugin = (await rendererPlugins())[id];
   if (!plugin) return;
 
@@ -78,11 +102,12 @@ export const forceLoadRendererPlugin = async (id: string) => {
   });
 
   if (
-    hasEvaled ||
-    plugin?.stylesheets ||
-    (hasEvaled === null &&
-      typeof plugin?.renderer !== 'function' &&
-      plugin?.renderer)
+    hasEvaled !== false &&
+    (hasEvaled ||
+      plugin?.stylesheets ||
+      (hasEvaled === null &&
+        typeof plugin?.renderer !== 'function' &&
+        plugin?.renderer))
   ) {
     loadedPluginMap[id] = plugin;
 
@@ -98,6 +123,7 @@ export const forceLoadRendererPlugin = async (id: string) => {
         ...document.adoptedStyleSheets,
         ...styleSheetList,
       ];
+      pluginStyleMap[id] = styleSheetList;
     }
 
     console.log(
@@ -112,27 +138,64 @@ export const forceLoadRendererPlugin = async (id: string) => {
   }
 };
 
-export const loadAllRendererPlugins = async () => {
-  const pluginConfigs = window.mainConfig.plugins.getPlugins();
+// Register requests in call order, including bulk requests awaiting the registry.
+// Only registration is serialized globally; lifecycle hooks keep their per-ID queue.
+const registerOperations = (
+  register: () => Promise<void>[] | Promise<Promise<void>[]>,
+) => {
+  const registered = pendingRegistration.then(register);
+  pendingRegistration = registered.then(
+    () => {},
+    () => {},
+  );
+  return registered
+    .then((operations) => Promise.all(operations))
+    .then(() => {});
+};
 
-  for (const [pluginId, pluginDef] of Object.entries(await rendererPlugins())) {
-    const config = deepmerge(pluginDef.config, pluginConfigs[pluginId] ?? {});
+export const forceUnloadRendererPlugin = (id: string) =>
+  registerOperations(() => [
+    queuePluginOperation(id, () => unloadRendererPlugin(id)),
+  ]);
 
-    if (config.enabled) {
-      await forceLoadRendererPlugin(pluginId);
-    } else {
-      if (loadedPluginMap[pluginId]) {
-        await forceUnloadRendererPlugin(pluginId);
-      }
+export const forceLoadRendererPlugin = (id: string) =>
+  registerOperations(() => [
+    queuePluginOperation(id, () => loadRendererPlugin(id)),
+  ]);
+
+export const loadAllRendererPlugins = () =>
+  registerOperations(async () => {
+    const pluginConfigs = window.mainConfig.plugins.getPlugins();
+    const operations: Promise<void>[] = [];
+    let previous: Promise<void> = Promise.resolve();
+
+    for (const [pluginId, pluginDef] of Object.entries(
+      await rendererPlugins(),
+    )) {
+      const config = deepmerge(pluginDef.config, pluginConfigs[pluginId] ?? {});
+
+      const preceding = previous;
+      const operation = queuePluginOperation(pluginId, async () => {
+        await preceding;
+        if (config.enabled) await loadRendererPlugin(pluginId);
+        else await unloadRendererPlugin(pluginId);
+      });
+      operations.push(operation);
+      previous = operation;
     }
-  }
-};
+    return operations;
+  });
 
-export const unloadAllRendererPlugins = async () => {
-  for (const id of Object.keys(loadedPluginMap)) {
-    await forceUnloadRendererPlugin(id);
-  }
-};
+export const unloadAllRendererPlugins = () =>
+  registerOperations(() => {
+    const ids = new Set([
+      ...Object.keys(loadedPluginMap),
+      ...pendingOperations.keys(),
+    ]);
+    return [...ids].map((id) =>
+      queuePluginOperation(id, () => unloadRendererPlugin(id)),
+    );
+  });
 
 export const getLoadedRendererPlugin = (
   id: string,

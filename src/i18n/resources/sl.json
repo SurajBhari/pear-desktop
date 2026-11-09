@@ -541,6 +541,13 @@
         "id-copied": "Host ID je kopiran v odložišče",
         "id-copy-failed": "Host ID ni bilo mogoče kopirati"
       }
+    },
+    "adblocker": {
+      "description": "Izklopi vse oglase in sledenje",
+      "menu": {
+        "blocker": "Blokator"
+      },
+      "name": "Blokator reklam"
     }
   }
 }

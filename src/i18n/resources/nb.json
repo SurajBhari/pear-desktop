@@ -579,6 +579,13 @@
         "visualizer-type": "Visualisatortype"
       },
       "name": "Visualisator"
+    },
+    "adblocker": {
+      "description": "Stenger ute reklame og sporing",
+      "menu": {
+        "blocker": "Blokkering"
+      },
+      "name": "Reklameblokkering"
     }
   }
 }

@@ -1,133 +1,168 @@
 import { t } from '@/i18n';
-import { type MusicPlayer } from '@/types/music-player';
+import {
+  getCurrentAudioGraph,
+  graphFromAnnouncement,
+  type RendererAudioGraph,
+} from '@/providers/renderer-audio';
 import { createPlugin } from '@/utils';
 
-const lazySafeTry = (...fns: (() => void)[]) => {
-  for (const fn of fns) {
-    try {
-      fn();
-    } catch {}
-  }
-};
+import {
+  defaultConfig,
+  TrackGain,
+  type CompressorConfig,
+} from './audio-compressor/track-gain';
 
-const createCompressorNode = (
-  audioContext: AudioContext,
-): DynamicsCompressorNode => {
-  const compressor = audioContext.createDynamicsCompressor();
+import type { RendererContext } from '@/types/contexts';
+import type { MusicPlayer } from '@/types/music-player';
 
-  compressor.threshold.value = -50;
-  compressor.ratio.value = 12;
-  compressor.knee.value = 40;
-  compressor.attack.value = 0;
-  compressor.release.value = 0.25;
+let generation = 0;
+let runtime: {
+  config: CompressorConfig;
+  api: MusicPlayer | null;
+  graph: RendererAudioGraph | null;
+  compressor: DynamicsCompressorNode | null;
+  track: TrackGain | null;
+  release: (() => void) | null;
+  unsubscribe: (() => void) | null;
+  contextChanged: (() => void) | null;
+} | null = null;
 
-  return compressor;
-};
-
-class Storage {
-  lastSource: MediaElementAudioSourceNode | null = null;
-  lastContext: AudioContext | null = null;
-  lastCompressor: DynamicsCompressorNode | null = null;
-
-  connected: WeakMap<MediaElementAudioSourceNode, DynamicsCompressorNode> =
-    new WeakMap();
-
-  connectToCompressor = (
-    source: MediaElementAudioSourceNode | null = null,
-    audioContext: AudioContext | null = null,
-    compressor: DynamicsCompressorNode | null = null,
-  ): boolean => {
-    if (!(source && audioContext && compressor)) return false;
-
-    const current = this.connected.get(source);
-    if (current === compressor) return false;
-
-    this.lastSource = source;
-    this.lastContext = audioContext;
-    this.lastCompressor = compressor;
-
-    if (current) {
-      lazySafeTry(
-        () => source.disconnect(current),
-        () => current.disconnect(audioContext.destination),
-      );
-    } else {
-      lazySafeTry(() => source.disconnect(audioContext.destination));
-    }
-
-    try {
-      source.connect(compressor);
-      compressor.connect(audioContext.destination);
-      this.connected.set(source, compressor);
-      return true;
-    } catch (error) {
-      console.error('connectToCompressor failed', error);
-      return false;
-    }
-  };
-
-  disconnectCompressor = (): boolean => {
-    const source = this.lastSource;
-    const audioContext = this.lastContext;
-    if (!(source && audioContext)) return false;
-    const current = this.connected.get(source);
-    if (!current) return false;
-
-    lazySafeTry(
-      () => source.connect(audioContext.destination),
-      () => source.disconnect(current),
-      () => current.disconnect(audioContext.destination),
+function detach() {
+  const state = runtime;
+  if (!state) return;
+  state.unsubscribe?.();
+  state.unsubscribe = null;
+  if (state.contextChanged)
+    state.graph?.audioContext.removeEventListener(
+      'statechange',
+      state.contextChanged,
     );
-    this.connected.delete(source);
-    return true;
-  };
+  state.contextChanged = null;
+  state.track?.stop();
+  state.release?.();
+  state.release = null;
+  state.compressor?.disconnect();
+  state.track?.node.disconnect();
+  state.compressor = null;
+  state.track = null;
+  state.graph = null;
 }
-
-const storage = new Storage();
-
-const audioCanPlayHandler = ({
-  detail: { audioSource, audioContext },
-}: CustomEvent<Compressor>) => {
-  storage.connectToCompressor(
-    audioSource,
-    audioContext,
-    createCompressorNode(audioContext),
-  );
-};
-
-const ensureAudioContextLoad = (playerApi: MusicPlayer) => {
-  if (playerApi.getPlayerState() !== 1 || storage.lastContext) return;
-
-  playerApi.loadVideoById(
-    playerApi.getPlayerResponse().videoDetails.videoId,
-    playerApi.getCurrentTime(),
-    playerApi.getUserPlaybackQualityPreference(),
-  );
-};
+function attach(next: RendererAudioGraph | null) {
+  const state = runtime;
+  if (
+    !state ||
+    !next ||
+    next === state.graph ||
+    next.audioContext.state === 'closed'
+  )
+    return;
+  detach();
+  const node = next.audioContext.createDynamicsCompressor();
+  node.threshold.value = -50;
+  node.ratio.value = 12;
+  node.knee.value = 40;
+  node.attack.value = 0;
+  node.release.value = 0.25;
+  const track = new TrackGain(next.audioContext.createGain());
+  try {
+    node.connect(track.node);
+    state.release = next.insertDry(node, track.node);
+    state.graph = next;
+    state.compressor = node;
+    state.track = track;
+    track.configure(state.config);
+    state.unsubscribe = next.observeAuxiliaryMedia((count) =>
+      track.auxiliary(count),
+    );
+    track.setApi(state.api);
+    state.contextChanged = () => {
+      if (
+        next.audioContext.state === 'closed' &&
+        runtime === state &&
+        state.graph === next
+      )
+        detach();
+    };
+    next.audioContext.addEventListener('statechange', state.contextChanged);
+  } catch (error) {
+    if (state.graph === next) detach();
+    else {
+      track.stop();
+      node.disconnect();
+      track.node.disconnect();
+    }
+    console.error('[audio-compressor] Could not attach dry insert', error);
+  }
+}
+const handler = ({ detail }: CustomEvent<Compressor>) =>
+  attach(graphFromAnnouncement(detail));
+function stop() {
+  generation++;
+  document.removeEventListener('peard:audio-can-play', handler);
+  detach();
+  runtime = null;
+}
 
 export default createPlugin({
   name: () => t('plugins.audio-compressor.name'),
   description: () => t('plugins.audio-compressor.description'),
-
+  authors: ['atrupb'],
+  restartNeeded: false,
+  config: defaultConfig,
+  menu: async ({ getConfig, setConfig }) => {
+    const config = await getConfig();
+    return [
+      {
+        label: t('plugins.audio-compressor.auto-track-gain'),
+        type: 'checkbox',
+        checked: config.autoTrackGain === true,
+        click: (item) => setConfig({ autoTrackGain: item.checked }),
+      },
+      {
+        label: t('plugins.audio-compressor.maximum-gain'),
+        submenu: [3, 6, 9, 12].map((value) => ({
+          label: `${value} dB`,
+          type: 'radio' as const,
+          checked: config.maxTrackGainDb === value,
+          click: () => setConfig({ maxTrackGainDb: value }),
+        })),
+      },
+      { label: t('plugins.audio-compressor.gain-headroom'), enabled: false },
+      { label: t('plugins.audio-compressor.gain-crossfade'), enabled: false },
+    ];
+  },
   renderer: {
-    onPlayerApiReady(playerApi) {
-      ensureAudioContextLoad(playerApi);
+    onPlayerApiReady(api: MusicPlayer) {
+      if (!runtime) return;
+      runtime.api = api;
+      attach(getCurrentAudioGraph());
+      runtime.track?.setApi(api);
     },
-
-    start() {
-      document.addEventListener('peard:audio-can-play', audioCanPlayHandler, {
+    async start(context?: RendererContext<CompressorConfig>) {
+      stop();
+      const epoch = ++generation;
+      const config = context ? await context.getConfig() : defaultConfig;
+      if (epoch !== generation) return;
+      runtime = {
+        config,
+        api: null,
+        graph: null,
+        compressor: null,
+        track: null,
+        release: null,
+        unsubscribe: null,
+        contextChanged: null,
+      };
+      document.addEventListener('peard:audio-can-play', handler, {
         passive: true,
       });
-      storage.connectToCompressor(
-        storage.lastSource,
-        storage.lastContext,
-        storage.lastCompressor,
-      );
+      attach(getCurrentAudioGraph());
     },
-
-    stop() {
-      document.removeEventListener('peard:audio-can-play', audioCanPlayHandler);
-      storage.disconnectCompressor();
+    onConfigChange(config: CompressorConfig) {
+      if (!runtime) return;
+      runtime.config = config;
+      runtime.track?.configure(config);
     },
+    stop,
   },
 });

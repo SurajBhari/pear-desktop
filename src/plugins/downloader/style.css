@@ -19,3 +19,398 @@
   height: var(--iron-icon-height, 24px);
   animation: var(--iron-icon_-_animation);
 }
+
+dialog.pear-downloader-settings {
+  --downloader-surface: #141415;
+  --downloader-raised: #19191b;
+  --downloader-card: #232325;
+  --downloader-control: #232325;
+  --downloader-border: rgb(255 255 255 / 8%);
+  --downloader-text: #ededed;
+  --downloader-secondary: #a1a1a6;
+  --downloader-muted: #85858b;
+  --downloader-accent: #ff647c;
+  box-sizing: border-box;
+  width: min(760px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  max-height: calc(100dvh - 24px);
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  color: var(--downloader-text);
+  color-scheme: dark;
+  background: var(--downloader-surface);
+  border: 1px solid var(--downloader-border);
+  border-radius: 12px;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
+  font:
+    14px/1.5 system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+  -webkit-app-region: no-drag;
+}
+
+dialog.pear-downloader-settings[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+dialog.pear-downloader-settings::backdrop {
+  background: rgb(0 0 0 / 65%);
+}
+
+.pear-downloader-settings *,
+.pear-downloader-settings *::before,
+.pear-downloader-settings *::after {
+  box-sizing: border-box;
+}
+
+.pear-downloader-settings .downloader-panel-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--downloader-border);
+}
+
+.pear-downloader-settings .downloader-panel-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.pear-downloader-settings svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pear-downloader-settings .downloader-panel-title > svg {
+  color: var(--downloader-secondary);
+}
+
+.pear-downloader-settings h2 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.pear-downloader-settings .downloader-panel-scroll {
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 20px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #606060 transparent;
+  scrollbar-width: thin;
+}
+
+.pear-downloader-settings p {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--downloader-secondary);
+}
+
+.pear-downloader-settings .downloader-panel-summary {
+  margin: 0 0 20px;
+  max-width: 68ch;
+  color: var(--downloader-secondary);
+  font-size: 13px;
+}
+
+.pear-downloader-settings .downloader-section {
+  min-width: 0;
+  margin: 0 0 24px;
+  padding: 0;
+  border: 0;
+}
+
+.pear-downloader-settings .downloader-section > legend {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 0;
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.pear-downloader-settings .downloader-preferences {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 16px;
+}
+
+.pear-downloader-settings .downloader-preference-group {
+  min-width: 0;
+  padding: 12px 0;
+  background: transparent;
+  border: 0;
+}
+
+.pear-downloader-settings .downloader-source-group {
+  grid-column: 1 / -1;
+  padding-top: 8px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--downloader-border);
+}
+
+.pear-downloader-settings .downloader-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+  gap: 16px;
+}
+
+.pear-downloader-settings label {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  color: var(--downloader-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.pear-downloader-settings .downloader-field-title {
+  color: var(--downloader-text);
+  font-weight: 500;
+}
+
+.pear-downloader-settings label.check {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  cursor: pointer;
+}
+
+.pear-downloader-settings input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--downloader-accent);
+}
+
+.pear-downloader-settings select,
+.pear-downloader-settings input:not([type='checkbox']),
+.pear-downloader-settings button {
+  min-width: 0;
+  min-height: 40px;
+  max-width: 100%;
+  margin: 0;
+  padding: 8px 12px;
+  color: var(--downloader-text);
+  background: var(--downloader-control);
+  border: 1px solid var(--downloader-border);
+  border-radius: 6px;
+  font: inherit;
+  line-height: 1.4;
+  -webkit-app-region: no-drag;
+}
+
+.pear-downloader-settings select,
+.pear-downloader-settings input:not([type='checkbox']) {
+  width: 100%;
+}
+
+.pear-downloader-settings select {
+  text-overflow: ellipsis;
+}
+
+.pear-downloader-settings button {
+  cursor: pointer;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+
+.pear-downloader-settings .downloader-section > button {
+  margin-top: 12px;
+}
+
+.pear-downloader-settings .downloader-section > legend + button {
+  margin-top: 0;
+}
+
+.pear-downloader-settings button:hover:not(:disabled) {
+  background: #303033;
+  border-color: rgb(255 255 255 / 16%);
+}
+
+.pear-downloader-settings button:active:not(:disabled) {
+  background: #38383b;
+}
+
+.pear-downloader-settings button.downloader-primary {
+  color: #141415;
+  background: #ededed;
+  border-color: transparent;
+}
+
+.pear-downloader-settings button.downloader-primary:hover:not(:disabled) {
+  color: #141415;
+  background: #fff;
+}
+
+.pear-downloader-settings button.downloader-secondary {
+  color: var(--downloader-secondary);
+  background: transparent;
+  border-color: var(--downloader-border);
+}
+
+.pear-downloader-settings button.downloader-secondary:hover:not(:disabled) {
+  color: var(--downloader-text);
+}
+
+.pear-downloader-settings button.downloader-panel-close {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  flex: 0 0 44px;
+  place-items: center;
+  padding: 0;
+  color: var(--downloader-secondary);
+  background: transparent;
+  border-color: transparent;
+  border-radius: 6px;
+  -webkit-app-region: no-drag;
+}
+
+.pear-downloader-settings .downloader-panel-close svg {
+  width: 18px;
+  height: 18px;
+}
+
+.pear-downloader-settings :focus-visible {
+  outline: 2px solid var(--downloader-accent);
+  outline-offset: 2px;
+}
+
+.pear-downloader-settings button:disabled,
+.pear-downloader-settings input:disabled,
+.pear-downloader-settings select:disabled,
+.pear-downloader-settings fieldset:disabled label {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.pear-downloader-settings .downloader-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.pear-downloader-settings .downloader-track {
+  margin: 16px 0 12px;
+  color: var(--downloader-text);
+  font-weight: 500;
+}
+
+.pear-downloader-settings .downloader-library {
+  margin-bottom: 0;
+  padding-top: 20px;
+  border-top: 1px solid var(--downloader-border);
+}
+
+.pear-downloader-settings ul {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  overflow-wrap: anywhere;
+}
+
+.pear-downloader-settings li {
+  min-width: 0;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--downloader-border);
+}
+
+.pear-downloader-settings li:last-child {
+  border-bottom: 0;
+}
+
+.pear-downloader-settings .downloader-review-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pear-downloader-settings .downloader-review-list button {
+  flex: 0 0 auto;
+}
+
+.pear-downloader-settings .downloader-library-list strong {
+  display: inline-block;
+  margin-bottom: 6px;
+  padding: 2px 8px;
+  color: var(--downloader-text);
+  background: var(--downloader-control);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.pear-downloader-settings .downloader-library-list span {
+  display: block;
+  color: var(--downloader-secondary);
+  font-size: 13px;
+}
+
+.pear-downloader-settings .downloader-feedback {
+  margin: 0;
+}
+
+.pear-downloader-settings .downloader-feedback:not(:empty) {
+  margin-top: 16px;
+}
+
+.pear-downloader-settings [role='alert'] {
+  color: #ffb4ab;
+}
+
+@media (max-width: 600px) {
+  .pear-downloader-settings .downloader-panel-header {
+    padding: 8px 12px;
+  }
+
+  .pear-downloader-settings .downloader-panel-scroll {
+    padding: 16px;
+  }
+
+  .pear-downloader-settings .downloader-preferences {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 440px) {
+  .pear-downloader-settings .downloader-form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pear-downloader-settings .downloader-review-list li {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

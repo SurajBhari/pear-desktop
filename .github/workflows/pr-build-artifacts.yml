@@ -2,7 +2,7 @@ name: Build PR Artifacts
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions: {}
 
@@ -27,14 +27,10 @@ jobs:
           username: ${{ github.event.pull_request.user.login }}
 
   build:
-    name: Build ${{ matrix.os }}
+    name: Build Windows installer
     needs: check-permissions
     if: needs.check-permissions.outputs.has-write-access == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -46,55 +42,27 @@ jobs:
           run_install: false
 
       - name: Setup NodeJS
-        if: startsWith(matrix.os, 'macOS') != true
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'pnpm'
 
-      - name: Setup NodeJS for macOS
-        if: startsWith(matrix.os, 'macOS')
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build on macOS
-        if: startsWith(matrix.os, 'macOS')
+      # Only the x64 NSIS installer: the other Windows targets (web installer,
+      # portable, ia32, arm64) and macOS/Linux builds aren't needed for PRs.
+      - name: Build Windows installer
         run: |
-          pnpm dist:mac
-          pnpm dist:mac:arm64
+          pnpm clean
+          pnpm build
+          pnpm exec electron-builder --win nsis:x64 -p never
 
-      - name: Install Linux dependencies
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          sudo snap install snapcraft --classic
-          sudo apt update
-          sudo apt install -y flatpak flatpak-builder
-          sudo flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo
-          sudo flatpak install -y flathub org.freedesktop.Platform/x86_64/24.08
-          sudo flatpak install -y flathub org.freedesktop.Sdk/x86_64/24.08
-          sudo flatpak install -y flathub org.electronjs.Electron2.BaseApp/x86_64/24.08
-
-      - name: Build on Linux
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          pnpm dist:linux
-          pnpm dist:linux:deb-arm64
-          pnpm dist:linux:rpm-arm64
-
-      - name: Build on Windows
-        if: startsWith(matrix.os, 'windows')
-        run: |
-          pnpm dist:win
-
-      - name: Upload artifacts
+      - name: Upload installer
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: build-artifacts-${{ matrix.os }}
-          path: pack/
+          name: windows-installer
+          path: pack/*.exe
           retention-days: 7
           if-no-files-found: error
 
@@ -124,15 +92,13 @@ jobs:
             **[📦 Download Artifacts](${runUrl})**
 
             ### Available builds:
-            - **Windows**: \`build-artifacts-windows-latest\`
-            - **macOS**: \`build-artifacts-macos-latest\`
-            - **Linux**: \`build-artifacts-ubuntu-latest\`
+            - **Windows installer (x64)**: \`windows-installer\`
 
             *Note: Artifacts are available for 7 days.*`;
             } else if (buildResult === 'failure') {
               comment = `## ❌ Build Failed
 
-            Unfortunately, one or more builds failed. Please check the workflow run for details:
+            Unfortunately, the Windows build failed. Please check the workflow run for details:
 
             **[View Workflow Run](${runUrl})**`;
             } else {

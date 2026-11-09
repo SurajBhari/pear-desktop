@@ -997,6 +997,13 @@
         "visualizer-type": "Tipe Visualisator"
       },
       "name": "Visualisator"
+    },
+    "adblocker": {
+      "description": "Blokir semua iklan dan pelacakan di luar kotak",
+      "menu": {
+        "blocker": "Pemblokir"
+      },
+      "name": "Pemblokir Iklan"
     }
   }
 }

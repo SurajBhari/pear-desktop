@@ -848,6 +848,13 @@
         "visualizer-type": "Visualiseerija liik"
       },
       "name": "Visualiseerija"
+    },
+    "adblocker": {
+      "description": "Blokeeri kõik reklaamid ja jälitajad",
+      "menu": {
+        "blocker": "Blokeerijad"
+      },
+      "name": "Reklaamiblokeerija"
     }
   }
 }

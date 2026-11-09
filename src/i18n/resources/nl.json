@@ -992,6 +992,13 @@
         "visualizer-type": "Visualisatietype"
       },
       "name": "Visualisator"
+    },
+    "adblocker": {
+      "description": "Blokkeer alle advertenties en trackers buiten het kader",
+      "menu": {
+        "blocker": "Blokkeerder"
+      },
+      "name": "Advertentieblokkeerder"
     }
   }
 }

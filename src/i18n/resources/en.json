@@ -11,6 +11,9 @@
         "unload-failed": "Failed to unload plugin \"{{pluginName}}\"",
         "unloaded": "Plugin \"{{pluginName}}\" unloaded"
       }
+    },
+    "player-panel": {
+      "cog-label": "Player Actions"
     }
   },
   "language": {
@@ -79,6 +82,8 @@
       }
     },
     "menu": {
+      "mcp-dependency-notices-error": "The MCP dependency notices could not be opened.",
+      "mcp-dependency-notices": "MCP dependency notices",
       "about": "About",
       "navigation": {
         "label": "Navigation",
@@ -181,7 +186,8 @@
                 }
               }
             }
-          }
+          },
+          "strip-music-from-shared-links": "Use youtube.com in shared links"
         }
       },
       "plugins": {
@@ -215,6 +221,18 @@
     }
   },
   "plugins": {
+    "taskbar-progress": {
+      "name": "Taskbar progress",
+      "description": "Show the current track's playback progress in the taskbar or dock."
+    },
+    "toast-autoclose": {
+      "name": "Toast Auto-Close",
+      "description": "Close YouTube Music notifications after three seconds. Notifications with focused actions stay open."
+    },
+    "dismiss-multidevice-popup": {
+      "name": "Dismiss Multidevice Popup",
+      "description": "Close the simultaneous playback dialog using its native close action. Other dialogs stay open."
+    },
     "ad-speedup": {
       "description": "If an ad play it mutes the audio and sets playback speed to 16x",
       "name": "Ad Speedup"
@@ -235,6 +253,10 @@
         "enable-seekbar": "Enable seekbar theming"
       },
       "name": "Album Color Theme"
+    },
+    "always-show-volume-slider": {
+      "name": "Always Show Volume Slider",
+      "description": "Keeps the volume slider visible and draggable instead of only showing it on hover."
     },
     "ambient-mode": {
       "description": "Applies a lighting effect by casting gentle colors from the video, into your screen’s background",
@@ -349,7 +371,11 @@
     },
     "audio-compressor": {
       "description": "Apply compression to audio (lowers the volume of the loudest parts of the signal and raises the volume of the softest parts)",
-      "name": "Audio Compressor"
+      "name": "Audio Compressor",
+      "auto-track-gain": "Auto Track Gain",
+      "maximum-gain": "Maximum track gain",
+      "gain-headroom": "Boosts quiet tracks after compression. Leave equalizer headroom; high gain can clip.",
+      "gain-crossfade": "Track gain is suspended while auxiliary or crossfade audio is registered."
     },
     "auth-proxy-adapter": {
       "description": "Support for the use of authentication proxy services",
@@ -513,8 +539,10 @@
       "name": "Blur Navigation Bar"
     },
     "bypass-age-restrictions": {
+      "compatibility-notice": "Experimental: current YouTube changes can prevent unlocking, and the legacy proxy may be unavailable. Sign-in may still be required.",
       "description": "Bypass Music Player's age verification",
-      "name": "Bypass Age Restrictions"
+      "name": "Bypass Age Restrictions",
+      "proxy-notice": "When needed, sends video identifiers and playback requests to youtube-proxy.zerody.one and ny.4everproxy.com. Google account credentials are excluded."
     },
     "captions-selector": {
       "description": "Caption selector for {{applicationName}} audio tracks",
@@ -555,6 +583,7 @@
       "name": "Compact Sidebar"
     },
     "crossfade": {
+      "route-unavailable": "Crossfade is unavailable for this stream because auxiliary audio could not be routed. Regular playback continues.",
       "description": "Crossfade between songs",
       "menu": {
         "advanced": "Advanced"
@@ -567,6 +596,7 @@
             "fade-out-duration": "Fade out duration (ms)",
             "fade-scaling": {
               "label": "Fade scaling",
+              "equalPower": "Equal power",
               "linear": "Linear",
               "logarithmic": "Logarithmic"
             },
@@ -587,6 +617,16 @@
           "label": "Choose the output media device to be used",
           "title": "Select Output Device"
         }
+      },
+      "system-default": "System default",
+      "unnamed-device": "Audio output {{number}} (name unavailable)",
+      "persistence-failed": "Could not save the audio-output device list. Disable and re-enable the plugin to retry.",
+      "status": {
+        "unsupported": "This runtime does not support this audio-output operation.",
+        "permission": "The system denied audio-output access. Grant access in system settings, then disable and re-enable this plugin. Microphone permission is not requested.",
+        "limited": "The system has hidden some device names or outputs. Available outputs are listed without requesting microphone permission.",
+        "unavailable": "The selected output is unavailable. System default is used until it becomes available again.",
+        "failed": "The audio output could not be changed or refreshed. Disable and re-enable the plugin to retry."
       }
     },
     "disable-autoplay": {
@@ -610,6 +650,7 @@
         "connected": "Connected",
         "disconnected": "Disconnected",
         "hide-duration-left": "Hide duration left",
+        "show-artist-image": "Show artist avatar (public lookup)",
         "hide-github-button": "Hide GitHub link Button",
         "play-on-application": "Play on {{applicationName}}",
         "set-inactivity-timeout": "Set inactivity timeout",
@@ -708,9 +749,137 @@
       },
       "templates": {
         "button": "Download"
+      },
+      "quality": {
+        "open": "Source audio quality and library…",
+        "title": "Source audio and library",
+        "close": "Close downloader settings",
+        "summary": "Source quality and saved file format are separate. MP3/FLAC conversion does not restore information missing from a lossy source.",
+        "preferences": "Saved preferences",
+        "source": "Source audio",
+        "best": "Best offered tier (Opus preferred on ties)",
+        "opus": "Prefer Opus",
+        "aac": "Prefer AAC / M4A",
+        "bitrateMode": "At or below requested bitrate",
+        "itagMode": "Specific itag (advanced)",
+        "bitrate": "Maximum reported source bitrate (kbps)",
+        "itag": "Requested itag",
+        "language": "Audio language",
+        "originalLanguage": "Original audio (automatic)",
+        "specificLanguage": "Specific language code",
+        "languageCode": "Language code (for example en or pt)",
+        "drc": "Allow dynamic-range-compressed (DRC) variants",
+        "output": "Saved format",
+        "outputMp3": "MP3 (256 kbps)",
+        "outputSource": "Source (audio copy)",
+        "outputCustom": "Custom (existing encoder settings)",
+        "sourceHelp": "Source copies the offered audio to a compatible WebM/M4A container. Custom keeps your existing encoder settings.",
+        "duplicate": "When this track is already downloaded",
+        "legacy": "Keep legacy filename setting",
+        "skipAny": "Skip any verified completed variant",
+        "better": "Save better / explicitly preferred source",
+        "variantPolicy": "Save selected source/output variant",
+        "ask": "Ask before saving another variant",
+        "duplicateHelp": "Different codecs and unknown legacy qualities are not automatically ranked. Existing files are preserved; upgrades save another variant.",
+        "fallback": "If a saved preference is unavailable, use best offered audio",
+        "save": "Save preferences",
+        "saved": "Preferences saved.",
+        "formats": "Available audio for current track",
+        "inspect": "Show available qualities",
+        "refreshed": "Available qualities refreshed for the current session.",
+        "variant": "Available audio quality",
+        "unavailable": "Missing higher-rate formats are not offered for this track/current session. Premium membership is not a format guarantee.",
+        "download": "Download selected quality",
+        "savedVariant": "Saved selected variant: {{path}}",
+        "result": "Download result: {{status}}",
+        "library": "Local download library",
+        "review": "Tracks waiting for a manual source choice:",
+        "reviewChoose": "Choose quality",
+        "chooseAbove": "Choose an available quality above.",
+        "scanHelp": "Scan only the selected download folder and its playlist subfolders. Scanning does not log in, fetch formats, delete or retag files.",
+        "scan": "Scan download folder",
+        "cancelScan": "Cancel scan",
+        "scanDone": "Local scan completed.",
+        "scanSummary": "{{count}} files inspected",
+        "limited": " · scan/read budget reached",
+        "first100": "First 100 results shown.",
+        "working": "Working…",
+        "failed": "Downloader operation failed",
+        "downloadFailed": "Download failed",
+        "unknownCodec": "unknown codec",
+        "unknownContainer": "unknown container",
+        "unknownBitrate": "bitrate unknown",
+        "rate": "{{bitrate}} kbps reported",
+        "tvExtraction": "TV fallback audio extraction · ",
+        "originalVariant": "original audio",
+        "unknownLanguage": "language unspecified",
+        "drcVariant": " · DRC",
+        "itagDetail": "itag {{itag}}",
+        "trackDetail": "audio track {{id}}",
+        "status": {
+          "complete": "complete",
+          "changed": "changed",
+          "uncertain": "uncertain",
+          "invalid": "invalid",
+          "missing": "missing"
+        },
+        "reasons": {
+          "unknownLength": "Cannot verify complete audio: content length missing or invalid",
+          "audioOnly": "Audio-only source required",
+          "drm": "DRM or segmented source unsupported",
+          "container": "Unsupported source container/codec",
+          "itag": "Invalid source itag",
+          "live": "Live/Post-Live-DVR unsupported",
+          "unplayable": "Track not playable in current session",
+          "unknownQuality": "Unknown source quality",
+          "unindexed": "Unindexed: source/completion unknown",
+          "empty": "Empty file",
+          "changed": "File differs from completed record",
+          "budget": "Verification read budget reached",
+          "metadataBudget": "Metadata read budget reached",
+          "metadata": "Metadata unreadable; preserved",
+          "renamed": "Completed receipt verified at renamed path",
+          "missing": "Indexed file missing",
+          "selectTrack": "Select a track before choosing audio quality"
+        }
       }
     },
     "equalizer": {
+      "editor": {
+        "audio-error": "This audio response could not be applied. Reduce overlapping boosts or Q; the previous sound is retained.",
+        "save-error": "Settings could not be saved. Changes remain active; make another edit to retry.",
+        "title": "Equalizer",
+        "close": "Close",
+        "layout": "Bands",
+        "custom": "Custom",
+        "bypass": "Bypass equalizer",
+        "reset": "Reset gains",
+        "use-custom": "Use as Custom",
+        "preamp": "Preamp (dB)",
+        "auto-preamp": "Automatic preamp",
+        "auto-preamp-help": "Uses filter boosts and the current player volume to reduce gain only when more headroom is needed. With other audio mixed in, it assumes full volume. Editing manual preamp turns automatic mode off. This is not a limiter.",
+        "response": "Target frequency response",
+        "response-help": "Sampled filter response at the current audio sample rate. A new target may take a moment to become audible during a transition.",
+        "response-unavailable": "Play a track to preview the response",
+        "effective-preamp": "Applied preamp: {{value}} dB",
+        "gain": "Gain (dB)",
+        "frequency": "Frequency (Hz)",
+        "q": "Q / bandwidth",
+        "remove-band": "Remove band",
+        "add-band": "Add band",
+        "preset": "Preset",
+        "preset-name": "Preset name",
+        "choose-preset": "Choose a preset",
+        "flat": "Flat",
+        "save": "Save preset",
+        "update": "Update preset",
+        "delete": "Delete preset",
+        "headroom": "Positive boosts can clip. Reduce preamp for headroom. Shelf filters do not use Q.",
+        "unsupported": "These stored settings need a supported version and at most 64 valid bands. Original data is preserved; editing and EQ are bypassed.",
+        "nyquist": "Some bands exceed this audio context frequency range and are inactive. Their settings are preserved.",
+        "graph-help": "Click the graph to add a peaking band; drag a point to change frequency and gain. Points include the applied preamp. Use arrow keys on a point (one semitone / 0.1 dB), or the Add band button and numeric fields. The headroom scale stays fixed while dragging.",
+        "graph-band": "Band {{number}}: {{frequency}} Hz, {{gain}} dB. Arrow keys change frequency and gain."
+      },
       "description": "Adds an equalizer to the player",
       "menu": {
         "presets": {
@@ -720,7 +889,43 @@
           }
         }
       },
-      "name": "Equalizer"
+      "name": "Equalizer",
+      "stock": {
+        "label": "Stock curves (10 bands)",
+        "user-presets": "Saved presets",
+        "names": {
+          "flat": "Flat",
+          "acoustic": "Acoustic",
+          "bass-booster": "Bass booster",
+          "bass-reducer": "Bass reducer",
+          "classical": "Classical",
+          "club": "Club",
+          "dance": "Dance",
+          "deep": "Deep",
+          "electronic": "Electronic",
+          "hip-hop": "Hip hop",
+          "jazz": "Jazz",
+          "latin": "Latin",
+          "live": "Live",
+          "loudness": "Loudness",
+          "lounge": "Lounge",
+          "metal": "Metal",
+          "piano": "Piano",
+          "pop": "Pop",
+          "reggae": "Reggae",
+          "rnb": "R&B",
+          "rock": "Rock",
+          "ska": "Ska",
+          "small-speakers": "Small speakers",
+          "soft": "Soft",
+          "soft-rock": "Soft rock",
+          "spoken-word": "Spoken word",
+          "techno": "Techno",
+          "treble-booster": "Treble booster",
+          "treble-reducer": "Treble reducer",
+          "vocal-booster": "Vocal booster"
+        }
+      }
     },
     "exponential-volume": {
       "description": "Makes the volume slider exponential so it's easier to select lower volumes.",
@@ -795,6 +1000,9 @@
     },
     "navigation": {
       "description": "Next/Back navigation arrows directly integrated in the interface, like in your favorite browser",
+      "menu": {
+        "swipe-navigation": "Experimental history swipes and browser buttons"
+      },
       "name": "Navigation",
       "templates": {
         "back": {
@@ -823,9 +1031,15 @@
         },
         "priority": "Notification Priority",
         "toast-style": "Toast style",
-        "unpause-notification": "Show notification on unpause"
+        "unpause-notification": "Show notification on unpause",
+        "notify-on-like-change": "Notify when rating changes"
       },
-      "name": "Notifications"
+      "name": "Notifications",
+      "rating": {
+        "liked": "Liked",
+        "disliked": "Disliked",
+        "removed": "Removed rating"
+      }
     },
     "performance-improvement": {
       "description": "Improve performance by enabling experimental scripts",
@@ -857,8 +1071,25 @@
     "playback-speed": {
       "description": "Listen fast, listen slow! Adds a slider that controls song speed",
       "name": "Playback Speed",
+      "menu": {
+        "preserve-pitch": "Preserve pitch when changing speed",
+        "global-shortcuts": "Global speed hotkeys",
+        "step": "Hotkey speed step"
+      },
       "templates": {
         "button": "Speed"
+      },
+      "prompt": {
+        "global-shortcuts": {
+          "title": "Playback speed hotkeys",
+          "label": "Choose global hotkeys for playback speed:",
+          "speedUp": "Increase speed",
+          "speedDown": "Decrease speed"
+        },
+        "step": {
+          "title": "Playback speed step",
+          "label": "Speed change per hotkey command (0.01–15.93):"
+        }
       }
     },
     "precise-volume": {
@@ -910,6 +1141,10 @@
             "message": "Failed to authenticate with Last.fm\nHide the popup until the next restart.",
             "title": "Authentication Failed"
           }
+        },
+        "invalid-regex": {
+          "title": "Invalid or unavailable regular expression",
+          "message": "Filter {{line}} could not be validated within its limits."
         }
       },
       "menu": {
@@ -920,8 +1155,12 @@
           "token": "Enter ListenBrainz user token"
         },
         "scrobble-alternative-title": "Use alternative titles",
-        "scrobble-alternative-artist": "Use alternative artists",
-        "scrobble-other-media": "Scrobble other media"
+        "scrobble-alternative-artist": "Prefer first tag as artist (legacy)",
+        "scrobble-other-media": "Scrobble other media",
+        "regex-filters": "Regular expression filters",
+        "add-regex-filter": "Add filter",
+        "use-musicbrainz": "Use MusicBrainz to correct metadata",
+        "musicbrainz-email": "MusicBrainz contact email"
       },
       "name": "Scrobbler",
       "prompt": {
@@ -934,14 +1173,43 @@
             "label": "Enter your ListenBrainz user token:",
             "title": "ListenBrainz token"
           }
+        },
+        "regex-filter": {
+          "label": "Enter one regex (blank removes it). Filters run in order; enabled filters affect title and artist."
+        },
+        "musicbrainz-email": {
+          "title": "MusicBrainz contact email",
+          "label": "Contact email sent to MusicBrainz with lookup requests. Blank disables correction."
         }
       }
+    },
+    "force-shuffle": {
+      "name": "Force Shuffle",
+      "description": "Keep native shuffle enabled on track changes, always or while preserving your choice",
+      "menu": {
+        "always": "Always enable shuffle on new tracks",
+        "preserve": "Preserve my shuffle choice"
+      }
+    },
+    "fullscreen-auto-hide": {
+      "name": "Fullscreen auto-hide",
+      "description": "Hide idle fullscreen controls; show them on activity, focus or pause."
     },
     "shortcuts": {
       "description": "Allows setting global hotkeys for playback (play/pause/next/previous) and turning off media OSD by overriding media keys, turning on Ctrl/CMD + F to search, turning on Linux MPRIS support for media keys, and custom hotkeys for advanced users",
       "menu": {
         "override-media-keys": "Override Media Keys",
-        "set-keybinds": "Set Global Song Controls"
+        "focus-window-on-double-play-pause": "Focus Window on Double Play/Pause Command",
+        "double-command-repeat-info": "System key repeat can count as another command.",
+        "set-keybinds": "Set Global Song Controls",
+        "set-local-keybinds": "Set Local Song Controls",
+        "seek-seconds": "Seek intervals",
+        "seek": {
+          "music-forward": "Music: forward",
+          "music-backward": "Music: backward",
+          "podcast-forward": "Podcasts: forward",
+          "podcast-backward": "Podcasts: backward"
+        }
       },
       "name": "Shortcuts (& MPRIS)",
       "prompt": {
@@ -949,10 +1217,19 @@
           "keybind-options": {
             "next": "Next",
             "play-pause": "Play / Pause",
-            "previous": "Previous"
+            "previous": "Previous",
+            "seek-forward": "Seek forward",
+            "seek-backward": "Seek backward",
+            "like": "Like",
+            "dislike": "Dislike"
           },
           "label": "Choose Global Keybinds for Songs Control:",
-          "title": "Global Keybinds"
+          "title": "Global Keybinds",
+          "global-label": "Global controls (work outside the app)",
+          "local-label": "Local controls (while the app is focused)"
+        },
+        "seek": {
+          "title": "Seek interval in seconds (1–600)"
         }
       }
     },
@@ -969,12 +1246,17 @@
       "name": "SponsorBlock"
     },
     "synced-lyrics": {
+      "instrumental-break": "Instrumental",
       "description": "Provides synced lyrics to songs, using providers like LRClib.",
       "errors": {
         "fetch": "⚠️\tAn error occurred while fetching the lyrics.\n\tPlease try again later.",
         "not-found": "⚠️ No lyrics found for this song."
       },
       "menu": {
+        "direct-ytmusic": {
+          "label": "Fetch YouTube Music lyrics directly",
+          "tooltip": "Use YouTube Music’s connection instead of the external lyrics proxy. Can help when the proxy is unavailable."
+        },
         "preferred-provider": {
           "label": "Preferred Provider",
           "tooltip": "Choose the default provider to use",
@@ -992,19 +1274,19 @@
           "submenu": {
             "fancy": {
               "label": "Fancy",
-              "tooltip": "Use large, app-like effects on the current line"
+              "tooltip": "Large stable lyrics with real word highlighting"
             },
             "focus": {
               "label": "Focus",
-              "tooltip": "Make only the current line white"
+              "tooltip": "Highlight the current line without resizing text"
             },
             "offset": {
-              "label": "Offset",
-              "tooltip": "Offset on the right the current line"
+              "label": "Standard",
+              "tooltip": "Standard stable lyrics"
             },
             "scale": {
-              "label": "Scale",
-              "tooltip": "Scale the current line"
+              "label": "Compact",
+              "tooltip": "Compact stable lyrics"
             }
           },
           "tooltip": "Choose the effect to apply to the current line"
@@ -1053,6 +1335,22 @@
         "duration-mismatch": "⚠️ - The lyrics may be out of sync due to a duration mismatch.",
         "inexact": "⚠️ - The lyrics for this song may not be exact",
         "instrumental": "⚠️ - This is an instrumental song"
+      },
+      "tools": {
+        "export": "Export lyrics…",
+        "plain-text": "Plain text",
+        "saved": "Lyrics saved",
+        "invalid": "These lyrics cannot be exported",
+        "error": "Could not save lyrics",
+        "offset": "Lyrics timing offset (ms)…",
+        "offset-help": "Positive values show lyrics later; negative values show them earlier.",
+        "romanization-size": "Romanization size",
+        "enhanced-lrc": "Export real word timing in enhanced LRC",
+        "enhanced-lrc-help": "Use source word timestamps when available; other lines retain line timing.",
+        "show-export": {
+          "label": "Show lyrics export button",
+          "tooltip": "Show or hide the export button and its status in the lyrics picker."
+        }
       }
     },
     "taskbar-mediacontrol": {
@@ -1130,6 +1428,115 @@
         "visualizer-type": "Visualizer Type"
       },
       "name": "Visualizer"
+    },
+    "adblocker": {
+      "applied": "No pending page changes",
+      "apply-document": "Apply page changes and reload; recommendations may refresh",
+      "apply-notice": "Network blocking updates without a reload. Playback is preserved where possible; pending page changes can be applied manually.",
+      "description": "Block all ads and tracking out of the box",
+      "menu": {
+        "blocker": "Blocker"
+      },
+      "name": "Ad Blocker",
+      "reload-notice": "Changes to With blocklists reload the player page and may interrupt playback."
+    },
+    "player-actions": {
+      "description": "Slowed + Reverb and section looping in one panel.",
+      "name": "Player Actions"
+    },
+    "slowed-reverb": {
+      "panel": {
+        "active": "Active",
+        "reset": "Reset",
+        "reverb": "Reverb",
+        "wet-highpass": "Reverb high-pass",
+        "wet-lowpass": "Reverb low-pass",
+        "speed": "Speed",
+        "title": "Slowed + Reverb"
+      }
+    },
+    "section-repeat": {
+      "panel": {
+        "active": "Repeat",
+        "clear": "Clear",
+        "from": "From",
+        "now": "Now",
+        "save": "Save",
+        "set-from-now": "Set From to the current time",
+        "set-to-now": "Set To to the current time",
+        "status-invalid": "From must be earlier than To",
+        "status-loop": "Looping {{start}} → {{end}}",
+        "status-need-start": "Set a From or To time to start looping",
+        "status-off": "Repeat is off",
+        "status-saved": "Saved for this song",
+        "status-save-failed": "Could not save this section. Try again.",
+        "status-saved-removed": "Saved section removed",
+        "status-to-end": "Looping {{start}} → end of song",
+        "title": "Section Repeat",
+        "to": "To",
+        "to-placeholder": "end of song"
+      }
+    },
+    "playlist-search": {
+      "name": "Collection search",
+      "description": "Filter items already loaded in playlists, albums and library lists. Does not download the full collection.",
+      "label": "Search loaded items",
+      "placeholder": "Title or artist",
+      "clear": "Clear",
+      "results": "{{matches}} of {{total}} loaded items match"
+    },
+    "statusbar-lyrics": {
+      "name": "Menu bar lyrics",
+      "description": "Show the current synced lyric line in the macOS menu bar. Requires Synced Lyrics.",
+      "pronunciation": "Include pronunciation",
+      "max-length": "Maximum length",
+      "failed": "Could not update menu bar lyrics"
+    },
+    "blocklist": {
+      "name": "Artist blocklist",
+      "description": "Automatically skip blocked artists, using confirmed current-track identity.",
+      "templates": {
+        "button": "Block {{name}}"
+      },
+      "menu": {
+        "allow-intentional-previous": "Allow an intentionally revisited song to play once",
+        "add": {
+          "label": "Add blocked artist…",
+          "prompt-title": "Block artist",
+          "prompt-label": "Artist name (up to 200 characters)"
+        },
+        "edit": {
+          "label": "Edit artist…",
+          "prompt-title": "Edit blocked artist"
+        },
+        "remove": "Remove",
+        "clear": "Clear all",
+        "no-artists": "No blocked artists",
+        "unsupported": "Artist list has unsupported entries; stored data is preserved."
+      }
+    },
+    "skip-live-songs": {
+      "name": "Skip non-studio recordings",
+      "description": "Skip selected, explicitly marked live, acoustic, demo, session or venue recordings. Ordinary song titles are retained.",
+      "menu": {
+        "live": "Live, concert, festival and tour recordings",
+        "acoustic": "Acoustic and unplugged versions",
+        "demo": "Demo and rehearsal recordings",
+        "session": "Radio, BBC and broadcast sessions",
+        "venue": "Recordings with a performance location",
+        "unsupported": "Recording categories contain unsupported data; stored preferences are preserved."
+      }
+    },
+    "auto-acknowledge": {
+      "name": "Auto-acknowledge content warnings",
+      "description": "Automatically dismisses YouTube's suicide/self-harm player interstitial so playback is not blocked. Opt-in; does not dismiss age gates, sign-in, or other playability errors",
+      "menu": {
+        "debug": "Debug logging"
+      }
+    },
+    "resume-shuffle": {
+      "name": "Resume shuffle",
+      "description": "Remember shuffle and restore it when resuming the last queue."
     }
   }
 }

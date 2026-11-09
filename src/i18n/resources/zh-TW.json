@@ -997,6 +997,13 @@
         "visualizer-type": "視覺化效果樣式"
       },
       "name": "視覺化效果"
+    },
+    "adblocker": {
+      "description": "阻擋所有廣告",
+      "menu": {
+        "blocker": "阻擋方式"
+      },
+      "name": "廣告攔截器"
     }
   }
 }

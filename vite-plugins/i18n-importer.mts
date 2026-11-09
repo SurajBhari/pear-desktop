@@ -1,48 +1,49 @@
+import { readFileSync } from 'node:fs';
 import { basename, resolve, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { globSync } from 'glob';
-import { Project } from 'ts-morph';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const globalProject = new Project({
-  tsConfigFilePath: resolve(__dirname, '..', 'tsconfig.json'),
-  skipAddingFilesFromTsConfig: true,
-  skipLoadingLibFiles: true,
-  skipFileDependencyResolution: true,
-});
 
 export const i18nImporter = () => {
-  const srcPath = resolve(__dirname, '..', 'src');
-  const plugins = globSync(['src/i18n/resources/*.json']).map((path) => {
-    const nameWithExt = basename(path);
-    const name = nameWithExt.replace(extname(nameWithExt), '');
-
-    return { name, path };
-  });
-
-  const src = globalProject.createSourceFile(
-    'vm:i18n',
-    (writer) => {
-      writer.writeLine('export const languageResources = async () => {');
-      writer.writeLine('  const entries = await Promise.all([');
-      for (const { name, path } of plugins) {
-        const absolutePath = resolve(srcPath, '..', path).replace(
-          /\\/g,
-          '/',
-        );
-
-        writer.writeLine(
-          `    import('${absolutePath}').then((mod) => ({ "${name}": { translation: mod.default } })),`,
-        );
-      }
-      writer.writeLine('  ]);');
-      writer.writeLine('  return Object.assign({}, ...entries);');
-      writer.writeLine('};');
-      writer.blankLine();
+  const root = resolve(__dirname, '..');
+  const languages = globSync(['src/i18n/resources/*.json'], { cwd: root }).map(
+    (path) => {
+      const name = basename(path, extname(path));
+      const absolutePath = resolve(root, path).replace(/\\/g, '/');
+      const resource = JSON.parse(readFileSync(absolutePath, 'utf8')) as {
+        language?: { name?: string; 'local-name'?: string };
+      };
+      return {
+        name,
+        path: absolutePath,
+        label: {
+          name: resource.language?.name ?? 'Unknown',
+          localName: resource.language?.['local-name'] ?? 'Unknown',
+        },
+      };
     },
-    { overwrite: true },
   );
 
-  return src.getText();
+  return `export const availableLanguages = Object.freeze(${JSON.stringify(languages.map(({ name }) => name))});
+export const languageLabels = Object.freeze(${JSON.stringify(Object.fromEntries(languages.map(({ name, label }) => [name, label])))});
+const loaders = new Map([
+${languages.map(({ name, path }) => `  [${JSON.stringify(name)}, () => import(${JSON.stringify(path)}).then(mod => mod.default)],`).join('\n')}
+]);
+const resources = new Map();
+export const loadLanguageResource = (name) => {
+  const loader = loaders.get(name);
+  if (!loader) return Promise.resolve(undefined);
+  const cached = resources.get(name);
+  if (cached) return cached;
+  const pending = Promise.resolve().then(loader);
+  resources.set(name, pending);
+  pending.catch(() => { if (resources.get(name) === pending) resources.delete(name); });
+  return pending;
+};
+export const languageResources = async () => Object.fromEntries(await Promise.all(
+  availableLanguages.map(async name => [name, { translation: await loadLanguageResource(name) }])
+));
+`;
 };

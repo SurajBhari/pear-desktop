@@ -5,6 +5,11 @@ export enum AuthStrategy {
 
 export interface APIServerConfig {
   enabled: boolean;
+  musicApiEnabled: boolean;
+  mcpEnabled?: boolean;
+  mcpPort?: number;
+  musicApiRemoteEnabled?: boolean;
+  musicApiRemoteResource?: string;
   hostname: string;
   port: number;
   authStrategy: AuthStrategy;
@@ -18,10 +23,17 @@ export interface APIServerConfig {
 
 export const defaultAPIServerConfig: APIServerConfig = {
   enabled: false,
-  hostname: '0.0.0.0',
+  musicApiEnabled: false,
+  mcpEnabled: false,
+  mcpPort: 26539,
+  musicApiRemoteEnabled: false,
+  hostname: '127.0.0.1',
   port: 26538,
   authStrategy: AuthStrategy.AUTH_AT_FIRST,
-  secret: Date.now().toString(36),
+  secret: Array.from(
+    globalThis.crypto.getRandomValues(new Uint8Array(32)),
+    (byte) => byte.toString(16).padStart(2, '0'),
+  ).join(''),
 
   authorizedClients: [],
   useHttps: false,

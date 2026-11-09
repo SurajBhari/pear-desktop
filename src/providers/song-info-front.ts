@@ -1,6 +1,7 @@
 import { LikeType, type GetState } from '@/types/datahost-get-state';
 
 import { singleton } from './decorators';
+import { adoptPlaybackOwner, type PlaybackBinding } from './playback-owner';
 
 import type { SongInfo } from './song-info';
 import type { MusicPlayer } from '@/types/music-player';
@@ -49,37 +50,36 @@ export const setupTimeChangedListener = singleton(() => {
   }
 });
 
-export const setupRepeatChangedListener = singleton(() => {
-  const repeatObserver = new MutationObserver((mutations) => {
-    // provided by App
-    window.ipcRenderer.send(
-      'peard:repeat-changed',
-      (
-        mutations[0].target as Node & {
-          __dataHost: {
-            getState: () => GetState;
-          };
-        }
-      ).__dataHost.getState().queue.repeatMode,
-    );
-  });
-  repeatObserver.observe(document.querySelector('#right-controls .repeat')!, {
-    attributeFilter: ['title'],
-  });
+const getRepeatBar = () =>
+  document.querySelector<
+    HTMLElement & { getState?: () => GetState | null | undefined }
+  >('ytmusic-player-bar');
 
-  // Emit the initial value as well; as it's persistent between launches.
-  // provided by App
-  window.ipcRenderer.send(
-    'peard:repeat-changed',
-    document
-      .querySelector<
-        HTMLElement & {
-          getState: () => GetState;
-        }
-      >('ytmusic-player-bar')
-      ?.getState().queue.repeatMode,
-  );
-});
+const reportRepeat = () => {
+  const mode = getRepeatBar()?.getState?.()?.queue?.repeatMode;
+  if (mode === 'NONE' || mode === 'ONE' || mode === 'ALL')
+    window.ipcRenderer.send('peard:repeat-changed', mode);
+};
+
+let repeatObserver: MutationObserver | undefined;
+
+export const setupRepeatChangedListener = () => {
+  if (!repeatObserver) {
+    repeatObserver = new MutationObserver((mutations) => {
+      const control = getRepeatBar()?.querySelector('#right-controls .repeat');
+      if (control && mutations.some((mutation) => mutation.target === control))
+        reportRepeat();
+    });
+    // Only title attributes are observed; current-bar identity handles SPA
+    // replacement without child-list scanning or holding an old control.
+    repeatObserver.observe(document, {
+      attributes: true,
+      attributeFilter: ['title'],
+      subtree: true,
+    });
+  }
+  reportRepeat();
+};
 
 const mapLikeStatus = (status: string | null): LikeType =>
   Object.values(LikeType).includes(status as LikeType)
@@ -114,20 +114,32 @@ export const setupLikeChangedListener = singleton(() => {
   }
 });
 
-export const setupVolumeChangedListener = singleton((api: MusicPlayer) => {
-  document.querySelector('video')?.addEventListener('volumechange', () => {
-    window.ipcRenderer.send('peard:volume-changed', {
-      state: api.getVolume(),
-      isMuted: api.isMuted(),
-    });
-  });
+let volumeApi: MusicPlayer | undefined;
 
-  // Emit the initial value as well; as it's persistent between launches.
+const reportVolume = () => {
+  if (!volumeApi) return;
   window.ipcRenderer.send('peard:volume-changed', {
-    state: api.getVolume(),
-    isMuted: api.isMuted(),
+    state: volumeApi.getVolume(),
+    isMuted: volumeApi.isMuted(),
   });
+};
+
+const registerVolumeCapture = singleton(() => {
+  // Media events do not bubble; capture also covers inserted/replaced videos.
+  document.addEventListener(
+    'volumechange',
+    (event) => {
+      if (event.target === document.querySelector('video')) reportVolume();
+    },
+    true,
+  );
 });
+
+export const setupVolumeChangedListener = (api: MusicPlayer) => {
+  volumeApi = api;
+  registerVolumeCapture();
+  reportVolume();
+};
 
 export const setupShuffleChangedListener = singleton(() => {
   const playerBar = document.querySelector('ytmusic-player-bar');
@@ -193,6 +205,7 @@ export const setupAutoPlayChangedListener = singleton(() => {
 });
 
 export const setupSongInfo = (api: MusicPlayer) => {
+  const playbackOwner = adoptPlaybackOwner(api);
   window.ipcRenderer.on('peard:setup-time-changed-listener', () => {
     setupTimeChangedListener();
   });
@@ -255,6 +268,27 @@ export const setupSongInfo = (api: MusicPlayer) => {
 
   const waitingEvent = new Set<string>();
   const waitingTimeouts = new Map<string, NodeJS.Timeout>();
+  let submittedBinding: PlaybackBinding | null = null;
+
+  const refreshBinding = (
+    previous: PlaybackBinding,
+    binding: PlaybackBinding | null,
+  ) => {
+    if (submittedBinding !== previous) return;
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
+    if (binding && !playbackOwner.binding(previous.videoId, binding))
+      binding = null;
+    if (submittedBinding !== previous) return;
+    submittedBinding = binding;
+    window.ipcRenderer.send('peard:time-changed', {
+      type: 'playback-binding-refresh',
+      previous,
+      binding,
+    });
+  };
 
   const clearVideoTimeout = (videoId: string) => {
     const timeoutId = waitingTimeouts.get(videoId);
@@ -268,13 +302,26 @@ export const setupSongInfo = (api: MusicPlayer) => {
   // Name = "dataloaded" and abit later "dataupdated"
   // Sometimes "dataupdated" is not fired, so we need to fallback to "dataloaded"
   api.addEventListener('videodatachange', (name, videoData) => {
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
+    const previous = submittedBinding;
+    const binding = playbackOwner.binding(videoData.videoId);
     videoEventDispatcher(name, videoData);
+    // A synchronous document listener can publish or retire a newer lineage.
+    if (submittedBinding !== previous) return;
+    if (!playbackOwner.isCurrent()) {
+      submittedBinding = null;
+      return;
+    }
 
     if (name === 'dataupdated' && waitingEvent.has(videoData.videoId)) {
       waitingEvent.delete(videoData.videoId);
       clearVideoTimeout(videoData.videoId);
-      sendSongInfo(videoData);
+      sendSongInfo(videoData, binding);
     } else if (name === 'dataloaded') {
+      if (previous) refreshBinding(previous, null);
       const video = document.querySelector<HTMLVideoElement>('video');
       video?.dispatchEvent(srcChangedEvent);
 
@@ -290,11 +337,18 @@ export const setupSongInfo = (api: MusicPlayer) => {
         if (waitingEvent.has(videoData.videoId)) {
           waitingEvent.delete(videoData.videoId);
           waitingTimeouts.delete(videoData.videoId);
-          sendSongInfo(videoData);
+          sendSongInfo(videoData, binding);
         }
       }, DATAUPDATED_FALLBACK_TIMEOUT_MS);
 
       waitingTimeouts.set(videoData.videoId, timeoutId);
+    } else if (previous) {
+      refreshBinding(
+        previous,
+        name === 'dataupdated' && videoData.videoId === previous.videoId
+          ? binding
+          : null,
+      );
     }
   });
 
@@ -330,7 +384,13 @@ export const setupSongInfo = (api: MusicPlayer) => {
     }
   }
 
-  function sendSongInfo(videoData: VideoDataChangeValue) {
+  function sendSongInfo(
+    videoData: VideoDataChangeValue,
+    binding = playbackOwner.binding(videoData.videoId),
+  ) {
+    if (!playbackOwner.isCurrent()) return;
+    // A delayed payload cannot acquire a newer episode, including same-ID ABA.
+    if (binding && !playbackOwner.binding(videoData.videoId, binding)) return;
     const data = api.getPlayerResponse();
 
     let playerOverlay: PlayerOverlays | undefined;
@@ -352,6 +412,11 @@ export const setupSongInfo = (api: MusicPlayer) => {
     data.videoDetails.elapsedSeconds = 0;
     data.videoDetails.isPaused = false;
 
-    window.ipcRenderer.send('peard:video-src-changed', data);
+    const annotation: PlaybackBinding | null = binding
+      ? playbackOwner.binding(videoData.videoId, binding)
+      : null;
+    if (!playbackOwner.isCurrent() || (binding && !annotation)) return;
+    submittedBinding = annotation;
+    window.ipcRenderer.send('peard:video-src-changed', data, annotation);
   }
 };

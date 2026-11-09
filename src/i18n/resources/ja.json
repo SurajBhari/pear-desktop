@@ -997,6 +997,13 @@
         "visualizer-type": "ビジュアライザーの種類"
       },
       "name": "視覚効果"
+    },
+    "adblocker": {
+      "description": "すべての広告とトラッカーをブロックj",
+      "menu": {
+        "blocker": "ブロッカー"
+      },
+      "name": "広告ブロッカー"
     }
   }
 }

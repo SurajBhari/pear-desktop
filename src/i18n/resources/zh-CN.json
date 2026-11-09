@@ -997,6 +997,13 @@
         "visualizer-type": "可视化类型"
       },
       "name": "可视化效果"
+    },
+    "adblocker": {
+      "description": "屏蔽所有广告与跟踪器",
+      "menu": {
+        "blocker": "屏蔽器"
+      },
+      "name": "广告屏蔽器"
     }
   }
 }

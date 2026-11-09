@@ -1,9 +1,21 @@
 import i18next from 'i18next';
 import { setTheme } from 'mdui/functions/setTheme.js';
+
+import {
+  loadI18n,
+  retireLanguageRequests,
+  setLanguage,
+  t as i18t,
+} from '@/i18n';
+
 import 'mdui/mdui.css';
 import 'mdui';
 
-import { loadI18n, setLanguage, t as i18t } from '@/i18n';
+import {
+  initializeAudioGraph,
+  observeAudioGraphLifetime,
+} from '@/providers/renderer-audio';
+import { LoggerPrefix } from '@/utils';
 import {
   defaultTrustedTypePolicy,
   registerWindowDefaultTrustedTypePolicy,
@@ -18,18 +30,44 @@ import {
   loadAllRendererPlugins,
 } from './loader/renderer';
 import { startingPages } from './providers/extracted-data';
+import {
+  getMusicActionsOwner,
+  publishMusicActionsOwner,
+} from './providers/music-actions';
+import { createPlaylistQueueController } from './providers/queue-playlist-renderer';
+import { createRepeatPreference } from './providers/repeat-preference';
+import { setupShareLinks } from './providers/share-links';
 import { setupSongInfo } from './providers/song-info-front';
 
 import type { MusicPlayer } from '@/types/music-player';
 import type { MusicPlayerAppElement } from '@/types/music-player-app-element';
 import type { QueueResponse } from '@/types/music-player-desktop-internal';
-import type { PluginConfig } from '@/types/plugins';
+import type { PluginConfig, PluginDef } from '@/types/plugins';
 import type { QueueElement } from '@/types/queue';
 import type { SearchBoxElement } from '@/types/search-box-element';
 
 setTheme('dark');
 
+let languageDocumentActive = true;
+let audioAnnouncementGeneration = 0;
+let disposeAudioAnnouncements: (() => void) | undefined;
+const isLanguageDocumentCurrent = () => languageDocumentActive;
+window.addEventListener(
+  'pagehide',
+  () => {
+    languageDocumentActive = false;
+    audioAnnouncementGeneration++;
+    disposeAudioAnnouncements?.();
+    disposeAudioAnnouncements = undefined;
+    retireLanguageRequests();
+  },
+  { once: true },
+);
+
 let api: (Element & MusicPlayer) | null = null;
+let repeatPreference: ReturnType<typeof createRepeatPreference> | undefined;
+let playlistQueue: ReturnType<typeof createPlaylistQueueController> | undefined;
+let disposeMusicActionsOwner: (() => void) | undefined;
 let isPluginLoaded = false;
 let isApiLoaded = false;
 let firstDataLoaded = false;
@@ -40,6 +78,8 @@ async function listenForApiLoad() {
   if (!isApiLoaded) {
     api = document.querySelector('#movie_player');
     if (api) {
+      // Claim startup before async hooks can wake the discovery observer.
+      isApiLoaded = true;
       await onApiLoaded();
 
       return;
@@ -47,7 +87,52 @@ async function listenForApiLoad() {
   }
 }
 
+// One plugin's onPlayerApiReady throwing (e.g. a network-dependent fetch
+// failing while offline) must not stop the app from initializing every
+// other plugin - both the startup loop and the plugin:enable IPC handler
+// call this instead of invoking onPlayerApiReady directly.
+async function callOnPlayerApiReady(
+  id: string,
+  renderer: PluginDef<unknown, unknown, unknown>['renderer'],
+  playerApi: MusicPlayer,
+) {
+  if (typeof renderer === 'function') return;
+  try {
+    await renderer?.onPlayerApiReady?.call(
+      renderer,
+      playerApi,
+      createContext(id),
+    );
+  } catch (err) {
+    console.error(
+      LoggerPrefix,
+      i18t('common.console.plugins.execute-failed', {
+        pluginName: id,
+        contextName: 'onPlayerApiReady',
+      }),
+    );
+    console.trace(err);
+  }
+}
+
 async function onApiLoaded() {
+  const audioOwner = ++audioAnnouncementGeneration;
+  const isAudioOwnerCurrent = () =>
+    audioOwner === audioAnnouncementGeneration && isLanguageDocumentCurrent();
+  disposeAudioAnnouncements?.();
+  disposeAudioAnnouncements = undefined;
+  disposeMusicActionsOwner?.();
+  disposeMusicActionsOwner = undefined;
+  playlistQueue?.dispose();
+  playlistQueue = createPlaylistQueueController(api, () => api);
+  repeatPreference?.dispose();
+  repeatPreference = createRepeatPreference();
+  if (api?.isConnected)
+    disposeMusicActionsOwner = publishMusicActionsOwner(api, {
+      repeatPreference,
+      playlistQueue,
+      getApi: () => api,
+    });
   // Workaround for macOS traffic lights
   {
     let osType = 'Unknown';
@@ -69,28 +154,105 @@ async function onApiLoaded() {
     );
 
   window.ipcRenderer.on('peard:previous-video', () => {
-    document
-      .querySelector<HTMLElement>('.previous-button.ytmusic-player-bar')
-      ?.click();
+    const navigation = api && getMusicActionsOwner(api)?.navigation;
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
+    const button = document.querySelector<HTMLElement>(
+      '.previous-button.ytmusic-player-bar',
+    );
+    const target = button
+      ? button.click.bind(button)
+      : api?.previousVideo?.bind(api);
+    if (!target) {
+      navigation?.cancel();
+      return;
+    }
+    const ticket =
+      !button || !button.matches(':disabled,[aria-disabled="true"]')
+        ? navigation?.preparePrevious()
+        : undefined;
+    if (
+      button &&
+      document.querySelector('.previous-button.ytmusic-player-bar') !== button
+    )
+      ticket?.cancel();
+    try {
+      ticket?.arm();
+      target();
+    } catch (error) {
+      ticket?.cancel();
+      throw error;
+    }
   });
   window.ipcRenderer.on('peard:next-video', () => {
-    document
-      .querySelector<HTMLElement>('.next-button.ytmusic-player-bar')
-      ?.click();
+    if (api) getMusicActionsOwner(api)?.navigation?.cancel();
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
+    const button = document.querySelector<HTMLElement>(
+      '.next-button.ytmusic-player-bar',
+    );
+    if (button) button.click();
+    else api?.nextVideo?.();
   });
   window.ipcRenderer.on('peard:play', (_) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.interrupt();
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     api?.playVideo();
   });
   window.ipcRenderer.on('peard:pause', (_) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.interrupt();
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     api?.pauseVideo();
   });
   window.ipcRenderer.on('peard:toggle-play', (_) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.interrupt();
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     if (api?.getPlayerState() === 2) api?.playVideo();
     else api?.pauseVideo();
   });
-  window.ipcRenderer.on('peard:seek-to', (_, t: number) => api!.seekTo(t));
-  window.ipcRenderer.on('peard:seek-by', (_, t: number) => api!.seekBy(t));
+  window.ipcRenderer.on('peard:seek-to', (_, t: number) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.cancel();
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
+    api!.seekTo(t);
+  });
+  window.ipcRenderer.on('peard:seek-by', (_, t: number) => {
+    if (api) getMusicActionsOwner(api)?.navigation?.cancel();
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
+    api!.seekBy(t);
+  });
   window.ipcRenderer.on('peard:shuffle', () => {
+    if (api) getMusicActionsOwner(api)?.navigation?.cancel();
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     document
       .querySelector<HTMLElement & { queue: { shuffle: () => void } }>(
         'ytmusic-player-bar',
@@ -122,6 +284,11 @@ async function onApiLoaded() {
     },
   );
   window.ipcRenderer.on('peard:switch-repeat', (_, repeat = 1) => {
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     for (let i = 0; i < repeat; i++) {
       document
         .querySelector<HTMLElement & { onRepeatButtonClick: () => void }>(
@@ -129,13 +296,21 @@ async function onApiLoaded() {
         )
         ?.onRepeatButtonClick();
     }
+    repeatPreference?.rememberUserChange();
   });
   window.ipcRenderer.on('peard:update-volume', (_, volume: number) => {
-    document
-      .querySelector<HTMLElement & { updateVolume: (volume: number) => void }>(
-        'ytmusic-player-bar',
-      )
-      ?.updateVolume(volume);
+    if (!api || !Number.isFinite(volume)) return;
+    const clampedVolume = Math.max(0, Math.min(100, volume));
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
+    api.setVolume(clampedVolume);
+    for (const selector of ['#volume-slider', '#expand-volume-slider']) {
+      const slider = document.querySelector<HTMLInputElement>(selector);
+      if (slider) slider.value = String(clampedVolume);
+    }
   });
 
   const isFullscreen = () => {
@@ -172,6 +347,11 @@ async function onApiLoaded() {
   );
 
   window.ipcRenderer.on('peard:toggle-mute', (_) => {
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     document
       .querySelector<HTMLElement & { onVolumeClick: () => void }>(
         'ytmusic-player-bar',
@@ -189,63 +369,13 @@ async function onApiLoaded() {
   });
 
   window.ipcRenderer.on(
-    'peard:add-to-queue',
-    (_, videoId: string, queueInsertPosition: string) => {
-      const queue = document.querySelector<QueueElement>('#queue');
-      const app = document.querySelector<MusicPlayerAppElement>('ytmusic-app');
-      if (!app) return;
-
-      const store = queue?.queue.store.store;
-      if (!store) return;
-
-      app.networkManager
-        .fetch('/music/get_queue', {
-          queueContextParams: store.getState().queue.queueContextParams,
-          queueInsertPosition,
-          videoIds: [videoId],
-        })
-        .then((result) => {
-          if (
-            result &&
-            typeof result === 'object' &&
-            'queueDatas' in result &&
-            Array.isArray(result.queueDatas)
-          ) {
-            const queueItems = store.getState().queue.items;
-            const queueItemsLength = queueItems.length ?? 0;
-            queue?.dispatch({
-              type: 'ADD_ITEMS',
-              payload: {
-                nextQueueItemId: store.getState().queue.nextQueueItemId,
-                index:
-                  queueInsertPosition === 'INSERT_AFTER_CURRENT_VIDEO'
-                    ? queueItems.findIndex(
-                        (it) =>
-                          (
-                            it.playlistPanelVideoRenderer ||
-                            it.playlistPanelVideoWrapperRenderer
-                              ?.primaryRenderer.playlistPanelVideoRenderer
-                          )?.selected,
-                      ) + 1 || queueItemsLength
-                    : queueItemsLength,
-                items: result.queueDatas
-                  .map((it) =>
-                    typeof it === 'object' && it && 'content' in it
-                      ? it.content
-                      : null,
-                  )
-                  .filter(Boolean),
-                shuffleEnabled: false,
-                shouldAssignIds: true,
-              },
-            });
-          }
-        });
-    },
-  );
-  window.ipcRenderer.on(
     'peard:move-in-queue',
     (_, fromIndex: number, toIndex: number) => {
+      (
+        window as unknown as {
+          blockerSceneGuard?: { cancelFromUser: () => void };
+        }
+      ).blockerSceneGuard?.cancelFromUser();
       const queue = document.querySelector<QueueElement>('#queue');
       queue?.dispatch({
         type: 'MOVE_ITEM',
@@ -257,6 +387,11 @@ async function onApiLoaded() {
     },
   );
   window.ipcRenderer.on('peard:remove-from-queue', (_, index: number) => {
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     const queue = document.querySelector<QueueElement>('#queue');
     queue?.dispatch({
       type: 'REMOVE_ITEM',
@@ -264,6 +399,11 @@ async function onApiLoaded() {
     });
   });
   window.ipcRenderer.on('peard:set-queue-index', (_, index: number) => {
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     const queue = document.querySelector<QueueElement>('#queue');
     queue?.dispatch({
       type: 'SET_INDEX',
@@ -271,6 +411,11 @@ async function onApiLoaded() {
     });
   });
   window.ipcRenderer.on('peard:clear-queue', () => {
+    (
+      window as unknown as {
+        blockerSceneGuard?: { cancelFromUser: () => void };
+      }
+    ).blockerSceneGuard?.cancelFromUser();
     const queue = document.querySelector<QueueElement>('#queue');
     queue?.queue.store.store.dispatch({
       type: 'SET_PLAYER_PAGE_INFO',
@@ -312,17 +457,15 @@ async function onApiLoaded() {
   const video = document.querySelector('video')!;
   const audioContext = new AudioContext();
   const audioSource = audioContext.createMediaElementSource(video);
-  audioSource.connect(audioContext.destination);
+  const audioGraph = initializeAudioGraph(audioContext, audioSource);
 
   for (const [id, plugin] of Object.entries(getAllLoadedRendererPlugins())) {
     if (typeof plugin.renderer !== 'function') {
-      await plugin.renderer?.onPlayerApiReady?.call(
-        plugin.renderer,
-        api!,
-        createContext(id),
-      );
+      await callOnPlayerApiReady(id, plugin.renderer, api!);
     }
   }
+
+  if (!isAudioOwnerCurrent()) return;
 
   if (firstDataLoaded) {
     document.dispatchEvent(
@@ -330,35 +473,27 @@ async function onApiLoaded() {
     );
   }
 
-  const audioCanPlayEventDispatcher = () => {
-    document.dispatchEvent(
-      new CustomEvent('peard:audio-can-play', {
-        detail: {
-          audioContext,
-          audioSource,
-        },
-      }),
-    );
-  };
-
-  const loadstartListener = () => {
-    // Emit "audioCanPlay" for each video
-    video.addEventListener('canplaythrough', audioCanPlayEventDispatcher, {
-      once: true,
-    });
-  };
-
-  if (video.readyState === 4 /* HAVE_ENOUGH_DATA (loaded) */) {
-    audioCanPlayEventDispatcher();
+  const dispose = observeAudioGraphLifetime(audioGraph, isAudioOwnerCurrent);
+  // A synchronous readiness subscriber may retire/rebind this renderer owner.
+  if (!isAudioOwnerCurrent()) {
+    dispose();
+    return;
   }
-
-  video.addEventListener('loadstart', loadstartListener, { passive: true });
+  disposeAudioAnnouncements = dispose;
 
   window.ipcRenderer.send('peard:player-api-loaded');
 
   // Navigate to "Starting page"
   const startingPage: string = window.mainConfig.get('options.startingPage');
-  if (startingPage && startingPages[startingPage]) {
+  if (
+    startingPage &&
+    startingPages[startingPage] &&
+    !(
+      window as unknown as {
+        blockerSceneGuard?: { restorationDocument: () => boolean };
+      }
+    ).blockerSceneGuard?.restorationDocument()
+  ) {
     document
       .querySelector<MusicPlayerAppElement>('ytmusic-app')
       ?.navigate(startingPages[startingPage]);
@@ -437,7 +572,12 @@ const definePearTransElements = () => {
 
 const preload = async () => {
   await loadI18n();
-  await setLanguage(window.mainConfig.get('options.language') ?? 'en');
+  if (!isLanguageDocumentCurrent()) return;
+  await setLanguage(
+    window.mainConfig.get('options.language') ?? 'en',
+    isLanguageDocumentCurrent,
+  );
+  if (!isLanguageDocumentCurrent()) return;
   window.i18n = {
     t: i18t.bind(i18next),
   };
@@ -448,6 +588,30 @@ const preload = async () => {
 };
 
 const main = async () => {
+  const setSharedLinks = setupShareLinks();
+  let shareActive = true;
+  const updateSharedLinks = (_event: unknown, value: unknown) => {
+    if (shareActive) setSharedLinks(value === true);
+  };
+  window.ipcRenderer.on(
+    'peard:strip-music-from-shared-links',
+    updateSharedLinks,
+  );
+  setSharedLinks(
+    window.mainConfig.get('options.stripMusicFromSharedLinks') === true,
+  );
+  window.addEventListener(
+    'pagehide',
+    () => {
+      shareActive = false;
+      window.ipcRenderer.removeListener(
+        'peard:strip-music-from-shared-links',
+        updateSharedLinks,
+      );
+      setSharedLinks(false);
+    },
+    { once: true },
+  );
   await loadAllRendererPlugins();
   isPluginLoaded = true;
 
@@ -458,13 +622,7 @@ const main = async () => {
     await forceLoadRendererPlugin(id);
     if (api) {
       const plugin = getLoadedRendererPlugin(id);
-      if (plugin && typeof plugin.renderer !== 'function') {
-        await plugin.renderer?.onPlayerApiReady?.call(
-          plugin.renderer,
-          api,
-          createContext(id),
-        );
-      }
+      if (plugin) await callOnPlayerApiReady(id, plugin.renderer, api);
     }
   });
 
@@ -536,4 +694,9 @@ const initObserver = async () => {
   });
 };
 
-initObserver().then(preload).then(main);
+initObserver()
+  .then(preload)
+  .then(() => {
+    if (isLanguageDocumentCurrent()) return main();
+    return undefined;
+  });

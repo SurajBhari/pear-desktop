@@ -955,6 +955,13 @@
         "visualizer-type": "Tip vizualizacije"
       },
       "name": "Vizualizacija"
+    },
+    "adblocker": {
+      "description": "Podrazumevano blokiranje svih reklama i praćenja",
+      "menu": {
+        "blocker": "Bloker"
+      },
+      "name": "Bloker reklama"
     }
   }
 }

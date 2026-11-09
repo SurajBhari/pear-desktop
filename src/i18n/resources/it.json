@@ -985,6 +985,13 @@
         "visualizer-type": "Tipo di visualizzazione"
       },
       "name": "Visualizzatore grafico"
+    },
+    "adblocker": {
+      "description": "Blocca tutti gli annunci e i tracker",
+      "menu": {
+        "blocker": "Blocco"
+      },
+      "name": "Ad blocker"
     }
   }
 }

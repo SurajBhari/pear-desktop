@@ -1,24 +1,32 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Mutex } from 'async-mutex';
-import { app, type BrowserWindow, dialog, ipcMain } from 'electron';
+import { BG, type BgConfig } from 'bgutils-js';
+import {
+  app,
+  type BrowserWindow,
+  dialog,
+  ipcMain,
+  Notification,
+} from 'electron';
 import is from 'electron-is';
 import filenamify from 'filenamify';
 import lazyVar from 'lazy-var';
 import NodeID3 from 'node-id3';
 import {
-  Utils,
+  Innertube,
+  UniversalCache,
   YTNodes,
-  type Innertube,
+  Platform,
   type YT,
   type YTMusic,
   type Types,
 } from '\u0079\u006f\u0075\u0074\u0075\u0062\u0065i.js';
 
 import { t } from '@/i18n';
-import { createInnertube } from '@/plugins/utils/main/innertube';
+import { getNetFetchAsFetch } from '@/plugins/utils/main';
 import {
   registerCallback,
   cleanupName,
@@ -29,13 +37,37 @@ import {
 } from '@/providers/song-info';
 
 import {
+  createDownloaderInitialization,
+  type DownloaderInitialization,
+} from './initialization';
+import {
   cropMaxWidth,
+  clearErrorFeedback,
   getFolder,
+  getLibraryRoot,
+  sendErrorFeedback,
   sendFeedback as sendFeedback_,
   setBadge,
 } from './utils';
 
-import { DefaultPresetList, type Preset, VideoFormatList } from '../types';
+import {
+  describeAudioFormats,
+  selectAudioFormat,
+  sourceContainer,
+  validateAudioPreference,
+  type AudioDescriptor,
+} from '../audio';
+import {
+  checkDuplicate,
+  primaryOutputFilename,
+  publishCompleted,
+  hasVerifiedTrack,
+  scanLibrary,
+  type CompletedInput,
+  type LibraryReport,
+} from '../library';
+import { AudioTransferError, downloadSelectedAudio } from '../transfer';
+import { DefaultPresetList, type Preset } from '../types';
 
 import type { DownloaderPluginConfig } from '../index';
 import type { BackendContext } from '@/types/contexts';
@@ -52,38 +84,58 @@ const ffmpeg = lazyVar.lazy(async () =>
 );
 const ffmpegMutex = new Mutex();
 
-let yt: Innertube;
+Platform.shim.eval = (
+  data: Types.BuildScriptResult,
+  env: Record<string, Types.VMPrimative>,
+) => {
+  const properties = [];
+
+  if (env.n) {
+    properties.push(`n: exportedVars.nFunction("${env.n}")`);
+  }
+
+  if (env.sig) {
+    properties.push(`sig: exportedVars.sigFunction("${env.sig}")`);
+  }
+
+  const code = `${data.output}\nreturn { ${properties.join(', ')} }`;
+
+  // oxlint-disable-next-line typescript/no-unsafe-return,typescript/no-implied-eval,typescript/no-unsafe-call
+  return new Function(code)();
+};
+
 let win: BrowserWindow;
 let playingUrl: string;
+let lastErrorNotification: Notification | undefined;
 
-const isPremium = async () => {
+const isPremium = async (targetWindow: BrowserWindow) => {
   // If signed out, it is understood as non-premium
-  const isSignedIn = (await win.webContents.executeJavaScript(
+  const isSignedIn = (await targetWindow.webContents.executeJavaScript(
     '!!yt.config_.LOGGED_IN',
   )) as boolean;
 
   if (!isSignedIn) return false;
 
   // If signed in, check if the upgrade button is present
-  const upgradeBtnIconPathData = (await win.webContents.executeJavaScript(
-    'document.querySelector(\'iron-iconset-svg[name="yt-sys-icons"] #\u0079\u006f\u0075\u0074\u0075\u0062\u0065_music_monochrome\')?.firstChild?.getAttribute("d")?.substring(0, 15)',
-  )) as string | null;
+  const upgradeBtnIconPathData =
+    (await targetWindow.webContents.executeJavaScript(
+      'document.querySelector(\'iron-iconset-svg[name="yt-sys-icons"] #\u0079\u006f\u0075\u0074\u0075\u0062\u0065_music_monochrome\')?.firstChild?.getAttribute("d")?.substring(0, 15)',
+    )) as string | null;
 
   // Fallback to non-premium if the icon is not found
   if (!upgradeBtnIconPathData) return false;
 
   const upgradeButton = `ytmusic-guide-entry-renderer:has(> tp-yt-paper-item > yt-icon path[d^="${upgradeBtnIconPathData}"])`;
 
-  return (await win.webContents.executeJavaScript(
+  return (await targetWindow.webContents.executeJavaScript(
     `!document.querySelector('${upgradeButton}')`,
   )) as boolean;
 };
 
-const sendError = (error: Error, source?: string) => {
-  win.setProgressBar(-1); // Close progress bar
-  setBadge(0); // Close badge
-  sendFeedback_(win); // Reset feedback
-
+const sendError = (rejection: unknown, source?: string) => {
+  const errorOwner = backend;
+  const error =
+    rejection instanceof Error ? rejection : new Error(String(rejection));
   const songNameMessage = source ? `\nin ${source}` : '';
   const cause = error.cause
     ? `\n\n${
@@ -95,94 +147,536 @@ const sendError = (error: Error, source?: string) => {
 
   console.error(message);
   console.trace(error);
-  dialog.showMessageBox(win, {
-    type: 'info',
-    buttons: [t('plugins.downloader.backend.dialog.error.buttons.ok')],
-    title: t('plugins.downloader.backend.dialog.error.title'),
-    message: t('plugins.downloader.backend.dialog.error.message'),
-    detail: message,
-  });
+  try {
+    setBadge(0);
+  } catch (badgeError) {
+    console.warn('Could not clear downloader badge', badgeError);
+  }
+  const targetWindow = win;
+  if (targetWindow.isDestroyed()) return;
+  targetWindow.setProgressBar(-1);
+  const title = t('plugins.downloader.backend.dialog.error.title');
+  const compact =
+    `${t('plugins.downloader.backend.dialog.error.message')}: ${error.message}`
+      .replace(/\s+/g, ' ')
+      .trim();
+  let feedback = compact;
+  if (compact.length > 200) {
+    feedback = '';
+    const segments = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    for (const { segment } of segments.segment(compact)) {
+      if (feedback.length + segment.length > 199) break;
+      feedback += segment;
+    }
+    feedback += '…';
+  }
+  if (targetWindow.isFocused()) {
+    clearErrorFeedback(targetWindow);
+    const failedDialog = (dialogError: unknown) => {
+      console.warn('Could not show downloader error dialog', dialogError);
+      if (isCurrentBinding(errorOwner))
+        sendErrorFeedback(targetWindow, feedback);
+    };
+    try {
+      dialog
+        .showMessageBox(targetWindow, {
+          type: 'info',
+          buttons: [t('plugins.downloader.backend.dialog.error.buttons.ok')],
+          title,
+          message: t('plugins.downloader.backend.dialog.error.message'),
+          detail: message,
+        })
+        .catch(failedDialog);
+    } catch (dialogError) {
+      failedDialog(dialogError);
+    }
+    return;
+  }
+  sendErrorFeedback(targetWindow, feedback);
+  try {
+    if (!Notification.isSupported()) return;
+    lastErrorNotification?.close();
+    lastErrorNotification = new Notification({
+      title,
+      body: feedback,
+      silent: true,
+    });
+    lastErrorNotification.on('failed', (_, notificationError) => {
+      console.warn('Could not show downloader notification', notificationError);
+    });
+    lastErrorNotification.show();
+  } catch (notificationError) {
+    console.warn('Could not show downloader notification', notificationError);
+  }
+};
+
+export const getCookieFromWindow = async (win: BrowserWindow) => {
+  return (
+    await win.webContents.session.cookies.get({
+      url: 'https://music.\u0079\u006f\u0075\u0074\u0075\u0062\u0065.com',
+    })
+  )
+    .map((it) => it.name + '=' + it.value)
+    .join(';');
 };
 
 let config: DownloaderPluginConfig;
 
-export const onMainLoad = async ({
-  window: _win,
-  getConfig,
-  ipc,
-}: BackendContext<DownloaderPluginConfig>) => {
-  win = _win;
-  config = await getConfig();
+interface DownloaderBinding {
+  context: BackendContext<DownloaderPluginConfig>;
+  session: Electron.Session;
+  initialization: DownloaderInitialization<Innertube>;
+  disposed: boolean;
+  ready: boolean;
+  cleanup: (() => void)[];
+  scan?: AbortController;
+  library?: LibraryReport;
+  review: { id: string; title: string; reason: string }[];
+}
+let backend: DownloaderBinding | undefined;
+const botguardMutex = new Mutex();
+const isOwnedBinding = (
+  owner: DownloaderBinding | undefined,
+): owner is DownloaderBinding =>
+  !!owner &&
+  backend === owner &&
+  !owner.disposed &&
+  !owner.context.window.isDestroyed() &&
+  !owner.context.window.webContents.isDestroyed() &&
+  owner.context.window.webContents.session === owner.session;
+const isCurrentBinding = (
+  owner: DownloaderBinding | undefined,
+): owner is DownloaderBinding => isOwnedBinding(owner) && owner.ready;
+const assertCurrentBinding = (owner: DownloaderBinding) => {
+  if (!isCurrentBinding(owner))
+    throw new Error('Downloader backend is no longer active');
+};
+const disposeBinding = (owner: DownloaderBinding | undefined) => {
+  if (!owner || owner.disposed) return;
+  owner.disposed = true;
+  owner.scan?.abort();
+  owner.initialization.dispose();
+  for (const dispose of owner.cleanup) dispose();
+  owner.cleanup = [];
+  if (backend === owner) {
+    setBadge(0);
+    if (!owner.context.window.isDestroyed())
+      owner.context.window.setProgressBar(-1);
+    backend = undefined;
+    playingUrl = '';
+  }
+};
 
-  yt = await createInnertube(win);
-
-  ipc.handle('download-song', (url: string) => downloadSong(url));
-  ipc.on('peard:video-src-changed', (data: GetPlayerResponse) => {
-    playingUrl = data.microformat.microformatDataRenderer.urlCanonical;
+const initializeDownloader = async (
+  owner: DownloaderBinding,
+  signal: AbortSignal,
+) => {
+  const targetWindow = owner.context.window;
+  const cookie = await getCookieFromWindow(targetWindow);
+  assertCurrentBinding(owner);
+  const nativeFetch = getNetFetchAsFetch();
+  const ownedFetch: typeof fetch = async (input, init) => {
+    assertCurrentBinding(owner);
+    const requestSignal =
+      init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    return nativeFetch(input, {
+      ...init,
+      signal: requestSignal ? AbortSignal.any([signal, requestSignal]) : signal,
+    });
+  };
+  const client = await Innertube.create({
+    cache: new UniversalCache(false),
+    cookie,
+    generate_session_locally: true,
+    fetch: ownedFetch,
   });
-  ipc.handle('download-playlist-request', async (url: string) =>
-    downloadPlaylist(url),
-  );
+  assertCurrentBinding(owner);
+  const visitorData = client.session.context.client.visitorData;
+  if (visitorData) {
+    // Botguard temporarily uses process globals; retired work restores them
+    // before a new backend enters this section.
+    await botguardMutex.runExclusive(async () => {
+      assertCurrentBinding(owner);
+      const previousWindow = Object.getOwnPropertyDescriptor(
+        globalThis,
+        'window',
+      );
+      const previousDocument = Object.getOwnPropertyDescriptor(
+        globalThis,
+        'document',
+      );
+      // Never invoke prior accessors, and do not partially overlay immutable
+      // globals. PoToken setup remains optional in that environment.
+      if (
+        previousWindow?.configurable === false ||
+        previousDocument?.configurable === false
+      )
+        return;
+      let window: import('happy-dom').Window | undefined;
+      try {
+        const [width, height] = targetWindow.getSize();
+        window = new (await import('happy-dom')).Window({
+          width,
+          height,
+          console,
+        });
+        const document = window.document;
+        assertCurrentBinding(owner);
+        Object.defineProperties(globalThis, {
+          window: {
+            value: window,
+            writable: true,
+            configurable: true,
+            enumerable: previousWindow?.enumerable ?? true,
+          },
+          document: {
+            value: document,
+            writable: true,
+            configurable: true,
+            enumerable: previousDocument?.enumerable ?? true,
+          },
+        });
+        const bgConfig: BgConfig = {
+          fetch: ownedFetch,
+          globalObj: globalThis,
+          identifier: visitorData,
+          requestKey: 'O43z0dpjhgX20SCx4KAo',
+        };
+        const bgChallenge = await BG.Challenge.create(bgConfig);
+        assertCurrentBinding(owner);
+        const interpreterJavascript =
+          bgChallenge?.interpreterJavascript
+            .privateDoNotAccessOrElseSafeScriptWrappedValue;
+        if (interpreterJavascript) {
+          // Preserve the existing Botguard interpreter path.
+          // oxlint-disable-next-line typescript/no-implied-eval,typescript/no-unsafe-call
+          new Function(interpreterJavascript)();
+          const token = await BG.PoToken.generate({
+            program: bgChallenge.program,
+            globalName: bgChallenge.globalName,
+            bgConfig,
+          });
+          assertCurrentBinding(owner);
+          client.session.po_token = token.poToken;
+        }
+      } catch {
+        // A missing PoToken stays optional; backend retirement is terminal.
+        assertCurrentBinding(owner);
+      } finally {
+        try {
+          await window?.happyDOM.close();
+        } catch {
+          console.warn('Could not close downloader temporary DOM');
+        } finally {
+          if (previousWindow)
+            Object.defineProperty(globalThis, 'window', previousWindow);
+          else Reflect.deleteProperty(globalThis, 'window');
+          if (previousDocument)
+            Object.defineProperty(globalThis, 'document', previousDocument);
+          else Reflect.deleteProperty(globalThis, 'document');
+        }
+      }
+    });
+  }
+  assertCurrentBinding(owner);
+  return client;
+};
 
-  downloadSongOnFinishSetup({ ipc, getConfig });
+export const onMainLoad = async (
+  context: BackendContext<DownloaderPluginConfig>,
+) => {
+  disposeBinding(backend);
+  let owner: DownloaderBinding;
+  const initialization = createDownloaderInitialization(
+    () => isCurrentBinding(owner),
+    (signal) => initializeDownloader(owner, signal),
+  );
+  owner = {
+    context,
+    session: context.window.webContents.session,
+    initialization,
+    disposed: false,
+    ready: false,
+    cleanup: [],
+    review: [],
+  };
+  backend = owner;
+  const closed = () => disposeBinding(owner);
+  context.window.once('closed', closed);
+  owner.cleanup.push(() => context.window.removeListener('closed', closed));
+  try {
+    const loadedConfig = await context.getConfig();
+    if (!isOwnedBinding(owner)) return;
+    win = context.window;
+    config = loadedConfig;
+    playingUrl = '';
+    owner.ready = true;
+    const { ipc } = context;
+    ipc.handle('download-song', (url: string) =>
+      isCurrentBinding(owner) ? downloadSong(url) : undefined,
+    );
+    owner.cleanup.push(() => ipc.removeHandler('download-song'));
+    const sourceChanged = (
+      _event: Electron.IpcMainEvent,
+      data: GetPlayerResponse,
+    ) => {
+      if (isCurrentBinding(owner))
+        playingUrl = data.microformat.microformatDataRenderer.urlCanonical;
+    };
+    ipcMain.on('peard:video-src-changed', sourceChanged);
+    owner.cleanup.push(() =>
+      ipcMain.removeListener('peard:video-src-changed', sourceChanged),
+    );
+    ipc.handle('download-playlist-request', (url: string) =>
+      isCurrentBinding(owner) ? downloadPlaylist(url) : undefined,
+    );
+    owner.cleanup.push(() => ipc.removeHandler('download-playlist-request'));
+    const handlers: Record<string, (...args: never[]) => unknown> = {
+      'downloader-settings': () => ({
+        config,
+        library: owner.library,
+        review: owner.review,
+      }),
+      'downloader-save-settings': async (value: unknown) => {
+        const settings = value as Partial<DownloaderPluginConfig>;
+        const sourceAudio = validateAudioPreference(settings?.sourceAudio);
+        if (
+          ![
+            'legacy',
+            'skip-any',
+            'keep-better',
+            'save-variant',
+            'ask',
+          ].includes(settings.duplicatePolicy ?? '') ||
+          typeof settings.sourceFallback !== 'boolean'
+        )
+          throw new Error('Invalid duplicate/fallback settings');
+        if (
+          settings.selectedPreset !== undefined &&
+          !Object.hasOwn(DefaultPresetList, settings.selectedPreset)
+        )
+          throw new Error('Unknown output preset');
+        const patch = {
+          sourceAudio,
+          sourceFallback: settings.sourceFallback,
+          duplicatePolicy: settings.duplicatePolicy,
+          selectedPreset: settings.selectedPreset ?? config.selectedPreset,
+        };
+        assertCurrentBinding(owner);
+        await context.setConfig(patch);
+        assertCurrentBinding(owner);
+        config = { ...config, ...patch };
+        return config;
+      },
+      'downloader-formats': async (url?: string) => {
+        const id = getVideoId(url ?? playingUrl);
+        if (!id)
+          throw new Error('Select a track before inspecting source audio');
+        const yt = await owner.initialization.get();
+        assertCurrentBinding(owner);
+        let info: YTMusic.TrackInfo | YT.VideoInfo = await yt.music.getInfo(id);
+        let client: 'YTMUSIC' | 'TV_EMBEDDED' = 'YTMUSIC';
+        assertCurrentBinding(owner);
+        if (info.playability_status?.status === 'LOGIN_REQUIRED') {
+          info = await getAndroidTvInfo(id, yt);
+          client = 'TV_EMBEDDED';
+          assertCurrentBinding(owner);
+        }
+        const rows = describeAudioFormats(
+          [
+            ...(info.streaming_data?.formats ?? []),
+            ...(info.streaming_data?.adaptive_formats ?? []),
+          ],
+          client === 'TV_EMBEDDED',
+        );
+        for (const row of rows) row.client = client;
+        const live =
+          info.page[0].video_details?.is_live ||
+          info.page[0].video_details?.is_post_live_dvr;
+        if (
+          live ||
+          ['LOGIN_REQUIRED', 'UNPLAYABLE'].includes(
+            info.playability_status?.status ?? '',
+          )
+        )
+          for (const row of rows) {
+            row.supported = false;
+            row.reason = live
+              ? 'Live/Post-Live-DVR unsupported'
+              : 'Track not playable in current session';
+          }
+        const premiumHint = await isPremium(owner.context.window).catch(
+          () => undefined,
+        );
+        assertCurrentBinding(owner);
+        return { id, title: info.basic_info.title, formats: rows, premiumHint };
+      },
+      'downloader-selected': async (id: string, key: string) => {
+        if (
+          typeof id !== 'string' ||
+          !/^[\w-]{1,128}$/.test(id) ||
+          typeof key !== 'string' ||
+          key.length > 4096
+        )
+          throw new Error('Invalid track/source selection');
+        return downloadSongFromIdInOperation(
+          id,
+          undefined,
+          undefined,
+          undefined,
+          true,
+          key,
+        );
+      },
+      'downloader-scan': async () => {
+        owner.scan?.abort();
+        const scan = new AbortController();
+        owner.scan = scan;
+        const result = await scanLibrary(getFolder(config.downloadFolder), {
+          signal: scan.signal,
+          onProgress: (visited) => {
+            if (isCurrentBinding(owner))
+              context.ipc.send('downloader-scan-progress', visited);
+          },
+        });
+        assertCurrentBinding(owner);
+        if (owner.scan !== scan) throw new Error('Scan superseded');
+        owner.library = result;
+        return result;
+      },
+      'downloader-scan-cancel': () => {
+        owner.scan?.abort();
+      },
+    };
+    for (const [event, handler] of Object.entries(handlers)) {
+      ipc.handle(event, (...args: never[]) => {
+        assertCurrentBinding(owner);
+        return handler(...args);
+      });
+      owner.cleanup.push(() => ipc.removeHandler(event));
+    }
+    owner.cleanup.push(downloadSongOnFinishSetup(context, owner));
+  } catch (error) {
+    disposeBinding(owner);
+    throw error;
+  }
+};
+
+export const onMainStop = ({
+  window,
+}: BackendContext<DownloaderPluginConfig>) => {
+  if (backend?.context.window === window) disposeBinding(backend);
 };
 
 export const onConfigChange = (newConfig: DownloaderPluginConfig) => {
-  config = newConfig;
+  if (isCurrentBinding(backend)) config = newConfig;
+};
+export const openDownloaderSettings = () => {
+  if (isCurrentBinding(backend))
+    backend.context.ipc.send('downloader-open-settings');
+};
+
+const resolvePreset = (selected: string | undefined): Preset => {
+  const name = selected ?? 'mp3 (256kbps)';
+  const preset =
+    name === 'Custom'
+      ? (config.customPresetSetting ?? DefaultPresetList['mp3 (256kbps)'])
+      : Object.hasOwn(DefaultPresetList, name)
+        ? DefaultPresetList[name]
+        : DefaultPresetList['mp3 (256kbps)'];
+  return { ...preset, ffmpegArgs: [...preset.ffmpegArgs] };
 };
 
 export async function downloadSong(
   url: string,
-  playlistFolder?: string ,
-  trackId?: string ,
+  playlistFolder?: string,
+  trackId?: string,
   increasePlaylistProgress: (value: number) => void = () => {},
+  interactive = true,
 ) {
+  const owner = backend;
+  if (!isCurrentBinding(owner)) return;
   let resolvedName;
   try {
+    clearErrorFeedback(win);
     await downloadSongUnsafe(
+      owner,
       false,
       url,
       (name: string) => (resolvedName = name),
       playlistFolder,
       trackId,
       increasePlaylistProgress,
+      undefined,
+      interactive,
     );
   } catch (error: unknown) {
-    sendError(error as Error, resolvedName || url);
+    if (backend === owner && !owner.disposed)
+      sendError(error as Error, resolvedName || url);
   }
 }
 
 export async function downloadSongFromId(
   id: string,
-  playlistFolder?: string ,
-  trackId?: string ,
+  playlistFolder?: string,
+  trackId?: string,
   increasePlaylistProgress: (value: number) => void = () => {},
 ) {
+  await downloadSongFromIdInOperation(
+    id,
+    playlistFolder,
+    trackId,
+    increasePlaylistProgress,
+    true,
+  );
+}
+
+async function downloadSongFromIdInOperation(
+  id: string,
+  playlistFolder?: string,
+  trackId?: string,
+  increasePlaylistProgress: (value: number) => void = () => {},
+  startOperation = false,
+  selectedKey?: string,
+) {
+  const owner = backend;
+  if (!isCurrentBinding(owner)) return;
   let resolvedName;
   try {
-    await downloadSongUnsafe(
+    if (startOperation) clearErrorFeedback(win);
+    return await downloadSongUnsafe(
+      owner,
       true,
       id,
       (name: string) => (resolvedName = name),
       playlistFolder,
       trackId,
       increasePlaylistProgress,
+      selectedKey,
+      startOperation,
     );
   } catch (error: unknown) {
-    sendError(error as Error, resolvedName || id);
+    if (backend === owner && !owner.disposed)
+      sendError(error as Error, resolvedName || id);
+    return {
+      status: 'failed' as const,
+      error: error instanceof Error ? error.message : 'Download failed',
+    };
   }
 }
 
-function downloadSongOnFinishSetup({
-  ipc,
-}: Pick<BackendContext<DownloaderPluginConfig>, 'ipc' | 'getConfig'>) {
+function downloadSongOnFinishSetup(
+  { ipc }: Pick<BackendContext<DownloaderPluginConfig>, 'ipc' | 'getConfig'>,
+  owner: DownloaderBinding,
+) {
   let currentUrl: string | undefined;
   let duration: number | undefined;
   let time = 0;
 
   const defaultDownloadFolder = app.getPath('downloads');
 
-  registerCallback((songInfo: SongInfo, event) => {
+  const unregister = registerCallback((songInfo: SongInfo, event) => {
+    if (!isCurrentBinding(owner)) return;
     if (event === SongInfoEvent.TimeChanged) {
       const elapsedSeconds = songInfo.elapsedSeconds ?? 0;
       if (elapsedSeconds > time) time = elapsedSeconds;
@@ -203,6 +697,9 @@ function downloadSongOnFinishSetup({
             config.downloadOnFinish.folder ??
               config.downloadFolder ??
               defaultDownloadFolder,
+            undefined,
+            undefined,
+            false,
           );
         } else if (
           config.downloadOnFinish.mode === 'percent' &&
@@ -213,6 +710,9 @@ function downloadSongOnFinishSetup({
             config.downloadOnFinish.folder ??
               config.downloadFolder ??
               defaultDownloadFolder,
+            undefined,
+            undefined,
+            false,
           );
         }
       }
@@ -223,20 +723,29 @@ function downloadSongOnFinishSetup({
     }
   });
 
-  ipcMain.on('peard:player-api-loaded', () => {
-    ipc.send('peard:setup-time-changed-listener');
-  });
+  const playerReady = () => {
+    if (isCurrentBinding(owner)) ipc.send('peard:setup-time-changed-listener');
+  };
+  ipcMain.on('peard:player-api-loaded', playerReady);
+  return () => {
+    unregister();
+    ipcMain.removeListener('peard:player-api-loaded', playerReady);
+  };
 }
 
 async function downloadSongUnsafe(
+  owner: DownloaderBinding,
   isId: boolean,
   idOrUrl: string,
   setName: (name: string) => void,
-  playlistFolder?: string ,
-  trackId?: string ,
+  playlistFolder?: string,
+  trackId?: string,
   increasePlaylistProgress: (value: number) => void = () => {},
+  selectedKey?: string,
+  interactive = false,
 ) {
   const sendFeedback = (message: unknown, progress?: number) => {
+    if (!isCurrentBinding(owner)) return;
     if (!playlistFolder) {
       sendFeedback_(win, message);
       if (progress && !isNaN(progress)) {
@@ -258,7 +767,20 @@ async function downloadSongUnsafe(
       );
   }
 
+  const dir = getFolder(playlistFolder || config.downloadFolder);
+  const libraryRoot = getLibraryRoot(getFolder(config.downloadFolder), dir);
+  if (
+    config.duplicatePolicy === 'skip-any' &&
+    (await hasVerifiedTrack(libraryRoot, id, () => assertCurrentBinding(owner)))
+  ) {
+    sendFeedback('Already downloaded (verified track)', -1);
+    return { status: 'skipped' as const };
+  }
+  const yt = await owner.initialization.get();
+  assertCurrentBinding(owner);
   let info: YTMusic.TrackInfo | YT.VideoInfo = await yt.music.getInfo(id);
+  let infoClient: 'YTMUSIC' | 'TV_EMBEDDED' = 'YTMUSIC';
+  assertCurrentBinding(owner);
 
   if (!info) {
     throw new Error(
@@ -273,8 +795,6 @@ async function downloadSongUnsafe(
 
   metadata.trackId = trackId;
 
-  const dir =
-    playlistFolder || config.downloadFolder || app.getPath('downloads');
   const name = `${metadata.artist ? `${metadata.artist} - ` : ''}${
     metadata.title
   }`;
@@ -284,7 +804,8 @@ async function downloadSongUnsafe(
   let bypassedResult: YT.VideoInfo;
   if (playabilityStatus?.status === 'LOGIN_REQUIRED') {
     // Try to bypass the age restriction
-    bypassedResult = await getAndroidTvInfo(id);
+    bypassedResult = await getAndroidTvInfo(id, yt);
+    assertCurrentBinding(owner);
     playabilityStatus = bypassedResult.playability_status;
 
     if (playabilityStatus?.status === 'LOGIN_REQUIRED') {
@@ -294,6 +815,7 @@ async function downloadSongUnsafe(
     }
 
     info = bypassedResult;
+    infoClient = 'TV_EMBEDDED';
   }
 
   if (playabilityStatus?.status === 'UNPLAYABLE') {
@@ -304,28 +826,36 @@ async function downloadSongUnsafe(
     );
   }
 
-  const selectedPreset = config.selectedPreset ?? 'mp3 (256kbps)';
-  let presetSetting: Preset;
-  if (selectedPreset === 'Custom') {
-    presetSetting = config.customPresetSetting ?? DefaultPresetList['Custom'];
-  } else if (selectedPreset === 'Source') {
-    presetSetting = DefaultPresetList['Source'];
-  } else {
-    presetSetting = DefaultPresetList['mp3 (256kbps)'];
+  const presetSetting = resolvePreset(config.selectedPreset);
+  const formats = [
+    ...(info.streaming_data?.formats ?? []),
+    ...(info.streaming_data?.adaptive_formats ?? []),
+  ];
+  if (
+    !/^[\w-]{1,128}$/.test(metadata.videoId) ||
+    (info.basic_info.id && info.basic_info.id !== metadata.videoId)
+  )
+    throw new Error(
+      'Streaming response track identity does not match metadata',
+    );
+  const rows = describeAudioFormats(formats, infoClient === 'TV_EMBEDDED');
+  for (const row of rows) row.client = infoClient;
+  let selected: AudioDescriptor;
+  const preference = validateAudioPreference(
+    config.sourceAudio ?? { mode: 'best' },
+  );
+  try {
+    selected = selectAudioFormat(rows, preference, selectedKey);
+  } catch (error) {
+    if (!config.sourceFallback || selectedKey) throw error;
+    selected = selectAudioFormat(rows, { ...preference, mode: 'best' });
+    sendFeedback('Requested source unavailable; using best offered source');
   }
-
-  const downloadOptions: Types.FormatOptions = {
-    type: (await isPremium()) ? 'audio' : 'video+audio', // Audio, video or video+audio
-    quality: 'best', // Best, bestefficiency, 144p, 240p, 480p, 720p and so on.
-    format: 'any', // Media container format
-  };
-
-  const format = info.chooseFormat(downloadOptions);
+  const format = formats[rows.indexOf(selected)];
 
   let targetFileExtension: string;
   if (!presetSetting?.extension) {
-    targetFileExtension =
-      VideoFormatList.find((it) => it.itag === format.itag)?.container ?? 'mp3';
+    targetFileExtension = sourceContainer(selected);
   } else {
     targetFileExtension = presetSetting?.extension ?? 'mp3';
   }
@@ -339,12 +869,75 @@ async function downloadSongUnsafe(
   }
   const filePath = join(dir, filename);
 
-  if (config.skipExisting && existsSync(filePath)) {
+  if (!/^[\w]{1,12}$/.test(targetFileExtension))
+    throw new Error('Invalid output extension');
+  const policy = config.duplicatePolicy ?? 'legacy';
+  if (
+    policy === 'legacy' &&
+    config.skipExisting &&
+    (existsSync(filePath) ||
+      existsSync(join(dir, primaryOutputFilename(filename))))
+  ) {
     sendFeedback(null, -1);
     return;
   }
 
-  const stream = await info.download(downloadOptions);
+  const completed: CompletedInput = {
+    videoId: metadata.videoId,
+    source: selected,
+    output: {
+      extension: targetFileExtension,
+      args: [...(presetSetting?.ffmpegArgs ?? []), '-vn'],
+    },
+    policy,
+    preference,
+  };
+  let stopped: 'skipped' | 'needs-choice' = 'skipped';
+  const decide = async () => {
+    const decision = await checkDuplicate(libraryRoot, completed, () =>
+      assertCurrentBinding(owner),
+    );
+    if (decision === 'skip') {
+      sendFeedback('Already downloaded (verified source/output policy)', -1);
+      return false;
+    }
+    if (decision === 'ask') {
+      stopped = 'needs-choice';
+      if (!interactive) {
+        if (!owner.review.some((row) => row.id === id))
+          owner.review.push({
+            id,
+            title: name,
+            reason: 'Existing source quality requires manual choice',
+          });
+        owner.review = owner.review.slice(-100);
+        sendFeedback(
+          'Existing track requires a source-quality choice; queued for manual review',
+          -1,
+        );
+        return false;
+      }
+      const result = await dialog.showMessageBox(owner.context.window, {
+        type: 'question',
+        message:
+          'This track already has a verified download. Source qualities cannot be safely ordered, or your policy asks each time.',
+        buttons: ['Keep existing', 'Save selected variant'],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      assertCurrentBinding(owner);
+      if (result.response !== 1) {
+        stopped = 'skipped';
+        return false;
+      }
+      completed.approved = true;
+    }
+    return true;
+  };
+  if (!(await decide())) return { status: stopped };
+  const iterableStream = await downloadSelectedAudio(info, format, () =>
+    assertCurrentBinding(owner),
+  );
 
   console.info(
     t('plugins.downloader.backend.feedback.download-info', {
@@ -354,40 +947,66 @@ async function downloadSongUnsafe(
     }),
   );
 
-  const iterableStream = Utils.streamToIterable(stream);
-
   if (!existsSync(dir)) {
     mkdirSync(dir);
   }
 
-  let fileBuffer = await iterableStreamToProcessedUint8Array(
+  let fileBuffer: Uint8Array | null = await iterableStreamToProcessedUint8Array(
     iterableStream,
     targetFileExtension,
     metadata,
-    presetSetting?.ffmpegArgs ?? [],
+    completed.output.args,
     format.content_length ?? 0,
     sendFeedback,
     increasePlaylistProgress,
+    owner,
   );
+  assertCurrentBinding(owner);
 
   if (fileBuffer && targetFileExtension === 'mp3') {
     fileBuffer = await writeID3(
       Buffer.from(fileBuffer),
       metadata,
       sendFeedback,
+      owner,
     );
+    assertCurrentBinding(owner);
   }
 
   if (fileBuffer) {
-    writeFileSync(filePath, fileBuffer);
+    const saved = await publishCompleted(
+      libraryRoot,
+      dir,
+      filename,
+      fileBuffer,
+      completed,
+      () => assertCurrentBinding(owner),
+    );
+    assertCurrentBinding(owner);
+    if (saved.status === 'needs-choice') {
+      sendFeedback('Concurrent download requires manual source choice', -1);
+      return { status: 'needs-choice' as const };
+    }
+    if (saved.status === 'skipped') {
+      sendFeedback('Already downloaded (verified)', -1);
+      return { status: 'skipped' as const };
+    }
+    sendFeedback(
+      `Saved ${selected.codec} (${Math.round((selected.averageBitrate ?? selected.bitrate ?? 0) / 1000) || 'unknown'} kbps source) → ${targetFileExtension}`,
+      -1,
+    );
+    owner.review = owner.review.filter((row) => row.id !== id);
+    return {
+      status: 'saved' as const,
+      path: saved.path,
+      source: selected,
+      extension: targetFileExtension,
+    };
+  } else {
+    throw new Error(
+      'Audio processing/tagging failed; no file or completion record saved',
+    );
   }
-
-  sendFeedback(null, -1);
-  console.info(
-    t('plugins.downloader.backend.feedback.done', {
-      filePath,
-    }),
-  );
 }
 
 async function downloadChunks(
@@ -398,20 +1017,26 @@ async function downloadChunks(
 ) {
   const chunks = [];
   let downloaded = 0;
-  for await (const chunk of stream) {
-    downloaded += chunk.length;
-    chunks.push(chunk);
-    const ratio = downloaded / contentLength;
-    const progress = Math.floor(ratio * 100);
-    sendFeedback(
-      t('plugins.downloader.backend.feedback.download-progress', {
-        percent: progress,
-      }),
-      ratio,
-    );
-    // 15% for download, 85% for conversion
-    // This is a very rough estimate, trying to make the progress bar look nice
-    increasePlaylistProgress(ratio * 0.15);
+  try {
+    for await (const chunk of stream) {
+      downloaded += chunk.length;
+      chunks.push(chunk);
+      const ratio = downloaded / contentLength;
+      const progress = Math.floor(ratio * 100);
+      sendFeedback(
+        t('plugins.downloader.backend.feedback.download-progress', {
+          percent: progress,
+        }),
+        ratio,
+      );
+      // 15% for download, 85% for conversion
+      // This is a very rough estimate, trying to make the progress bar look nice
+      increasePlaylistProgress(ratio * 0.15);
+    }
+  } catch (error) {
+    throw error instanceof AudioTransferError
+      ? error
+      : new AudioTransferError('failed', error);
   }
   return chunks;
 }
@@ -424,46 +1049,49 @@ async function iterableStreamToProcessedUint8Array(
   contentLength: number,
   sendFeedback: (str: string, value?: number) => void,
   increasePlaylistProgress: (value: number) => void = () => {},
-): Promise<Uint8Array | null> {
+  owner: DownloaderBinding,
+): Promise<Uint8Array> {
   sendFeedback(t('plugins.downloader.backend.feedback.loading'), 2); // Indefinite progress bar after download
 
   const safeVideoName = randomBytes(32).toString('hex');
+  const safeVideoNameWithExtension = `${safeVideoName}.${extension}`;
 
   return await ffmpegMutex.runExclusive(async () => {
     try {
+      assertCurrentBinding(owner);
       const ffmpegInstance = await ffmpeg.get();
-      if (!ffmpegInstance.isLoaded()) {
-        await ffmpegInstance.load();
-      }
-
-      sendFeedback(t('plugins.downloader.backend.feedback.preparing-file'));
-      ffmpegInstance.FS(
-        'writeFile',
-        safeVideoName,
-        Buffer.concat(
-          await downloadChunks(
-            stream,
-            contentLength,
-            sendFeedback,
-            increasePlaylistProgress,
-          ),
-        ),
-      );
-
-      sendFeedback(t('plugins.downloader.backend.feedback.converting'));
-
-      ffmpegInstance.setProgress(({ ratio }) => {
-        sendFeedback(
-          t('plugins.downloader.backend.feedback.conversion-progress', {
-            percent: Math.floor(ratio * 100),
-          }),
-          ratio,
-        );
-        increasePlaylistProgress(0.15 + (ratio * 0.85));
-      });
-
-      const safeVideoNameWithExtension = `${safeVideoName}.${extension}`;
       try {
+        if (!ffmpegInstance.isLoaded()) {
+          await ffmpegInstance.load();
+        }
+
+        sendFeedback(t('plugins.downloader.backend.feedback.preparing-file'));
+        ffmpegInstance.FS(
+          'writeFile',
+          safeVideoName,
+          Buffer.concat(
+            await downloadChunks(
+              stream,
+              contentLength,
+              sendFeedback,
+              increasePlaylistProgress,
+            ),
+          ),
+        );
+
+        sendFeedback(t('plugins.downloader.backend.feedback.converting'));
+
+        ffmpegInstance.setProgress(({ ratio }) => {
+          sendFeedback(
+            t('plugins.downloader.backend.feedback.conversion-progress', {
+              percent: Math.floor(ratio * 100),
+            }),
+            ratio,
+          );
+          const conversionProgress = ratio * 0.85;
+          increasePlaylistProgress(0.15 + conversionProgress);
+        });
+
         await ffmpegInstance.run(
           '-i',
           safeVideoName,
@@ -471,21 +1099,30 @@ async function iterableStreamToProcessedUint8Array(
           ...getFFmpegMetadataArgs(metadata),
           safeVideoNameWithExtension,
         );
-      } finally {
-        ffmpegInstance.FS('unlink', safeVideoName);
-      }
 
-      sendFeedback(t('plugins.downloader.backend.feedback.saving'));
+        sendFeedback(t('plugins.downloader.backend.feedback.saving'));
 
-      try {
         return ffmpegInstance.FS('readFile', safeVideoNameWithExtension);
       } finally {
-        ffmpegInstance.FS('unlink', safeVideoNameWithExtension);
+        for (const ownedFile of [safeVideoName, safeVideoNameWithExtension]) {
+          try {
+            if (
+              ffmpegInstance.isLoaded() &&
+              ffmpegInstance.FS('readdir', '/').includes(ownedFile)
+            )
+              ffmpegInstance.FS('unlink', ownedFile);
+          } catch (cleanupError) {
+            console.warn(
+              'Could not clean downloader processing file',
+              cleanupError,
+            );
+          }
+        }
       }
     } catch (error: unknown) {
-      sendError(error as Error, safeVideoName);
+      assertCurrentBinding(owner);
+      throw error;
     }
-    return null;
   });
 }
 
@@ -498,6 +1135,7 @@ async function writeID3(
   buffer: Buffer,
   metadata: CustomSongInfo,
   sendFeedback: (str: string, value?: number) => void,
+  owner: DownloaderBinding,
 ) {
   try {
     sendFeedback(t('plugins.downloader.backend.feedback.writing-id3'));
@@ -506,6 +1144,9 @@ async function writeID3(
     // Create the metadata tags
     tags.title = metadata.title;
     tags.artist = metadata.artist;
+    tags.userDefinedText = [
+      { description: 'pear-desktop:youtube-video-id', value: metadata.videoId },
+    ];
 
     if (metadata.album) {
       tags.album = metadata.album;
@@ -529,12 +1170,24 @@ async function writeID3(
 
     return NodeID3.write(tags, buffer);
   } catch (error: unknown) {
-    sendError(error as Error, `${metadata.artist} - ${metadata.title}`);
+    if (isCurrentBinding(owner))
+      sendError(error as Error, `${metadata.artist} - ${metadata.title}`);
     return null;
   }
 }
 
 export async function downloadPlaylist(givenUrl?: string | URL) {
+  const owner = backend;
+  if (!isCurrentBinding(owner)) return;
+  clearErrorFeedback(win);
+  let yt: Innertube;
+  try {
+    yt = await owner.initialization.get();
+    assertCurrentBinding(owner);
+  } catch (error) {
+    if (isCurrentBinding(owner)) sendError(error);
+    return;
+  }
   try {
     givenUrl = new URL(givenUrl ?? '');
   } catch {
@@ -551,7 +1204,9 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
     return;
   }
 
-  const sendFeedback = (message?: unknown) => sendFeedback_(win, message);
+  const sendFeedback = (message?: unknown) => {
+    if (isCurrentBinding(owner)) sendFeedback_(win, message);
+  };
 
   console.log(
     t('plugins.downloader.backend.feedback.trying-to-get-playlist-id', {
@@ -563,6 +1218,7 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
   const items: YTNodes.MusicResponsiveListItem[] = [];
   try {
     playlist = await yt.music.getPlaylist(playlistId);
+    assertCurrentBinding(owner);
     if (playlist?.items) {
       const filteredItems = playlist.items.filter(
         (item): item is YTNodes.MusicResponsiveListItem =>
@@ -572,6 +1228,7 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
       items.push(...filteredItems);
     }
   } catch (error: unknown) {
+    if (!isCurrentBinding(owner)) return;
     sendError(
       Error(
         t('plugins.downloader.backend.feedback.playlist-is-mix-or-private', {
@@ -602,22 +1259,36 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
     'NO_TITLE';
   const isAlbum = !normalPlaylistTitle;
 
-  while (playlist.has_continuation) {
-    playlist = await playlist.getContinuation();
-
-    const filteredItems = playlist.items.filter(
-      (item): item is YTNodes.MusicResponsiveListItem =>
-        item instanceof YTNodes.MusicResponsiveListItem,
-    );
-
-    items.push(...filteredItems);
+  const configuredLimit = config.playlistMaxItems;
+  const limit =
+    typeof configuredLimit === 'number' &&
+    Number.isFinite(configuredLimit) &&
+    configuredLimit >= 1
+      ? Math.floor(configuredLimit)
+      : undefined;
+  try {
+    while (playlist.has_continuation && (!limit || items.length < limit)) {
+      playlist = await playlist.getContinuation();
+      assertCurrentBinding(owner);
+      const filteredItems = playlist.items.filter(
+        (item): item is YTNodes.MusicResponsiveListItem =>
+          item instanceof YTNodes.MusicResponsiveListItem,
+      );
+      items.push(...filteredItems);
+    }
+  } catch (error) {
+    if (isCurrentBinding(owner)) sendError(error);
+    return;
   }
+  // A capped collection remains a playlist/album, including its folder/tags.
+  const naturallySingle = items.length === 1 && !playlist.has_continuation;
+  if (limit) items.splice(limit);
 
-  if (items.length === 1) {
+  if (naturallySingle) {
     sendFeedback(
       t('plugins.downloader.backend.feedback.playlist-has-only-one-song'),
     );
-    await downloadSongFromId(items.at(0)!.id!);
+    await downloadSongFromIdInOperation(items.at(0)!.id!);
     return;
   }
 
@@ -629,7 +1300,10 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
   const folder = getFolder(config.downloadFolder ?? '');
   const playlistFolder = join(folder, safePlaylistTitle);
   if (existsSync(playlistFolder)) {
-    if (!config.skipExisting) {
+    if (
+      !config.skipExisting &&
+      (config.duplicatePolicy ?? 'legacy') === 'legacy'
+    ) {
       sendError(
         new Error(
           t('plugins.downloader.backend.feedback.folder-already-exists', {
@@ -682,13 +1356,16 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
   const progressStep = 1 / items.length;
 
   const increaseProgress = (itemPercentage: number) => {
+    if (!isCurrentBinding(owner)) return;
     const currentProgress = (counter - 1) / (items.length ?? 1);
-    const newProgress = currentProgress + (progressStep * itemPercentage);
+    const itemProgress = progressStep * itemPercentage;
+    const newProgress = currentProgress + itemProgress;
     win.setProgressBar(newProgress);
   };
 
   try {
     for (const song of items) {
+      assertCurrentBinding(owner);
       sendFeedback(
         t('plugins.downloader.backend.feedback.downloading-counter', {
           current: counter,
@@ -696,7 +1373,7 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
         }),
       );
       const trackId = isAlbum ? counter : undefined;
-      await downloadSongFromId(
+      await downloadSongFromIdInOperation(
         song.id!,
         playlistFolder,
         trackId?.toString(),
@@ -713,16 +1390,19 @@ export async function downloadPlaylist(givenUrl?: string | URL) {
         ),
       );
 
-      win.setProgressBar(counter / items.length);
+      assertCurrentBinding(owner);
+      owner.context.window.setProgressBar(counter / items.length);
       setBadge(items.length - counter);
       counter++;
     }
   } catch (error: unknown) {
-    sendError(error as Error);
+    if (isCurrentBinding(owner)) sendError(error as Error);
   } finally {
-    win.setProgressBar(-1); // Close progress bar
-    setBadge(0); // Close badge counter
-    sendFeedback(); // Clear feedback
+    if (isCurrentBinding(owner)) {
+      owner.context.window.setProgressBar(-1); // Close progress bar
+      setBadge(0); // Close badge counter
+      sendFeedback(); // Clear feedback
+    }
   }
 }
 
@@ -735,6 +1415,12 @@ function getFFmpegMetadataArgs(metadata: CustomSongInfo) {
     ...(metadata.title ? ['-metadata', `title=${metadata.title}`] : []),
     ...(metadata.artist ? ['-metadata', `artist=${metadata.artist}`] : []),
     ...(metadata.album ? ['-metadata', `album=${metadata.album}`] : []),
+    ...(metadata.videoId
+      ? [
+          '-metadata',
+          `comment=https://music.youtube.com/watch?v=${metadata.videoId}`,
+        ]
+      : []),
     ...(metadata.trackId ? ['-metadata', `track=${metadata.trackId}`] : []),
   ];
 }
@@ -773,10 +1459,13 @@ const getMetadata = (info: YTMusic.TrackInfo): CustomSongInfo => ({
 });
 
 // This is used to bypass age restrictions
-const getAndroidTvInfo = async (id: string): Promise<YT.VideoInfo> => {
+const getAndroidTvInfo = async (
+  id: string,
+  client: Innertube,
+): Promise<YT.VideoInfo> => {
   // GetInfo 404s with the bypass, so we use getBasicInfo instead
   // that's fine as we only need the streaming data
-  return await yt.getBasicInfo(id, {
+  return await client.getBasicInfo(id, {
     client: 'TV_EMBEDDED',
   });
 };

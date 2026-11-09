@@ -997,6 +997,13 @@
         "visualizer-type": "Typ av visualiserare"
       },
       "name": "Visualiserare"
+    },
+    "adblocker": {
+      "description": "Blockerar annonser och spårning automatiskt",
+      "menu": {
+        "blocker": "Blockerare"
+      },
+      "name": "Annonsblockerare"
     }
   }
 }

@@ -1,0 +1,182 @@
+diff --git a/src/createFFmpeg.js b/src/createFFmpeg.js
+index d175358e4d0849a84e95bb3940917b877dc5f263..1e483cf92354c3883412cb63ede16ebfddc6dbd7 100644
+--- a/src/createFFmpeg.js
++++ b/src/createFFmpeg.js
+@@ -23,6 +23,7 @@ module.exports = (_options = {}) => {
+   let runResolve = null;
+   let runReject = null;
+   let running = false;
++  let coreGeneration = 0;
+   let customLogger = optLogger;
+   let logging = optLog;
+   let progress = optProgress;
+@@ -31,13 +32,69 @@ module.exports = (_options = {}) => {
+   let readFrames = false;
+   let ratio = 0;
+ 
+-  const detectCompletion = (message) => {
+-    if (message === "FFMPEG_END" && runResolve !== null) {
+-      runResolve();
+-      runResolve = null;
+-      runReject = null;
+-      running = false;
++  const detachRun = () => {
++    const pending = { resolve: runResolve, reject: runReject };
++    runResolve = null;
++    runReject = null;
++    running = false;
++    return pending;
++  };
++  const settlePending = ({ resolve, reject }, error, failed = false) => {
++    if (!failed) {
++      if (resolve) resolve();
++    } else if (reject) {
++      reject(error);
++    }
++  };
++  const settleRun = (error, failed = false) => {
++    settlePending(detachRun(), error, failed);
++  };
++  const stopCoreWorkers = (core) => {
++    // Private ABI of the byte-pinned @ffmpeg.wasm/core-mt 0.12.0 only.
++    // Version and all three assets are bound by the worker-stop ABI test.
++    // Never call Core.exit: its WASM destructors can block active teardown.
++    const pool = core && core.PThread;
++    if (
++      !pool ||
++      typeof pool.pd !== "function" ||
++      !Array.isArray(pool.Rb) ||
++      !Array.isArray(pool.Vb) ||
++      !pool.Gb ||
++      typeof pool.Gb !== "object" ||
++      [...pool.Rb, ...pool.Vb, ...Object.values(pool.Gb)].some(
++        (worker) => !worker || typeof worker.terminate !== "function"
++      )
++    ) {
++      const error = new Error("Cannot dispose unsupported ffmpeg core worker pool");
++      error.code = "FFMPEG_UNSUPPORTED_CORE_DISPOSAL";
++      throw error;
++    }
++    try {
++      pool.pd();
++    } catch (cause) {
++      const error = new Error("Could not stop ffmpeg core workers", { cause });
++      error.code = "FFMPEG_CORE_DISPOSAL_FAILED";
++      throw error;
++    }
++  };
++  const terminateCore = (error) => {
++    // Invalidate storage and callbacks before worker stop or settlement.
++    coreGeneration += 1;
++    const oldCore = Core;
++    Core = null;
++    ffmpeg = null;
++    const pending = detachRun();
++    let disposalError;
++    if (oldCore) {
++      try {
++        stopCoreWorkers(oldCore);
++      } catch (err) {
++        disposalError = err;
++        log("info", String(err && err.message ? err.message : err));
++      }
+     }
++    settlePending(pending, disposalError === undefined ? error : disposalError, true);
++    return disposalError;
+   };
+   const log = (type, message) => {
+     customLogger({ type, message });
+@@ -88,7 +145,6 @@ module.exports = (_options = {}) => {
+   const parseMessage = ({ type, message }) => {
+     log(type, message);
+     parseProgress(message, progress);
+-    detectCompletion(message);
+   };
+ 
+   /*
+@@ -105,6 +161,7 @@ module.exports = (_options = {}) => {
+   const load = async () => {
+     log("info", "load ffmpeg-core");
+     if (Core === null) {
++      const generation = ++coreGeneration;
+       log("info", "loading ffmpeg-core");
+       /*
+        * In node environment, all paths are undefined as there
+@@ -112,11 +169,24 @@ module.exports = (_options = {}) => {
+        */
+       const { createFFmpegCore, corePath, workerPath, wasmPath } =
+         await getCreateFFmpegCore(options);
+-      Core = await createFFmpegCore({
++      const loadedCore = await createFFmpegCore({
+         /*
+          * Avoid automatic exit after main is run
+          */
+         noExitRuntime: true,
++        // FFMPEG_END and proxy-main's immediate return precede this status.
++        onExit: (exitCode) => {
++          if (generation !== coreGeneration || !running) return;
++          if (!Number.isInteger(exitCode)) {
++            terminateCore(new Error("ffmpeg returned an invalid exit status"));
++          } else if (exitCode === 0) {
++            settleRun();
++          } else {
++            const error = new Error(`ffmpeg exited with code ${exitCode}`);
++            error.exitCode = exitCode;
++            settleRun(error, true);
++          }
++        },
+         /*
+          * Assign mainScriptUrlOrBlob fixes chrome extension web worker issue
+          * as there is no document.currentScript in the context of content_scripts
+@@ -150,6 +220,11 @@ module.exports = (_options = {}) => {
+           return prefix + path;
+         },
+       });
++      if (generation !== coreGeneration) {
++        stopCoreWorkers(loadedCore);
++        throw new Error("ffmpeg core load was superseded");
++      }
++      Core = loadedCore;
+       ffmpeg = Core.cwrap(
+         options.mainName || "_emscripten_proxy_main",
+         "number",
+@@ -198,7 +273,11 @@ module.exports = (_options = {}) => {
+         const args = [...defaultArgs, ..._args].filter((s) => s.length !== 0);
+         runResolve = resolve;
+         runReject = reject;
+-        ffmpeg(...parseArgs(Core, args));
++        try {
++          ffmpeg(...parseArgs(Core, args));
++        } catch (error) {
++          terminateCore(error);
++        }
+       });
+     }
+   };
+@@ -257,24 +336,8 @@ module.exports = (_options = {}) => {
+     if (Core === null) {
+       throw NO_LOAD;
+     } else {
+-      // if there's any pending runs, reject them
+-      if (runReject) {
+-        runReject("ffmpeg has exited");
+-      }
+-      running = false;
+-      try {
+-        Core.exit(0);
+-      } catch (err) {
+-        log(err.message);
+-        if (runReject) {
+-          runReject(err);
+-        }
+-      } finally {
+-        Core = null;
+-        ffmpeg = null;
+-        runResolve = null;
+-        runReject = null;
+-      }
++      const disposalError = terminateCore("ffmpeg has exited");
++      if (disposalError) throw disposalError;
+     }
+   };
+ 

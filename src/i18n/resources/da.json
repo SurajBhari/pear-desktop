@@ -322,6 +322,13 @@
         "advanced": "Avanceret"
       },
       "name": "Fade [Beta]"
+    },
+    "adblocker": {
+      "description": "Bloker alle reklamer og sporing fra starten af",
+      "menu": {
+        "blocker": "Bloker"
+      },
+      "name": "Bloker reklamer"
     }
   }
 }

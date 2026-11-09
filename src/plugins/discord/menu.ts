@@ -101,6 +101,14 @@ export const onMenu = async ({
       },
     },
     {
+      label: t('plugins.discord.menu.show-artist-image'),
+      type: 'checkbox',
+      checked: config.showArtistImage === true,
+      click(item: Electron.MenuItem) {
+        setConfig({ showArtistImage: item.checked });
+      },
+    },
+    {
       label: t('plugins.discord.menu.set-inactivity-timeout'),
       click: () => setInactivityTimeout(window, config),
     },

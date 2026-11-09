@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file. Dates are displayed in UTC.
 
+#### [v3.13.0](https://github.com/deruta74/pear-desktop/compare/v3.12.1...v3.13.0)
+
+> 7 October 2026
+
+- Add Player Actions: slowed playback, reverb, section repeat and saved loops [#21](https://github.com/deruta74/pear-desktop/pull/21).
+- Add the Always Show Volume Slider plugin [#19](https://github.com/deruta74/pear-desktop/pull/19) and use the player API for volume writes [#18](https://github.com/deruta74/pear-desktop/pull/18).
+- Update vulnerable runtime/API dependencies and guard malformed WebSocket upgrades [#13](https://github.com/deruta74/pear-desktop/pull/13).
+- Isolate plugin player-API readiness failures [#14](https://github.com/deruta74/pear-desktop/pull/14), dispose Navigation controls on disable [#15](https://github.com/deruta74/pear-desktop/pull/15), and remove redundant Ambient Mode canvas pixel readbacks [#16](https://github.com/deruta74/pear-desktop/pull/16).
+- Repair MusixMatch matching and token refresh [#20](https://github.com/deruta74/pear-desktop/pull/20); fence lyrics requests and release renderer resources on stop/remount [#25](https://github.com/deruta74/pear-desktop/pull/25).
+- Give fresh API profiles loopback binding and a persisted random secret while preserving existing settings [#24](https://github.com/deruta74/pear-desktop/pull/24).
+- Initialize downloader clients lazily with session ownership; fix empty destinations and actual playlist caps, including capped-one album folders [#26](https://github.com/deruta74/pear-desktop/pull/26).
+- Preserve paused position when restoring media [#23](https://github.com/deruta74/pear-desktop/pull/23), expand cross-platform/native startup regression coverage [#17](https://github.com/deruta74/pear-desktop/pull/17) [#22](https://github.com/deruta74/pear-desktop/pull/22), and update fork documentation [#12](https://github.com/deruta74/pear-desktop/pull/12).
+- Include nested NSIS web assets in release staging [#11](https://github.com/deruta74/pear-desktop/pull/11) and keep upstream Winget automation disabled for fork releases.
+
+Upstream contributions adapted: [@bonkedbythonk](https://github.com/bonkedbythonk) [#4661](https://github.com/pear-devs/pear-desktop/pull/4661) [#4665](https://github.com/pear-devs/pear-desktop/pull/4665); [@Angry3vilbot](https://github.com/Angry3vilbot) [#4650](https://github.com/pear-devs/pear-desktop/pull/4650); [@Chaganti-Reddy](https://github.com/Chaganti-Reddy) [#4574](https://github.com/pear-devs/pear-desktop/pull/4574); [@aashish254](https://github.com/aashish254) [#4716](https://github.com/pear-devs/pear-desktop/pull/4716); [@nathwn12](https://github.com/nathwn12) [#4700](https://github.com/pear-devs/pear-desktop/pull/4700); [@maseckt](https://github.com/maseckt), selected provider/API/lyrics/downloader directions from [#4734](https://github.com/pear-devs/pear-desktop/pull/4734); [@xToast-dev](https://github.com/xToast-dev), selected folder/cap/preset directions from [#4705](https://github.com/pear-devs/pear-desktop/pull/4705). These are bounded adaptations, not wholesale upstream patch imports. Dependency proposals [#4608](https://github.com/pear-devs/pear-desktop/pull/4608) [#4628](https://github.com/pear-devs/pear-desktop/pull/4628) [#4636](https://github.com/pear-devs/pear-desktop/pull/4636) came from the [Renovate bot](https://github.com/apps/renovate); fork-specific fixes, integration and tests remain fork work.
+
+Age bypass remains disabled by default and experimental; anonymous age-restricted playback is unavailable.
+
+#### [v3.12.1](https://github.com/deruta74/pear-desktop/compare/v3.12.0...v3.12.1)
+
+> 6 October 2026
+
+- fix(plugin): release renderer styles on disable [#1](https://github.com/deruta74/pear-desktop/pull/1)
+- feature(plugin): restore removed 3.11 plugins [#2](https://github.com/deruta74/pear-desktop/pull/2)
+- perf(renderer): reduce JSON namespace allocations [#3](https://github.com/deruta74/pear-desktop/pull/3)
+- fix(lyrics): restore Korean romanization [#4](https://github.com/deruta74/pear-desktop/pull/4)
+- fix(api): backfill current song and release subscriptions [#5](https://github.com/deruta74/pear-desktop/pull/5)
+- fix(downloader): keep background errors nonmodal [#6](https://github.com/deruta74/pear-desktop/pull/6)
+- fix(api-server): refresh volume state across player startup [#7](https://github.com/deruta74/pear-desktop/pull/7)
+- perf(synced-lyrics): defer pinyin and guard late text updates [#8](https://github.com/deruta74/pear-desktop/pull/8)
+- fix(api-server): refresh repeat state across player startup [#9](https://github.com/deruta74/pear-desktop/pull/9)
+- chore(release): prepare v3.12.1 packages and fork update routing.
+
+Age bypass remains disabled by default and experimental; anonymous age-restricted playback is unavailable.
+
 #### [v3.12.0](https://github.com/pear-devs/pear-desktop/compare/v3.12.0...v3.12.0)
 
 #### [v3.12.0](https://github.com/pear-devs/pear-desktop/compare/v3.11.4...v3.12.0)

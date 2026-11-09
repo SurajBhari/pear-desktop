@@ -1,49 +1,43 @@
-import { contextBridge, webFrame, type BrowserWindow } from 'electron';
+import { net } from 'electron';
+import * as z from 'zod';
 
 import { t } from '@/i18n';
+import { createBlockerBackend } from '@/providers/blocker-backend';
+import { createBlockerPreload } from '@/providers/blocker-preload';
+import {
+  applyPendingBlockerDocument,
+  getBlockerDocumentStatus,
+  isBlockerDocumentApplying,
+  setBlockerDocumentMenuRefresh,
+} from '@/providers/blocker-scene-main';
 import { createPlugin } from '@/utils';
 
-import {
-  isBlockerEnabled,
-  loadTrackerBlockerEngine,
-  unloadTrackerBlockerEngine,
-} from './blocker';
-import { inject, isInjected } from './injectors/inject';
-import injectCliqzPreload from './injectors/inject-cliqz-preload';
 import { blockers } from './types';
 
-export interface TrackerBlockerConfig {
-  /**
-   * Whether to enable the tracker blocker.
-   * @default true
-   */
-  enabled: boolean;
-  /**
-   * When enabled, the tracker blocker will cache the blocklists.
-   * @default true
-   */
-  cache: boolean;
-  /**
-   * Which tracker blocker to use.
-   * @default blockers.InPlayer
-   */
-  blocker: (typeof blockers)[keyof typeof blockers];
-  /**
-   * Additional list of filters to use.
-   * @example ["https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"]
-   * @default []
-   */
-  additionalBlockLists: string[];
-  /**
-   * Disable the default blocklists.
-   * @default false
-   */
-  disableDefaultLists: boolean;
-}
+import type { AdblockerConfig } from '@/plugins/adblocker/types';
+
+export type TrackerBlockerConfig = AdblockerConfig;
+
+const reloadNotice = () =>
+  t('plugins.adblocker.apply-notice', {
+    defaultValue:
+      'Network filters apply immediately. Supported playback is preserved automatically; unsupported scenes show pending document changes.',
+  });
+
+const defaultLists = async (): Promise<string[]> => {
+  const response = await net.fetch(
+    'https://raw.githubusercontent.com/organization/tb-list/refs/heads/main/tb.json',
+    { signal: AbortSignal.timeout(15_000) },
+  );
+  if (!response.ok)
+    throw new Error(`Tracker list manifest returned ${response.status}`);
+  return z.object({ tb: z.array(z.string()) }).parse(await response.json()).tb;
+};
 
 export default createPlugin({
   name: () => t('plugins.do-not-track.name'),
-  description: () => t('plugins.do-not-track.description'),
+  description: () =>
+    `${t('plugins.do-not-track.description')} ${reloadNotice()}`,
   restartNeeded: false,
   config: {
     enabled: false,
@@ -52,88 +46,51 @@ export default createPlugin({
     additionalBlockLists: [],
     disableDefaultLists: false,
   } as TrackerBlockerConfig,
-  menu: async ({ getConfig, setConfig }) => {
+  menu: async ({ getConfig, setConfig, window, refresh }) => {
     const config = await getConfig();
-
+    setBlockerDocumentMenuRefresh(window.webContents, 'do-not-track', refresh);
+    const status = getBlockerDocumentStatus(window.webContents);
     return [
       {
         label: t('plugins.do-not-track.menu.blocker'),
-        submenu: Object.values(blockers).map((blocker) => ({
-          label: blocker,
-          type: 'radio',
-          checked: (config.blocker || blockers.WithBlocklists) === blocker,
-          click() {
-            setConfig({ blocker });
+        submenu: [
+          ...Object.values(blockers).map((blocker) => ({
+            label: blocker,
+            type: 'radio' as const,
+            checked: config.blocker === blocker,
+            click: async () => {
+              await setConfig({ blocker });
+            },
+          })),
+          { type: 'separator' as const },
+          { label: reloadNotice(), enabled: false },
+          {
+            label:
+              status.reason ??
+              t('plugins.adblocker.applied', {
+                defaultValue: 'Document effects are applied',
+              }),
+            enabled: false,
           },
-        })),
+          {
+            label: t('plugins.adblocker.apply-document', {
+              defaultValue:
+                'Apply document changes — reload; generated recommendations can refresh',
+            }),
+            enabled:
+              !isBlockerDocumentApplying(window.webContents) &&
+              (status.kind === 'pending' ||
+                status.kind === 'failed' ||
+                status.kind === 'cancelled'),
+            click: async () => {
+              await applyPendingBlockerDocument(window.webContents);
+              await refresh();
+            },
+          },
+        ],
       },
     ];
   },
-  backend: {
-    mainWindow: null as BrowserWindow | null,
-    async start({ getConfig, window }) {
-      const config = await getConfig();
-      this.mainWindow = window;
-
-      if (config.blocker === blockers.WithBlocklists) {
-        await loadTrackerBlockerEngine(
-          window.webContents.session,
-          config.cache,
-          config.additionalBlockLists,
-          config.disableDefaultLists,
-        );
-      }
-    },
-    stop({ window }) {
-      if (isBlockerEnabled(window.webContents.session)) {
-        unloadTrackerBlockerEngine(window.webContents.session);
-      }
-    },
-    async onConfigChange(newConfig) {
-      if (this.mainWindow) {
-        if (
-          newConfig.blocker === blockers.WithBlocklists &&
-          !isBlockerEnabled(this.mainWindow.webContents.session)
-        ) {
-          await loadTrackerBlockerEngine(
-            this.mainWindow.webContents.session,
-            newConfig.cache,
-            newConfig.additionalBlockLists,
-            newConfig.disableDefaultLists,
-          );
-        }
-      }
-    },
-  },
-  preload: {
-    // see #1478
-    script: `const _prunerFn = window._pruner;
-    window._pruner = undefined;
-    JSON.parse = new Proxy(JSON.parse, {
-      apply() {
-        return _prunerFn(Reflect.apply(...arguments));
-      },
-    });
-    Response.prototype.json = new Proxy(Response.prototype.json, {
-      apply() {
-        return Reflect.apply(...arguments).then((o) => _prunerFn(o));
-      },
-    }); 0`,
-    async start({ getConfig }) {
-      const config = await getConfig();
-
-      if (config.blocker === blockers.InPlayer && !isInjected()) {
-        inject(contextBridge);
-        await webFrame.executeJavaScript(this.script);
-      } else if (config.blocker === blockers.WithBlocklists) {
-        await injectCliqzPreload();
-      }
-    },
-    async onConfigChange(newConfig) {
-      if (newConfig.blocker === blockers.InPlayer && !isInjected()) {
-        inject(contextBridge);
-        await webFrame.executeJavaScript(this.script);
-      }
-    },
-  },
+  backend: createBlockerBackend('do-not-track', defaultLists),
+  preload: createBlockerPreload('do-not-track'),
 });

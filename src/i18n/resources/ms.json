@@ -710,6 +710,13 @@
       "templates": {
         "button-song": "Lagu"
       }
+    },
+    "adblocker": {
+      "description": "Sekat semua iklan dan penjejakan di luar kotak",
+      "menu": {
+        "blocker": "Penyekat"
+      },
+      "name": "Penyekat Iklan"
     }
   }
 }

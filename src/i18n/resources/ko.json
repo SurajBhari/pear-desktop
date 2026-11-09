@@ -997,6 +997,13 @@
         "visualizer-type": "비주얼라이저 타입"
       },
       "name": "비주얼라이저"
+    },
+    "adblocker": {
+      "description": "모든 광고와 트래커를 즉시 차단합니다",
+      "menu": {
+        "blocker": "광고 차단 타입"
+      },
+      "name": "광고 차단기"
     }
   }
 }

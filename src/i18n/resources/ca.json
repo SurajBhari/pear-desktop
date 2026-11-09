@@ -997,6 +997,13 @@
         "visualizer-type": "Tipus de visualitzador"
       },
       "name": "Visualitzador"
+    },
+    "adblocker": {
+      "description": "Bloqueja tots els anuncis i el seguiment",
+      "menu": {
+        "blocker": "Bloquejador"
+      },
+      "name": "Bloquejador d'anuncis"
     }
   }
 }

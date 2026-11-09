@@ -1,4 +1,7 @@
+import prompt from 'custom-electron-prompt';
+
 import { t } from '@/i18n';
+import promptOptions from '@/providers/prompt-options';
 
 import { providerNames } from './providers';
 
@@ -10,8 +13,149 @@ export const menu = async (
   ctx: MenuContext<SyncedLyricsPluginConfig>,
 ): Promise<MenuItemConstructorOptions[]> => {
   const config = await ctx.getConfig();
+  let confirmedExport = config.enableDownload !== false;
+  let requestedExport = confirmedExport;
+  let requestId = 0;
+  let pendingWrite: Promise<void> = Promise.resolve();
+
+  const updateExportVisibility = (item?: { checked?: boolean }) => {
+    const enabled =
+      typeof item?.checked === 'boolean' ? item.checked : !requestedExport;
+    const thisRequest = ++requestId;
+    requestedExport = enabled;
+
+    const write = async (): Promise<boolean> => {
+      try {
+        await ctx.setConfig({ enableDownload: enabled });
+        confirmedExport = enabled;
+        if (thisRequest === requestId) {
+          requestedExport = enabled;
+          if (item) item.checked = enabled;
+        }
+      } catch (writeError) {
+        let persisted = confirmedExport;
+        let readError: unknown;
+        try {
+          persisted = (await ctx.getConfig()).enableDownload !== false;
+          confirmedExport = persisted;
+        } catch (error) {
+          readError = error;
+        }
+
+        if (thisRequest === requestId) {
+          requestedExport = persisted;
+          if (item) item.checked = persisted;
+        }
+
+        try {
+          await ctx.refresh();
+        } catch (error) {
+          console.error(
+            '[synced-lyrics] Failed to refresh menu after export preference rejection',
+            error,
+          );
+        }
+        console.error(
+          '[synced-lyrics] Failed to save export visibility preference',
+          writeError,
+        );
+        if (readError !== undefined)
+          console.error(
+            '[synced-lyrics] Failed to read export visibility preference after rejection',
+            readError,
+          );
+        return false;
+      }
+
+      try {
+        await ctx.refresh();
+      } catch (error) {
+        console.error(
+          '[synced-lyrics] Failed to refresh menu after saving export preference',
+          error,
+        );
+      }
+      return true;
+    };
+
+    const operation = pendingWrite.then(write, write);
+    pendingWrite = operation.then(
+      () => {},
+      () => {},
+    );
+    return operation;
+  };
 
   return [
+    {
+      label: t('plugins.synced-lyrics.menu.direct-ytmusic.label'),
+      toolTip: t('plugins.synced-lyrics.menu.direct-ytmusic.tooltip'),
+      type: 'checkbox',
+      checked: config.useYTMLyricsWithoutProxy === true,
+      click(item) {
+        if (ctx.window.isDestroyed()) return;
+        return ctx.setConfig({
+          useYTMLyricsWithoutProxy: item.checked === true,
+        });
+      },
+    },
+    {
+      label: t('plugins.synced-lyrics.tools.offset'),
+      async click() {
+        const current = await ctx.getConfig();
+        if (ctx.window.isDestroyed()) return;
+        const output: unknown = await prompt(
+          {
+            title: t('plugins.synced-lyrics.tools.offset'),
+            label: t('plugins.synced-lyrics.tools.offset-help'),
+            type: 'counter',
+            value: String(current.timingOffsetMs ?? 0),
+            counterOptions: {
+              minimum: -30000,
+              maximum: 30000,
+              multiFire: true,
+            },
+            ...promptOptions(),
+          },
+          ctx.window,
+        );
+        if (
+          ctx.window.isDestroyed() ||
+          output === null ||
+          output === undefined ||
+          (typeof output !== 'number' && typeof output !== 'string') ||
+          (typeof output === 'string' && !output.trim())
+        )
+          return;
+        const value = Number(output);
+        if (Number.isFinite(value) && Math.abs(value) <= 30000)
+          await ctx.setConfig({ timingOffsetMs: value });
+      },
+    },
+    {
+      label: t('plugins.synced-lyrics.tools.romanization-size'),
+      type: 'submenu',
+      submenu: [50, 70, 100, 125].map((size) => ({
+        label: `${size}%`,
+        type: 'radio' as const,
+        checked: (config.romanizationSizePercent ?? 70) === size,
+        click: () => ctx.setConfig({ romanizationSizePercent: size }),
+      })),
+    },
+    {
+      label: t('plugins.synced-lyrics.tools.show-export.label'),
+      toolTip: t('plugins.synced-lyrics.tools.show-export.tooltip'),
+      type: 'checkbox',
+      checked: config.enableDownload !== false,
+      click: updateExportVisibility,
+    },
+    {
+      label: t('plugins.synced-lyrics.tools.enhanced-lrc'),
+      toolTip: t('plugins.synced-lyrics.tools.enhanced-lrc-help'),
+      type: 'checkbox',
+      checked: config.enhancedLrc === true,
+      click: (item) => ctx.setConfig({ enhancedLrc: item.checked }),
+    },
     {
       label: t('plugins.synced-lyrics.menu.preferred-provider.label'),
       toolTip: t('plugins.synced-lyrics.menu.preferred-provider.tooltip'),
@@ -118,29 +262,6 @@ export const menu = async (
           },
         },
       ],
-    },
-    {
-      label: t('plugins.synced-lyrics.menu.default-text-string.label'),
-      toolTip: t('plugins.synced-lyrics.menu.default-text-string.tooltip'),
-      type: 'submenu',
-      submenu: [
-        { label: '♪', value: '♪' },
-        { label: '" "', value: ' ' },
-        { label: '...', value: ['.', '..', '...'] },
-        { label: '•••', value: ['•', '••', '•••'] },
-        { label: '———', value: '———' },
-      ].map(({ label, value }) => ({
-        label,
-        type: 'radio',
-        checked:
-          typeof value === 'string'
-            ? config.defaultTextString === value
-            : JSON.stringify(config.defaultTextString) ===
-              JSON.stringify(value),
-        click() {
-          ctx.setConfig({ defaultTextString: value });
-        },
-      })),
     },
     {
       label: t('plugins.synced-lyrics.menu.romanization.label'),

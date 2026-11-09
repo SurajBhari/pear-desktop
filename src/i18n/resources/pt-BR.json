@@ -997,6 +997,13 @@
         "visualizer-type": "Tipo de visualizador"
       },
       "name": "Visualizador"
+    },
+    "adblocker": {
+      "description": "Bloqueio de todos os anúncios e rastreamentos imediatamente",
+      "menu": {
+        "blocker": "Bloqueador"
+      },
+      "name": "Bloqueador de Anúncios"
     }
   }
 }
