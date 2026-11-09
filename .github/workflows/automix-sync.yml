@@ -1,8 +1,13 @@
 name: Sync AutoMix on deruta
 
-# Keeps automix-on-deruta (PR #3) = deruta74/master + our AutoMix branch.
+# Keeps automix-deruta-build (PR #6) = deruta74/master + our AutoMix branch,
+# and deruta-master (PR #6's base) = deruta74/master. Any change on either
+# side lands on automix-deruta-build, which starts PR #6's Windows build.
+#
 # Pushes use a deploy key so the push starts the PR's build workflows;
-# pushes made with GITHUB_TOKEN would not.
+# pushes made with GITHUB_TOKEN would not. Nothing is ever pushed to
+# claude/apple-music-auto-mix-plugin-ikpv6k: it is the head of
+# pear-devs/pear-desktop#4749.
 
 on:
   schedule:
@@ -12,6 +17,11 @@ on:
 permissions: {}
 
 concurrency: automix-sync
+
+env:
+  BUILD_BRANCH: automix-deruta-build
+  BASE_BRANCH: deruta-master
+  AUTOMIX_BRANCH: claude/apple-music-auto-mix-plugin-ikpv6k
 
 jobs:
   sync:
@@ -27,26 +37,64 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         if: env.HAS_KEY == 'true'
         with:
-          ref: automix-on-deruta
+          ref: ${{ env.BUILD_BRANCH }}
           fetch-depth: 0
           ssh-key: ${{ secrets.AUTOMIX_SYNC_KEY }}
+
+      - name: Install pnpm
+        if: env.HAS_KEY == 'true'
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 11
+          run_install: false
+
+      - name: Setup NodeJS
+        if: env.HAS_KEY == 'true'
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: 24.x
 
       - name: Merge and push
         if: env.HAS_KEY == 'true'
         run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch --no-tags https://github.com/deruta74/pear-desktop.git master:refs/remotes/deruta/master
-          git fetch --no-tags origin claude/apple-music-auto-mix-plugin-ikpv6k:refs/remotes/origin/automix
+          git fetch --no-tags origin "$AUTOMIX_BRANCH:refs/remotes/origin/automix"
 
           # PR base mirrors deruta74/master
-          git push --force origin refs/remotes/deruta/master:refs/heads/deruta-upstream
+          git push --force origin refs/remotes/deruta/master:refs/heads/$BASE_BRANCH
+
+          # Merge one side in. A conflict only in pnpm-lock.yaml is settled by
+          # keeping deruta74's lock; the refresh below adds our dependencies.
+          merge() {
+            local ref=$1 message=$2
+            if git merge --no-edit -m "$message" "$ref"; then return; fi
+            local conflicts
+            conflicts=$(git diff --name-only --diff-filter=U)
+            if [ "$conflicts" != "pnpm-lock.yaml" ]; then
+              echo "::error::Merging $ref conflicts in: $conflicts"
+              git merge --abort
+              exit 1
+            fi
+            git checkout deruta/master -- pnpm-lock.yaml
+            git commit --no-edit -m "$message"
+          }
 
           before=$(git rev-parse HEAD)
-          git merge --no-edit -m "Merge deruta74/master into automix-on-deruta" deruta/master
-          git merge --no-edit -m "Merge claude/apple-music-auto-mix-plugin-ikpv6k into automix-on-deruta" origin/automix
+          merge deruta/master "Merge deruta74/master into $BUILD_BRANCH"
+          merge origin/automix "Merge $AUTOMIX_BRANCH into $BUILD_BRANCH"
+
+          # Bring the lock in line with the merged package.json, so the
+          # frozen install in the PR build can't fail on it.
+          pnpm install --lockfile-only --no-frozen-lockfile --ignore-scripts
+          if ! git diff --quiet -- pnpm-lock.yaml; then
+            git commit -m "chore: refresh pnpm-lock.yaml after sync" -- pnpm-lock.yaml
+          fi
+
           if [ "$(git rev-parse HEAD)" != "$before" ]; then
-            git push origin HEAD:automix-on-deruta
+            git push origin "HEAD:$BUILD_BRANCH"
           else
             echo "Already up to date"
           fi
