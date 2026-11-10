@@ -74,10 +74,10 @@ export default createPlugin({
         click: (item) => setConfig({ cutEcho: item.checked }),
       },
       {
-        label: t('plugins.automix.menu.cut-drop'),
+        label: t('plugins.automix.menu.dj-handoffs'),
         type: 'checkbox',
-        checked: config.cutDrop,
-        click: (item) => setConfig({ cutDrop: item.checked }),
+        checked: config.djHandoffs,
+        click: (item) => setConfig({ djHandoffs: item.checked }),
       },
       {
         label: t('plugins.automix.menu.effects'),

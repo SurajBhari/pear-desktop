@@ -12,10 +12,10 @@ import { t } from '@/i18n';
 
 import {
   EFFECT_DEFAULTS,
-  effectById,
   effectName,
   laneTimes,
   laneValue,
+  styleOf,
   withBassSwap,
   type EffectParam,
   type Lane,
@@ -75,12 +75,11 @@ const laneLevel = (
 const levelsAt = (plan: TransitionPlan, time: number) => {
   const x = time - plan.mixOut;
   const d = Math.max(0.05, plan.duration);
-  // A drop's silence: the old song stops a beat or two before the downbeat
-  if (x < 0) return { out: plan.drop && x >= -plan.drop.gap ? 0 : 1, in: 0 };
+  if (x < 0) return { out: 1, in: 0 };
   const sine = Math.sin((Math.min(1, x / d) * Math.PI) / 2);
   const cosine = Math.cos((Math.min(1, x / d) * Math.PI) / 2);
   const ring = (after: number) => Math.exp(-after / (ENDING_RING / 4));
-  const style = plan.style === 'blend' ? effectById(plan.effect) : undefined;
+  const style = styleOf(plan);
   if (style) {
     return {
       out: x > d + 0.1 ? 0 : laneLevel(style.outgoing, 'gain', x, d, 1),
@@ -88,11 +87,8 @@ const levelsAt = (plan: TransitionPlan, time: number) => {
     };
   }
   switch (plan.style) {
-    case 'cut': {
-      const drop = plan.drop;
-      if (!drop || x >= drop.ease) return { out: 0, in: 1 };
-      return { out: 0, in: drop.boost + ((1 - drop.boost) * (x / drop.ease)) };
-    }
+    case 'cut':
+      return { out: 0, in: 1 };
     case 'segue':
       return { out: Math.exp(-x / (d / 4)), in: 1 };
     default:
@@ -126,7 +122,10 @@ const filterGains = (
   let lowpass = 20_000;
   let highpass = 10;
   let bassDb = 0;
-  const style = plan.style === 'blend' ? effectById(plan.effect) : undefined;
+  // A hand-off's isolator (24 dB/oct, so twice a 2nd-order filter's cut)
+  let lowCut = 10;
+  let highCut = 20_000;
+  const style = styleOf(plan);
   const swap = plan.bassSwapAt ?? [0.45, 0.55];
   const shelf = (fromDb: number, toDb: number) =>
     x <= swap[0] * d ? fromDb : x >= swap[1] * d ? toDb
@@ -134,10 +133,12 @@ const filterGains = (
   if (style) {
     const lanes = withBassSwap(style, plan.bassSwapAt)[side === 'out' ? 'outgoing' : 'incoming'];
     const at = (param: EffectParam) => laneLevel(lanes, param, Math.max(0, x), d, EFFECT_DEFAULTS[param]);
-    if (x >= 0) {
+    if (x >= -(style.preroll ?? 0)) {
       lowpass = at('lowpass');
       highpass = at('highpass');
       bassDb = at('bass');
+      lowCut = at('lowCut');
+      highCut = at('highCut');
     } else if (side === 'in') {
       bassDb = at('bass');
     }
@@ -160,12 +161,13 @@ const filterGains = (
       highpass = sweep(x, 0, plan.holdOutgoing ? d : 0.7 * d, 500, 20);
     }
   } else if (plan.style === 'cut' && side === 'out') {
-    const stop = -(plan.drop?.gap ?? 0);
-    highpass = sweep(x, stop - (4 * (plan.beat || 0.5)), stop, 20, 900);
+    highpass = sweep(x, -4 * (plan.beat || 0.5), 0, 20, 900);
   }
   const gain = (band: Band) =>
     lowpassGain(BAND_HZ[band], lowpass) *
     highpassGain(BAND_HZ[band], highpass) *
+    (lowpassGain(BAND_HZ[band], highCut) ** 2) *
+    (highpassGain(BAND_HZ[band], lowCut) ** 2) *
     (band === 'low' ? 10 ** (bassDb / 20) : 1);
   return { low: gain('low'), mid: gain('mid'), high: gain('high') };
 };

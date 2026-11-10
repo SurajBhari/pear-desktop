@@ -4,6 +4,7 @@ import {
   pickSpotifyEffect,
   CROSSFADE_REVERB,
 } from './effects';
+import { planHandoff } from './handoff';
 import { keysClash } from './key';
 
 import type { TempoSection, TrackAnalysis } from './analysis';
@@ -26,7 +27,9 @@ export type TransitionReason =
   | 'fallback'
   | 'late-change'
   | 'key-clash'
-  | 'beat-only-cut';
+  | 'beat-only-cut'
+  | 'pickup-handoff'
+  | 'outro-swap';
 
 export interface PlannerOptions {
   preference: TransitionPreference;
@@ -59,22 +62,36 @@ export interface PlannerOptions {
    */
   asap?: boolean;
   /**
-   * Beat cuts drop the next song in like a DJ: a beat or two of silence
-   * before the downbeat, then the next song lands past its intro, a little
-   * louder, and settles back to its own level
+   * DJ hand-offs: both songs at full level, mixed only by handing the low
+   * end from one to the other on a bar line, and never two vocals at once.
+   * Used whenever both songs have a beat to lock and a hand-off fits
    */
-  drop?: boolean;
+  handoffs?: boolean;
+  /** Seconds of the next song decoded for mixing (our copy can't go past it) */
+  headSeconds?: number;
 }
 
-/** How a dropped beat cut lands (see PlannerOptions.drop) */
-export interface DropShape {
-  /** Seconds of silence before the downbeat (the old song stops early) */
-  gap: number;
-  /** Level the next song lands at, settling back to 1 */
-  boost: number;
-  /** Seconds it takes to settle back to its own level */
-  ease: number;
-}
+/**
+ * A DJ hand-off (see handoff.ts). Fractions are of the transition window.
+ * - pickup: the old song is cut at the end of its breakdown, the next one's
+ *   pickup fills the bar after (gap), then for one bar the old song's kick
+ *   and bass carry the next one's top end (overlap), then the basses swap
+ *   and the new bass lands hot, easing back over the rest of the window
+ * - outro: the next song's intro plays under the old song's outro at full
+ *   level, the basses swap half way, the old song stops on its last beat
+ */
+export type HandoffRecipe =
+  | {
+      kind: 'pickup';
+      gapBars: number;
+      overlapBars: number;
+      decayBars: number;
+      /** Old song's bass lift while it carries the beat, dB */
+      liftDb: number;
+      /** New song's low shelf when its bass lands, dB, easing to 0 */
+      shelfDb: number;
+    }
+  | { kind: 'outro'; bars: number };
 
 export interface TransitionPlan {
   style: TransitionStyle;
@@ -101,8 +118,8 @@ export interface TransitionPlan {
    * only arrives after the usual swap (measured from the audio)
    */
   bassSwapAt?: [number, number];
-  /** A beat cut dropped in after a moment of silence, landing louder */
-  drop?: DropShape;
+  /** A DJ hand-off rather than a fade (see HandoffRecipe) */
+  recipe?: HandoffRecipe;
   /** Bring the incoming song in high-passed, opening up as it fades in */
   filterIn?: boolean;
   /** Camelot keys at the mix point, when detected (e.g. "8A") */
@@ -160,6 +177,14 @@ const SEGUE_MAX_WAIT = 8;
 const LEAD_IN_MIN = 1.5;
 const LEAD_IN_MAX = 5;
 const LEAD_IN_DEFAULT = 3;
+
+/** Our own grid must be at least this sure for a hand-off's hard switches */
+const HANDOFF_TEMPO_CONFIDENCE = 0.6;
+/** Seconds of the next song decoded for mixing, unless told otherwise */
+const HEAD_SECONDS_DEFAULT = 60;
+/** Effect ids the hand-offs are shown under (see effects.ts) */
+export const PICKUP_HANDOFF_ID = 201;
+export const OUTRO_SWAP_ID = 202;
 
 /** Both songs need a clearly steady beat before they get a DJ-style blend */
 export const DJ_TEMPO_CONFIDENCE = 0.45;
@@ -376,42 +401,6 @@ const entryPoint = (track: TrackAnalysis) => {
   return grid.find((time) => time >= audible) ?? track.leadingSilenceEnd;
 };
 
-/** Beats of silence before a dropped cut lands */
-const DROP_GAP_BEATS = 2;
-/** Longest silence before a drop, for slow songs */
-const DROP_GAP_MAX = 1.2;
-/** How much louder a dropped song lands */
-const DROP_BOOST_DB = 2;
-/** Bars it takes a dropped song to settle back to its own level */
-const DROP_EASE_BARS = 2;
-/**
- * Latest a drop may land in the next song: only its first minute is decoded
- * for mixing, and our copy plays until it has settled
- */
-const DROP_ENTRY_LIMIT = 40;
-
-/**
- * Where to drop into the next song: past a quiet intro, on the first
- * phrase (else bar) where it plays at full strength with its bass in, as
- * long as no vocal line is cut into. The song's first bar when its intro is
- * short, it never gets going in time, or every spot lands mid-line.
- */
-const dropEntry = (track: TrackAnalysis) => {
-  const start = entryPoint(track);
-  const bar = track.beatPeriod * BAR_BEATS;
-  const body = Math.max(track.introEnd, track.bassEntry ?? 0);
-  if (!bar || body - start < 2 * bar) return start;
-  const from = body - (bar / 2);
-  const to = Math.min(body + (4 * bar), DROP_ENTRY_LIMIT);
-  const singing = (time: number) =>
-    track.vocals?.some(
-      (region) => region.start < time - 0.1 && region.end > time + 0.1,
-    ) ?? false;
-  const pick = (grid: number[]) =>
-    grid.find((time) => time >= from && time <= to && !singing(time));
-  return pick(track.phrases ?? []) ?? pick(track.downbeats) ?? start;
-};
-
 /** The last hit of a song that stops on the beat, if the grid reaches it */
 const finalHit = (track: TrackAnalysis) => {
   const last = track.beats.at(-1);
@@ -626,18 +615,14 @@ const planCut = (
         limit,
       ) ?? latestGridPoint(from.beats, options.earliestMixOut, limit));
   if (mixOut === undefined) return null;
-  // A drop stops the old song a beat or two before the downbeat
-  const gap = options.drop
-    ? Math.min(from.beatPeriod * DROP_GAP_BEATS, DROP_GAP_MAX)
-    : 0;
   // Never cut a line off mid-way: wait for the first downbeat (else beat)
   // after it, as long as that's still before the song ends
-  const cutAt = mixOut - gap;
+  const cutAt = mixOut;
   const line = from.vocals?.find(
     (region) => region.start < cutAt && region.end > cutAt + 0.1,
   );
   const after = (grid: number[]) =>
-    line && grid.find((time) => time - gap >= line.end && time <= end);
+    line && grid.find((time) => time >= line.end && time <= end);
   const afterLine = after(from.downbeats) ?? after(from.beats) ?? undefined;
   if (afterLine !== undefined) mixOut = afterLine;
 
@@ -645,16 +630,7 @@ const planCut = (
     style: 'cut',
     reason: 'fallback',
     mixOut,
-    mixIn: options.drop
-      ? dropEntry(to)
-      : (vocalEntry(to, entryPoint(to), 0) ?? entryPoint(to)),
-    drop: options.drop
-      ? {
-          gap,
-          boost: 10 ** (DROP_BOOST_DB / 20),
-          ease: from.beatPeriod * BAR_BEATS * DROP_EASE_BARS,
-        }
-      : undefined,
+    mixIn: vocalEntry(to, entryPoint(to), 0) ?? entryPoint(to),
     duration: from.beatPeriod,
     rate: 1,
     beat: from.beatPeriod,
@@ -973,6 +949,9 @@ export const planTransition = (
 
   const reasonFor = (plan: TransitionPlan): TransitionReason => {
     const { style } = plan;
+    if (plan.recipe) {
+      return plan.recipe.kind === 'pickup' ? 'pickup-handoff' : 'outro-swap';
+    }
     if (options.preference !== 'auto') {
       return style === options.preference ? 'preference' : 'fallback';
     }
@@ -989,22 +968,79 @@ export const planTransition = (
     return endsAbruptly(from) ? 'cold-lead-in' : 'natural-fade';
   };
 
-  for (const style of order) {
-    const plan =
-      style === 'blend'
-        ? endsAbruptly(from)
-          ? (planEndingBlend(from, to, options) ?? planBlend(from, to, options))
-          : planBlend(from, to, options)
-        : style === 'segue'
-          ? planSegue(from, to, options)
-          : style === 'cut'
-            ? planCut(from, to, options)
-            : planSmooth(from, to, options);
+  // DJ hand-offs: only on grids trusted to the bar (every move is a hard
+  // switch on a bar line), with the next song alone matching the tempo
+  const handoffRate = tempoRatio(from.bpm, to.bpm);
+  // Apple's grids, or ours when sure and the tempos match as they are (our
+  // tempo can lock onto a half / two-thirds time that's steady but wrong)
+  const appleGrid = (track: TrackAnalysis) =>
+    Boolean(track.appleId && track.phrases?.length);
+  const direct =
+    Math.abs(Math.log(from.bpm / to.bpm)) <= Math.log(1 + options.maxStretch);
+  const trusted = (track: TrackAnalysis) =>
+    appleGrid(track) ||
+    (direct && track.tempoConfidence >= HANDOFF_TEMPO_CONFIDENCE);
+  const handoffPrefer =
+    options.preference === 'cut'
+      ? 'pickup'
+      : options.preference === 'auto' || options.preference === 'blend'
+        ? 'any'
+        : undefined;
+  const handoff =
+    options.handoffs &&
+    !options.asap &&
+    handoffPrefer &&
+    gridsOk &&
+    steadyEdges &&
+    steadyBeat &&
+    suits &&
+    Math.abs(handoffRate - 1) <= options.maxStretch &&
+    trusted(from) &&
+    trusted(to)
+      ? planHandoff(
+          {
+            from,
+            to,
+            rate: handoffRate,
+            clash,
+            earliestMixOut: options.earliestMixOut,
+            headSeconds: options.headSeconds ?? HEAD_SECONDS_DEFAULT,
+          },
+          handoffPrefer,
+        )
+      : null;
+
+  const plans = function* () {
+    if (handoff) {
+      const plan: TransitionPlan = { ...handoff, reason: 'tempo-match' };
+      delete (plan as Partial<typeof handoff>).score;
+      yield { style: 'blend' as const, plan };
+    }
+    for (const style of order) {
+      yield {
+        style,
+        plan:
+          style === 'blend'
+            ? endsAbruptly(from)
+              ? (planEndingBlend(from, to, options) ?? planBlend(from, to, options))
+              : planBlend(from, to, options)
+            : style === 'segue'
+              ? planSegue(from, to, options)
+              : style === 'cut'
+                ? planCut(from, to, options)
+                : planSmooth(from, to, options),
+      };
+    }
+  };
+
+  for (const { style, plan } of plans()) {
     if (plan) {
       const seed = `${outgoing.appleId ?? outgoing.duration}|${incoming.appleId ?? incoming.duration}`;
       let effect: number | undefined;
       const bars = plan.duration / ((plan.beat || 0.5) * 4);
-      if (
+      if (plan.recipe) {
+        effect = plan.recipe.kind === 'pickup' ? PICKUP_HANDOFF_ID : OUTRO_SWAP_ID;
+      } else if (
         options.spotifyStyle &&
         plan.style === 'blend' &&
         !plan.holdOutgoing &&
@@ -1066,7 +1102,15 @@ export const planTransition = (
               ? '-'
               : Math.round(to.vocalEntry * 10) / 10,
           endsAbruptly: endsAbruptly(from),
-          dropIn: plan.drop ? Math.round(plan.mixIn * 10) / 10 : '-',
+          handoff: handoff?.recipe
+            ? `${handoff.recipe.kind}${
+                handoff.recipe.kind === 'pickup'
+                  ? ` ${handoff.recipe.gapBars}+${handoff.recipe.overlapBars}+${handoff.recipe.decayBars}`
+                  : ` ${handoff.recipe.bars} bars`
+              } score ${handoff.score.toFixed(1)}`
+            : options.handoffs
+              ? 'none fits'
+              : 'off',
         },
       };
     }

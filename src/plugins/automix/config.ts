@@ -17,10 +17,11 @@ export type AutoMixPluginConfig = {
   /** Echo the old song's last beat under the next one on a beat cut */
   cutEcho: boolean;
   /**
-   * Beat cuts drop the next song in: a beat or two of silence, then it
-   * lands past its intro, a little louder, settling back
+   * DJ hand-offs: when a pair allows, both songs play at full level and the
+   * bass is handed from one to the other on a bar line (outro over intro,
+   * or a pickup dropped in after a breakdown), never two vocals at once
    */
-  cutDrop: boolean;
+  djHandoffs: boolean;
   /** Dress beat-matched blends in Apple Music's effect styles (filters, echoes, reverb) */
   effects: boolean;
   /**
@@ -52,7 +53,7 @@ export const defaultConfig: AutoMixPluginConfig = {
   smoothSeconds: 10,
   beatOnly: false,
   cutEcho: false,
-  cutDrop: false,
+  djHandoffs: true,
   effects: true,
   spotifyStyle: false,
   respectAlbums: true,
