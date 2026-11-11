@@ -458,6 +458,7 @@
           "segue-cold": "Next song lands right on the final hit",
           "smooth": "{{seconds}} s fade"
         },
+        "seek-marker": "Seek up to here ({{time}}) and the transition into \"{{title}}\" still plays as planned",
         "low-quality": "Only a lower quality stream ({{quality}}) was available for mixing, so the transition may sound duller than normal playback",
         "mixing": "AutoMixing",
         "off": "AutoMix off",
@@ -527,7 +528,9 @@
           "done": "Transition done",
           "high": "Highs",
           "in": "Transition in {{time}}",
-          "level": "What you'll hear",
+          "level": "Volume",
+          "eq": "Bass EQ (down = cut)",
+          "filter": "Filter (up = high-pass, down = low-pass)",
           "low": "Bass",
           "mid": "Mids",
           "mix": "mix",
