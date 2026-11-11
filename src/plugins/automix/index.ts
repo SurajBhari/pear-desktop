@@ -73,6 +73,15 @@ export default createPlugin({
         checked: config.cutEcho,
         click: (item) => setConfig({ cutEcho: item.checked }),
       },
+      radio(
+        t('plugins.automix.menu.cut-ending.label'),
+        config.cutEnding,
+        (['filter', 'brake', 'spinback', 'mixed'] as const).map((ending) => [
+          ending,
+          t(`plugins.automix.menu.cut-ending.${ending}`),
+        ]),
+        (cutEnding) => setConfig({ cutEnding }),
+      ),
       {
         label: t('plugins.automix.menu.dj-handoffs'),
         type: 'checkbox',
@@ -108,7 +117,7 @@ export default createPlugin({
         config.maxStretch,
         [
           [0, t('plugins.automix.menu.tempo-range.off')],
-          ...[0.03, 0.05, 0.08].map(
+          ...[0.03, 0.05, 0.08, 0.1].map(
             (range) =>
               [
                 range,
@@ -123,7 +132,7 @@ export default createPlugin({
       radio(
         t('plugins.automix.menu.fade-length'),
         config.smoothSeconds,
-        [6, 10, 15].map((seconds) => [
+        [5, 10, 15].map((seconds) => [
           seconds,
           t('plugins.automix.menu.seconds', { seconds }),
         ]),

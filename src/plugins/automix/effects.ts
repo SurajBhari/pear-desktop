@@ -11,6 +11,7 @@
 import {
   EQ_STYLES,
   FILTER_STYLES,
+  FX_STYLES,
   PRESETS,
   VOLUME_STYLES,
   type CatalogCurve,
@@ -377,21 +378,55 @@ export const catalogEq = (id: number): Side => {
   };
 };
 
+/** A catalog curve with its values mapped */
+const mapCurve = (curve: CatalogCurve, map: (y: number) => number): CatalogCurve =>
+  curve.map((value, i) => (i % 2 ? map(value) : value));
+
+/** Reverb tail of Spotify's reverb sends, seconds */
+const SPOTIFY_REVERB_SECONDS = 4;
+
+/**
+ * The old song's effect send of a Spotify fx style: its dry/wet (0..1 =
+ * 0..100 % wet) as the send into an echo or reverb and the dry level
+ */
+const fxLanes = (id: number): Lane[] => {
+  const fx = FX_STYLES[id];
+  if (!fx) return [];
+  const lanes = [
+    set('wet', 1),
+    ...curveLanes('send', mapCurve(fx.out, (wet) => Math.min(1, wet * 2))),
+    ...curveLanes('dry', mapCurve(fx.out, (wet) => 1 - wet)),
+  ];
+  if (fx.kind !== 'reverb') {
+    // An echo keeps repeating and fades; a delay is a shorter tail
+    lanes.push(
+      set('delayMix', 1),
+      set('delayFeedback', fx.kind === 'echo' ? 0.5 : 0.3),
+      set('delayLowpass', 5000),
+    );
+  }
+  return lanes;
+};
+
 /** One of Spotify's presets, exactly as its catalog defines it */
 const catalogPreset = (id: number): EffectStyle => {
   const preset = PRESETS[id];
   const volumeStyle = VOLUME_STYLES[preset.volume];
   const filter = FILTER_STYLES[preset.filter];
   const eq = catalogEq(preset.eq);
+  const fx = FX_STYLES[preset.fx];
   return {
     id: 100 + id,
     name: preset.name.replace(/([a-z])([A-Z])/g, '$1 $2'),
     family: 'spotify',
     bars: 4,
+    delay: fx ? fx.kind !== 'reverb' : undefined,
+    reverb: fx?.kind === 'reverb' ? SPOTIFY_REVERB_SECONDS : undefined,
     outgoing: [
       ...(volumeStyle ? curveLanes('gain', volumeStyle.out) : []),
       ...eq.outgoing,
       ...(filter ? curveLanes('djFilter', filter.out) : []),
+      ...fxLanes(preset.fx),
     ],
     incoming: [
       ...(volumeStyle ? curveLanes('gain', volumeStyle.in) : []),
@@ -406,9 +441,12 @@ const catalogPreset = (id: number): EffectStyle => {
  * own catalog (the cuts and the echo / reverb / riser presets aren't blends
  * AutoMix plays this way)
  */
-export const SPOTIFY_STYLES: EffectStyle[] = [1, 2, 3, 4, 5, 7, 8, 9, 10, 16, 17, 18, 19].map(
-  catalogPreset,
-);
+export const SPOTIFY_STYLES: EffectStyle[] = [
+  1, 2, 3, 4, 5, 7, 8, 9, 10, 16, 17, 18, 19,
+  // ...and the ones with an effect send: Dissolve (echo), Surge and
+  // Afterglow (reverb)
+  20, 21, 22,
+].map(catalogPreset);
 
 /** Spotify only uses these three on its 2-bar blends */
 const SHORT_SPOTIFY_STYLES = [101, 110, 117];
@@ -656,12 +694,37 @@ export const pickCrossfadeReverb = (seed: string) => djb2(seed) % 2 === 0;
  * of the pair too)
  */
 export const pickSpotifyEffect = (bars: number, seed: string): EffectStyle => {
-  const candidates =
-    bars <= 2
-      ? SPOTIFY_STYLES.filter((style) => SHORT_SPOTIFY_STYLES.includes(style.id))
-      : SPOTIFY_STYLES;
-  return candidates[djb2(seed) % candidates.length];
+  if (bars <= 2) {
+    const short = SPOTIFY_STYLES.filter((style) => SHORT_SPOTIFY_STYLES.includes(style.id));
+    return short[djb2(seed) % short.length];
+  }
+  // Weighted the way Spotify's own planner picks for beat-matched pairs
+  // (its GetComputedTransitions over 48 pairs of rap and Bollywood)
+  const pool = SPOTIFY_PICKS.flatMap(([id, weight]) => Array.from({ length: weight }, () => id));
+  const id = pool[djb2(seed) % pool.length];
+  return SPOTIFY_STYLES.find((style) => style.id === id) ?? SPOTIFY_STYLES[0];
 };
+
+/** Spotify preset id (+100) and how often Spotify chose it for a beat-matched pair */
+const SPOTIFY_PICKS: [number, number][] = [
+  [110, 6], // Filter Fade In Out
+  [109, 4], // Filter Fade In
+  [101, 4], // Simple Fade
+  [108, 3], // Filter Fade Out
+  [117, 3], // Bass Swap Low Pass Filter In
+  [103, 1], // Bass Swap
+  // Not in that sample, but Spotify offers them: now and then
+  [102, 1], // Eq Swap (all three bands swap)
+  [104, 1], // Bass Swap Filter In
+  [105, 1], // Bass Swap Filter Out
+  [107, 1], // Bass And Mid Swap
+  [116, 1], // Bass Swap At End
+  [118, 1], // Bass Swap Low Pass Filter Out
+  [119, 1], // Low Pass Filter Fade In Out
+  [120, 1], // Dissolve
+  [121, 1], // Surge
+  [122, 1], // Afterglow
+];
 
 export const effectById = (id: number | undefined) =>
   [...EFFECT_STYLES, ...SPOTIFY_STYLES].find((style) => style.id === id);
@@ -692,7 +755,14 @@ export const handoffStyle = (recipe: HandoffRecipe): EffectStyle => {
       name: HANDOFF_NAMES.loop,
       family: 'handoff',
       bars: recipe.bars,
-      repeats: [{ at: 0, bars: recipe.loopBeats / 4, behind: true }],
+      // ...rolling over its last quarter like Spotify's beat roll (looping
+      // style 5): the slice shortens to a beat, half a beat, a quarter
+      repeats: [
+        { at: 0, bars: recipe.loopBeats / 4, behind: true },
+        { at: 0.75, bars: 1 / 4 },
+        { at: 0.875, bars: 1 / 8 },
+        { at: 0.9375, bars: 1 / 16 },
+      ],
       repeatEnd: [1, 0.01],
       outEnd: [0, 0.05],
       outgoing: [
